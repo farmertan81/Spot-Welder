@@ -1,0 +1,40 @@
+{
+  "weld_number": 45,
+  "timestamp": "2025-12-20T10:26:28.069230",
+  "energy_joules": 23.84,
+  "peak_current_amps": 1978.3,
+  "duration_ms": 4.8,
+  "rise_time_ms": 0.0,
+  "settings": {
+    "mode": 1,
+    "d1": 5,
+    "gap1": 0,
+    "d2": 0,
+    "gap2": 0,
+    "d3": 0,
+    "active_preset": null,
+    "weld_counter": 44
+  },
+  "data": [
+    {
+      "t": 79,
+      "v": 4.959,
+      "i": 0.0
+    },
+    {
+      "t": 79,
+      "v": 4.959,
+      "i": 9.4
+    },
+    {
+      "t": 4717,
+      "v": 4.959,
+      "i": 1978.3
+    },
+    {
+      "t": 4917,
+      "v": 4.959,
+      "i": 0.0
+    }
+  ]
+}

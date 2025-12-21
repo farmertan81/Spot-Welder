@@ -1,0 +1,40 @@
+{
+  "weld_number": 54,
+  "timestamp": "2025-12-20T10:59:34.206192",
+  "energy_joules": 141.79,
+  "peak_current_amps": 3524.8,
+  "duration_ms": 4.7,
+  "rise_time_ms": 0.0,
+  "settings": {
+    "mode": 1,
+    "d1": 5,
+    "gap1": 0,
+    "d2": 0,
+    "gap2": 0,
+    "d3": 0,
+    "active_preset": null,
+    "weld_counter": 53
+  },
+  "data": [
+    {
+      "t": 4713,
+      "v": 8.736,
+      "i": 0.0
+    },
+    {
+      "t": 4713,
+      "v": 8.736,
+      "i": 3524.8
+    },
+    {
+      "t": 9234,
+      "v": 8.736,
+      "i": 3500.5
+    },
+    {
+      "t": 9434,
+      "v": 8.736,
+      "i": 0.0
+    }
+  ]
+}
