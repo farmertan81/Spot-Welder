@@ -18,11 +18,16 @@ class Ads1256 {
     // Stop continuous (RDATAC) mode.
     void stopContinuous();
 
+    // Channel switching for voltage/current measurements
+    void switchToVoltageChannel();
+    void switchToCurrentChannel();
+
     // Non-blocking:
     //  - returns true if DRDY was low and a new sample was read.
     //  - 'amps' will then contain the converted current value.
     //  - returns false if DRDY was high (no new sample yet).
     bool readCurrentFast(float& amps);
+    bool readVoltageFast(float& volts);
 
    private:
     int _cs;
