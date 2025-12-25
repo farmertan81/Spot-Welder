@@ -1,10 +1,13 @@
 {
   "mode": 1,
-  "d1": 5,
+  "d1": 10,
   "gap1": 0,
   "d2": 0,
   "gap2": 0,
   "d3": 0,
-  "active_preset": null,
-  "weld_counter": 58
+  "active_preset": "P1",
+  "power": 100,
+  "preheat_enabled": true,
+  "preheat_duration": 10,
+  "preheat_power": 30
 }

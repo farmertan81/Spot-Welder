@@ -193,18 +193,35 @@ function smoothData(data, windowSize = 3) {
 }
 
 function autoZoomChart(chart) {
+    // If user has zoomed/panned, don't fight them
+    if (chart?.isZoomedOrPanned && chart.isZoomedOrPanned()) return;
+
     const data = chart.data.datasets[0]?.data || [];
-    if (data.length === 0) return;
+    if (data.length < 2) return;
 
-    const times = data.map(d => d.x);
-    const minTime = Math.min(...times);
-    const maxTime = Math.max(...times);
+    const xs = data.map(d => d.x);
+    const ys = data.map(d => d.y);
 
-    const padding = (maxTime - minTime) * 0.1;
-    chart.options.scales.x.min = minTime - padding;
-    chart.options.scales.x.max = maxTime + padding;
+    const xMin = Math.min(...xs);
+    const xMax = Math.max(...xs);
+    const yMax = Math.max(...ys);
+
+    const padX = Math.max(0.2, (xMax - xMin) * 0.05);
+    const padY = Math.max(50, yMax * 0.08);
+
+    // IMPORTANT: use suggestedMin/Max instead of hard min/max
+    chart.options.scales.x.suggestedMin = xMin - padX;
+    chart.options.scales.x.suggestedMax = xMax + padX;
+
+    chart.options.scales.y.suggestedMin = 0;
+    chart.options.scales.y.suggestedMax = yMax + padY;
+
+    // and make sure hard min/max are not set
+    delete chart.options.scales.x.min;
+    delete chart.options.scales.x.max;
+    delete chart.options.scales.y.min;
+    delete chart.options.scales.y.max;
 }
-
 // ==================== Idealized Pulse & Energy ====================
 
 function buildCartoonPulse(data) {
@@ -234,6 +251,18 @@ function buildCartoonPulse(data) {
         { x: tEnd, y: 0.0 }
     ];
 }
+function resetZoom() {
+    if (chart?.resetZoom) chart.resetZoom();
+
+    // Clear hard min/max so pan/zoom can re-apply cleanly
+    delete chart.options.scales.x.min;
+    delete chart.options.scales.x.max;
+    delete chart.options.scales.y.min;
+    delete chart.options.scales.y.max;
+
+    chart.update();
+}
+
 
 function buildEnergyTraceFromCurrent(data, resistance_milliohm = 2.96) {
     if (!data || data.length < 2) return null;
@@ -266,6 +295,25 @@ function buildEnergyTraceFromCurrent(data, resistance_milliohm = 2.96) {
 
 const socket = io();
 
+// Register chartjs-plugin-zoom once (UMD global)
+(function registerZoomPluginOnce() {
+    const zp = window.ChartZoom || window['chartjs-plugin-zoom'];
+    if (!zp) {
+        console.warn('❌ Zoom plugin global not found on window (ChartZoom / chartjs-plugin-zoom).');
+        return;
+    }
+    Chart.register(zp);
+    console.log('✅ Zoom plugin registered. id=', zp.id || '(no id)');
+})();
+
+// Register chartjs-plugin-zoom (local, UMD-ish build)
+(function registerZoomPlugin() {
+    const zp = window.ChartZoom || window['chartjs-plugin-zoom'];
+    console.log('zoom global =', zp);
+    if (!zp) return console.warn('❌ zoom plugin global missing');
+    Chart.register(zp);
+    console.log('✅ zoom registered:', zp.id);
+})();
 const ctx = document.getElementById('waveform-chart').getContext('2d');
 const chart = new Chart(ctx, {
     plugins: [annotationPlugin],
@@ -316,14 +364,18 @@ const chart = new Chart(ctx, {
         responsive: true,
         maintainAspectRatio: false,
         animation: false,
+
+        // IMPORTANT: allow drag events
+        events: ['mousedown', 'mousemove', 'mouseup', 'mouseout', 'click', 'touchstart', 'touchmove', 'touchend'],
+
         scales: {
             x: {
                 type: 'linear',
                 title: { display: true, text: 'Time (ms)', color: '#fff' },
                 ticks: { color: '#aaa' },
                 grid: { color: "#444", lineWidth: 1, drawTicks: true },
-                min: 0,
-                max: 20   // full weld window
+                suggestedMin: 0,
+                suggestedMax: 20
             },
             y: {
                 type: 'linear',
@@ -331,8 +383,8 @@ const chart = new Chart(ctx, {
                 title: { display: true, text: 'Current (A)', color: '#ff6b35' },
                 ticks: { color: '#ff6b35' },
                 grid: { color: "#444", lineWidth: 1, drawTicks: true },
-                min: 0,
-                max: 6000
+                suggestedMin: 0,
+                suggestedMax: 6000
             },
             y1: {
                 type: 'linear',
@@ -340,8 +392,8 @@ const chart = new Chart(ctx, {
                 title: { display: true, text: 'Voltage (V)', color: '#2196F3' },
                 ticks: { color: '#2196F3' },
                 grid: { display: false },
-                min: 0,
-                max: 12
+                suggestedMin: 0,
+                suggestedMax: 12
             },
             y2: {
                 type: 'linear',
@@ -349,11 +401,23 @@ const chart = new Chart(ctx, {
                 title: { display: true, text: 'Energy (J)', color: '#00bcd4' },
                 ticks: { color: '#00bcd4' },
                 grid: { display: false },
-                min: 0
+                suggestedMin: 0
             }
         },
+
         plugins: {
-            legend: { labels: { color: '#fff' } }
+            zoom: {
+                pan: {
+                    enabled: true,
+                    mode: 'xy',
+                    threshold: 0
+                },
+                zoom: {
+                    wheel: { enabled: true, modifierKey: 'shift' },
+                    pinch: { enabled: true },
+                    mode: 'xy'
+                }
+            }
         }
     }
 });
@@ -362,7 +426,9 @@ let currentWeldData = { timestamps: [], voltage: [], current: [] };
 
 // live weld points from ESP
 socket.on('weld_data_point', (data) => {
-    const t_ms = data.t * 1000;  // seconds -> ms
+    const locked = chart?.isZoomedOrPanned && chart.isZoomedOrPanned();
+
+    const t_ms = data.t * 1000;
     currentWeldData.timestamps.push(t_ms);
     currentWeldData.voltage.push(data.v);
     currentWeldData.current.push(data.i);
@@ -370,9 +436,12 @@ socket.on('weld_data_point', (data) => {
     chart.data.datasets[0].data.push({ x: t_ms, y: data.i });
     chart.data.datasets[2].data.push({ x: t_ms, y: data.v });
 
-    const currentData = chart.data.datasets[0].data;
-    chart.data.datasets[1].data = buildCartoonPulse(currentData) || [];
-    chart.data.datasets[3].data = buildEnergyTraceFromCurrent(currentData) || [];
+    // Don’t constantly rebuild these while user is interacting
+    if (!locked) {
+        const currentData = chart.data.datasets[0].data;
+        chart.data.datasets[1].data = buildCartoonPulse(currentData) || [];
+        chart.data.datasets[3].data = buildEnergyTraceFromCurrent(currentData) || [];
+    }
 
     chart.update('none');
 });
@@ -473,9 +542,7 @@ async function loadWeldData(filename, event) {
         chart.data.datasets[1].data = buildCartoonPulse(currentData) || [];
         chart.data.datasets[3].data = buildEnergyTraceFromCurrent(currentData) || [];
 
-        // Fixed time window; no auto zoom
-        chart.options.scales.x.min = 0;
-        chart.options.scales.x.max = 20;   // show 0–20 ms
+        autoZoomChart(chart);
         chart.update();
 
         document.querySelectorAll('.weld-item').forEach(item => item.classList.remove('active'));
@@ -485,7 +552,8 @@ async function loadWeldData(filename, event) {
 
 function updateYAxis() {
     const yMax = parseFloat(document.getElementById('y-max').value);
-    chart.options.scales.y.max = yMax;
+    chart.options.scales.y.suggestedMax = yMax;
+    delete chart.options.scales.y.max;
     chart.update();
 }
 

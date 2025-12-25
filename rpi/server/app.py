@@ -1,226 +1,257 @@
-#!/usr/bin/env python3
-
-# Weld cooldown protection
-WELD_COOLDOWN_MS = 3000  # 3 seconds minimum between welds
-last_weld_time = 0
-# Circuit resistance
-TOTAL_RESISTANCE_OHM = 0.00296  # 2.96 mΩ total circuit resistance
-
-
 """
-Spot Welder Control Server
-Flask + SocketIO + ESP32 + ADS1256 + Weld Capture
+Flask + SocketIO server for ESP32 spot welder control
+Handles TCP connection, web UI, and real-time updates
 """
 
+import os
+import sys
+import json
+import time
+import socket
+import threading
+from datetime import datetime
 from flask import Flask, render_template, jsonify, request
 from flask_socketio import SocketIO, emit
-from flask_sock import Sock
-import threading
-from collections import deque
-import time
-import json
-import os
-from datetime import datetime
-import math
 
-# Import our drivers
-from esp_link import ESP32Link
-from ads1256_driver import ADS1256
-
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'weldctl_secret_2025'
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
-sock = Sock(app)
-
-# Directories
-WELD_HISTORY_DIR = "../weld_history"
+# ========== CONFIGURATION ==========
+ESP32_IP = "192.168.68.56"  # Change to your ESP32's IP
+ESP32_PORT = 8888
 SETTINGS_FILE = "settings.json"
 PRESETS_FILE = "presets.json"
-os.makedirs(WELD_HISTORY_DIR, exist_ok=True)
+LOG_FILE = "welder.log"
 
-# Global state
-esp_status = {
-    "vpack": 0.0,
-    "i": 0.0,
-    "pulse_ms": 50,
-    "state": "IDLE",
-    "enabled": False,
-    "cooldown_ms": 0
-}
+# ========== FLASK SETUP ==========
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'spot-welder-secret-2024'
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
 
-cells_status = {
-    "V1": 0.0, "V2": 0.0, "V3": 0.0,
-    "C1": 0.0, "C2": 0.0, "C3": 0.0
-}
-
-temperature = None
-pedal_active = False
-weld_counter = 0
-# Pre-trigger buffer (not used now but kept for compatibility)
-PRE_TRIGGER_MS = 10.0  # Capture 10 ms before weld (legacy)
-SAMPLE_RATE_HZ = 1000  # 1kHz sampling (legacy)
-PRE_BUFFER_SIZE = int(PRE_TRIGGER_MS * SAMPLE_RATE_HZ / 1000)
-pre_trigger_buffer = deque(maxlen=PRE_BUFFER_SIZE)
-continuous_sampling = True
-esp_connected = False
-
-# Weld capture
-MAX_WELD_HISTORY = 15
-current_weld_data = []  # list of {"t": usec, "v": volts, "i": amps}
-is_capturing = False
-weld_start_time = None
-
-# Logs buffer
-log_buffer = deque(maxlen=500)
-
-# Thread locks
-status_lock = threading.Lock()
-weld_lock = threading.Lock()
-
-# Hardware instances
+# ========== GLOBAL STATE ==========
 esp_link = None
-esp32_ws = None  # Global WebSocket connection to ESP32
-adc = None
+esp_connected = False
+last_status = {}
 
-
+# ========== LOGGING ==========
 def log(msg):
-    """Add message to log buffer and print"""
-    timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    log_msg = f"[{timestamp}] {msg}"
-    log_buffer.append(log_msg)
-    print(log_msg, flush=True)
+    """Log message to console and file"""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_line = f"[{timestamp}] {msg}"
+    print(log_line)
+    try:
+        with open(LOG_FILE, 'a') as f:
+            f.write(log_line + '\n')
+    except Exception as e:
+        print(f"⚠️ Failed to write log: {e}")
 
-
-def on_esp_status(data):
-    """Callback when ESP32Link pushes combined STATUS+CELLS payload"""
-    global esp_connected, temperature
-    with status_lock:
-        # Core ESP status
-        esp_status.update(data)
-        esp_connected = data.get("esp_connected", True)
-
-        # Temperature if present
-        if 'temp' in data:
-            temperature = data['temp']
-
-        # Cell info coming from ESP32Link._emit_status_update()
-        for key in ("V1", "V2", "V3", "C1", "C2", "C3"):
-            if key in data:
-                cells_status[key] = data[key]
-
-
-def on_esp_cells(data):
-    """Callback when ESP32 sends CELLS"""
-    with status_lock:
-        cells_status.update(data)
-
-
-def on_esp_log(msg):
-    """Handle ESP32 log messages including weld data (WDATA) and FIRED events."""
-    global esp_status, is_capturing, weld_start_time, current_weld_data, pedal_active, weld_counter
-
-    # Always log for debugging
-    log(msg)
-
-    # --- WDATA: per-sample weld data from ESP32 ---
-    if msg.startswith("WDATA,"):
+# ========== ESP32 TCP LINK ==========
+# ========== ESP32 TCP LINK ==========
+# ========== ESP32 TCP LINK ==========
+class ESP32Link:
+    """Manages TCP connection to ESP32"""
+    
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.connected = False
+        self.running = True
+        self.rx_thread = None
+        
+    def connect(self):
+        """Establish TCP connection"""
         try:
-            # Format: WDATA,voltage,current,time_us
-            parts = msg.split(',')
-            if len(parts) >= 4:
-                v = float(parts[1])
-                i = float(parts[2])
-                t_us = int(parts[3])
-
-                with weld_lock:
-                    # If we weren't capturing yet, start now on first WDATA
-                    if not is_capturing:
-                        is_capturing = True
-                        weld_start_time = time.time()
-                        current_weld_data = []
-                        pedal_active = True
-                        socketio.emit('pedal_active', {"active": True})
-                        log("🔥 Weld capture started on first WDATA")
-
-                        # Baseline point at the first ESP timestamp, i = 0
-                        current_weld_data.append({
-                            "t": t_us,  # µs, will normalize later
-                            "v": v,
-                            "i": 0.0
-                        })
-
-                    # Store real sample using raw ESP time_us
-                    current_weld_data.append({
-                        "t": t_us,   # µs
-                        "v": v,
-                        "i": i
-                    })
-
-                log(f"📊 WDATA: t={t_us/1000.0:.2f}ms, v={v:.3f}V, i={i:.1f}A")
-
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(5.0)
+            self.sock.connect((self.host, self.port))
+            self.connected = True
+            log(f"✅ Connected to ESP32 at {self.host}:{self.port}")
+            
+            # Start receive thread
+            self.rx_thread = threading.Thread(target=self._receive_loop, daemon=True)
+            self.rx_thread.start()
+            
+            return True
         except Exception as e:
-            log(f"⚠️ Failed to parse WDATA: {e}")
-
-    # --- WDATA_END: summary line from ESP32 (optional) ---
-    elif msg.startswith("WDATA_END,"):
-        log(f"ℹ️ WDATA_END summary: {msg}")
-
-    # --- FIRED: weld completed ---
-    elif msg.startswith("FIRED,"):
-        # Parse weld duration from FIRED,<ms> (optional)
-        weld_duration_ms = 0
+            log(f"❌ Failed to connect to ESP32: {e}")
+            self.connected = False
+            return False
+    
+    def disconnect(self):
+        """Close TCP connection"""
+        self.running = False
+        self.connected = False
+        if self.sock:
+            try:
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+        log("🔌 Disconnected from ESP32")
+    
+    def send_command(self, cmd):
+        """Send command to ESP32"""
+        if not self.connected or not self.sock:
+            log(f"⚠️ Cannot send command (not connected): {cmd}")
+            return False
+        
         try:
-            parts = msg.split(',')
-            if len(parts) >= 2:
-                weld_duration_ms = int(parts[1])
-                log(f"Parsed weld duration: {weld_duration_ms}ms")
-        except Exception:
-            pass
-
-        # Stop capture and save, if we have been capturing
-        if is_capturing:
-            is_capturing = False
-            log("✅ Weld ended - saving data")
-            with weld_lock:
-                # Append landing point at i = 0 after the last sample
-                if isinstance(current_weld_data, list) and current_weld_data:
-                    last = current_weld_data[-1]
-                    last_t_us = last["t"]
-                    last_v = last["v"]
-                    current_weld_data.append({
-                        "t": last_t_us + 200,  # +0.2 ms in µs
-                        "v": last_v,
-                        "i": 0.0
-                    })
-
-                weld_record = save_weld_history(current_weld_data)
-
-            pedal_active = False
-            socketio.emit('pedal_active', {"active": False})
-            socketio.emit('weld_complete', {
-                "weld_number": weld_counter,
-                "energy_joules": weld_record["energy_joules"],
-                "peak_current_amps": weld_record["peak_current_amps"],
-                "duration_ms": weld_record["duration_ms"]
-            })
-
-        # Update state regardless
-        with status_lock:
-            esp_status["state"] = "IDLE"
-
-    else:
-        # Already logged above
-        pass
-
-
+            if not cmd.endswith('\n'):
+                cmd += '\n'
+            self.sock.sendall(cmd.encode('utf-8'))
+            log(f"📤 Sent: {cmd.strip()}")
+            return True
+        except Exception as e:
+            log(f"❌ Failed to send command: {e}")
+            self.disconnect()
+            return False
+    
+    def _receive_loop(self):
+        """Background thread to receive data from ESP32"""
+        global esp_connected, last_status
+        buffer = ""
+        last_data_time = time.time()
+        TIMEOUT_SECONDS = 10  # If no data for 10 seconds, assume disconnected
+        
+        while self.running and self.connected:
+            try:
+                data = self.sock.recv(1024).decode('utf-8', errors='ignore')
+                if not data:
+                    log("⚠️ ESP32 connection closed (recv returned empty)")
+                    break
+                
+                # Update last data timestamp
+                last_data_time = time.time()
+                buffer += data
+                
+                # Process complete lines
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
+                    if line:
+                        self._handle_line(line)
+                        
+            except socket.timeout:
+                # Check if we've gone too long without data
+                if time.time() - last_data_time > TIMEOUT_SECONDS:
+                    log(f"⚠️ No data received for {TIMEOUT_SECONDS}s, assuming disconnected")
+                    break
+                continue
+            except Exception as e:
+                log(f"❌ Receive error: {e}")
+                break
+        
+        # Clean up when loop exits (connection lost)
+        log("🧹 Receive loop exiting, cleaning up connection...")
+        self.disconnect()
+        esp_connected = False
+        socketio.emit('status_update', {'esp_connected': False})
+    
+    def _handle_line(self, line):
+        """Parse and handle incoming ESP32 data"""
+        global esp_connected, last_status
+        
+        log(f"📥 Received: {line}")
+        
+        # Update connection status
+        if not esp_connected:
+            esp_connected = True
+            socketio.emit('status_update', {'esp_connected': True})
+        
+        # Parse different message types (comma-separated format)
+        if line.startswith("STATUS,"):
+            self._parse_status(line[7:])
+        elif line.startswith("CELLS,"):
+            self._parse_cells(line[6:])
+        elif line.startswith("WELD:") or line.startswith("WELD,"):
+            socketio.emit('weld_event', {'message': line.split(',', 1)[1] if ',' in line else line})
+        elif line.startswith("PEDAL:") or line.startswith("PEDAL,"):
+            active = "pressed" in line.lower()
+            socketio.emit('pedal_active', {'active': active})
+        elif line.startswith("CHARGER:") or line.startswith("CHARGER,"):
+            self._parse_charger(line.split(',', 1)[1] if ',' in line else line.split(':', 1)[1])
+        else:
+            socketio.emit('esp32_message', {'message': line})
+    
+    def _parse_status(self, data):
+        """Parse STATUS line"""
+        global last_status
+        try:
+            status = {}
+            for pair in data.split(','):
+                if '=' in pair:
+                    key, val = pair.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    try:
+                        if '.' in val:
+                            status[key] = float(val)
+                        else:
+                            status[key] = int(val)
+                    except:
+                        status[key] = val
+            
+            if 'vpack' in status:
+                status['vpack'] = status['vpack']
+            if 'temp' in status:
+                status['temperature'] = status['temp']
+            if 'i' in status:
+                status['current'] = status['i']
+            
+            last_status.update(status)
+            status['esp_connected'] = True
+            socketio.emit('status_update', status)
+            socketio.emit('esp32_status', status)
+            
+        except Exception as e:
+            log(f"⚠️ Failed to parse STATUS: {e}")
+    
+    def _parse_cells(self, data):
+        """Parse CELLS line"""
+        global last_status
+        try:
+            cells = {}
+            for pair in data.split(','):
+                if '=' in pair:
+                    key, val = pair.split('=', 1)
+                    key = key.strip()
+                    val = val.strip()
+                    if key.startswith('C'):
+                        try:
+                            cells[key] = float(val)
+                        except:
+                            pass
+            
+            last_status.update(cells)
+            socketio.emit('status_update', cells)
+            
+        except Exception as e:
+            log(f"⚠️ Failed to parse CELLS: {e}")
+    
+    def _parse_charger(self, data):
+        """Parse CHARGER line"""
+        global last_status
+        try:
+            if 'current=' in data:
+                val = data.split('current=')[1].split('A')[0].strip()
+                current = float(val)
+                last_status['current'] = current
+                socketio.emit('esp32_status', {'current': current, 'i': current})
+        except Exception as e:
+            log(f"⚠️ Failed to parse CHARGER: {e}")
+# ========== SETTINGS MANAGEMENT ==========
 def load_settings():
-    """Load settings from JSON"""
+    """Load settings from JSON file"""
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"⚠️ Failed to load settings: {e}")
+    
+    # Default settings
     return {
         "mode": 1,
         "d1": 50,
@@ -228,643 +259,303 @@ def load_settings():
         "d2": 0,
         "gap2": 0,
         "d3": 0,
-        "pulse_ms": 50,
-        "weld_counter": 0
+        "power": 100,
+        "preheat_enabled": False,
+        "preheat_duration": 20,
+        "preheat_power": 30,
+        "active_preset": None
     }
 
-
-def save_settings(data):
-    """Save settings to JSON"""
-    with open(SETTINGS_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-    log(f"Settings saved: mode={data.get('mode')}, d1={data.get('d1')}")
-
+def save_settings(settings):
+    """Save settings to JSON file"""
+    try:
+        with open(SETTINGS_FILE, 'w') as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        log(f"⚠️ Failed to save settings: {e}")
+        return False
 
 def load_presets():
-    """Load presets from JSON"""
+    """Load presets from JSON file"""
     if os.path.exists(PRESETS_FILE):
         try:
             with open(PRESETS_FILE, 'r') as f:
                 return json.load(f)
-        except Exception:
-            pass
+        except Exception as e:
+            log(f"⚠️ Failed to load presets: {e}")
+    
+    # Default presets
     return {
-        "P1": {"name": "Preset 1", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0},
-        "P2": {"name": "Preset 2", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0},
-        "P3": {"name": "Preset 3", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0},
-        "P4": {"name": "Preset 4", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0},
-        "P5": {"name": "Preset 5", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0}
+        "P1": {"name": "Preset 1", "mode": 1, "d1": 50, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0, "power": 100, "preheat_enabled": False, "preheat_duration": 20, "preheat_power": 30},
+        "P2": {"name": "Preset 2", "mode": 1, "d1": 80, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0, "power": 100, "preheat_enabled": False, "preheat_duration": 20, "preheat_power": 30},
+        "P3": {"name": "Preset 3", "mode": 2, "d1": 50, "gap1": 10, "d2": 50, "gap2": 0, "d3": 0, "power": 100, "preheat_enabled": False, "preheat_duration": 20, "preheat_power": 30},
+        "P4": {"name": "Preset 4", "mode": 1, "d1": 100, "gap1": 0, "d2": 0, "gap2": 0, "d3": 0, "power": 100, "preheat_enabled": False, "preheat_duration": 20, "preheat_power": 30},
+        "P5": {"name": "Preset 5", "mode": 3, "d1": 40, "gap1": 10, "d2": 40, "gap2": 10, "d3": 40, "power": 100, "preheat_enabled": False, "preheat_duration": 20, "preheat_power": 30}
     }
 
-
-def save_presets(data):
-    """Save presets to JSON"""
-    with open(PRESETS_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
-    log(f"Presets saved")
-
-
-def calculate_energy(weld_data):
-    """Calculate energy delivered in Joules using I²R integration (only during actual weld)"""
-    TOTAL_R = 0.00296  # 2.96 mΩ total circuit resistance
-    CURRENT_THRESHOLD = 100.0  # Only count energy when current > 100A
-    timestamps = weld_data["timestamps"]
-    currents = weld_data["current"]
-
-    if len(timestamps) < 2:
-        return 0.0
-
-    energy = 0.0
-    for i in range(1, len(timestamps)):
-        i_avg = (currents[i] + currents[i - 1]) / 2.0  # Amps
-        t_avg = (timestamps[i] + timestamps[i - 1]) / 2.0  # seconds
-
-        if abs(i_avg) > CURRENT_THRESHOLD and t_avg > 0:
-            dt = abs(timestamps[i] - timestamps[i - 1])  # seconds
-            power = (i_avg ** 2) * TOTAL_R              # Watts = I²R
-            energy += power * dt                        # Joules
-
-    return energy
-
-
-def compute_rise_time_ms(timestamps, currents):
-    """
-    Compute rise time between 10% and 90% of peak current
-    using the filtered waveform.
-    timestamps: list of seconds (0 -> end)
-    currents:   list of amps
-    """
-    if len(timestamps) < 2:
-        return 0.0
-
-    peak = max(currents) if currents else 0.0
-    if peak <= 0:
-        return 0.0
-
-    threshold10 = 0.10 * peak
-    threshold90 = 0.90 * peak
-    t10 = None
-    t90 = None
-
-    for t, i in zip(timestamps, currents):
-        if t10 is None and i >= threshold10:
-            t10 = t
-        if t90 is None and i >= threshold90:
-            t90 = t
-            break
-
-    if t10 is None or t90 is None or t90 <= t10:
-        return 0.0
-
-    return (t90 - t10) * 1000.0  # seconds -> ms
-
-
-def save_weld_history(weld_data):
-    """Save weld to history, keep last MAX_WELD_HISTORY"""
-    global weld_counter
-    weld_counter += 1
-
-    # Handle both formats: list of dicts or dict of lists
-    if isinstance(weld_data, list):
-        # ESP32 format: [{"t": <time_us>, "v": <V>, "i": <A>}, ...]
-        raw_t_us = [d["t"] for d in weld_data]
-
-        if raw_t_us:
-            t0 = raw_t_us[0]
-            # Normalize so first point is t = 0 (seconds)
-            timestamps = [(t - t0) / 1_000_000.0 for t in raw_t_us]
-        else:
-            timestamps = []
-
-        voltages = [d["v"] for d in weld_data]
-        currents = [d["i"] for d in weld_data]
-
-    else:
-        # Legacy ADC format: {"timestamps": [...], "voltage": [...], "current": [...]}
-        timestamps = weld_data.get("timestamps", [])
-        voltages = weld_data.get("voltage", [])
-        currents = weld_data.get("current", [])
-
-    # Calculate stats from timestamps (seconds), currents (A), voltages (V)
-    energy_j = 0.0
-    if len(currents) > 1 and len(timestamps) > 1:
-        for j in range(len(currents) - 1):
-            dt = timestamps[j + 1] - timestamps[j]   # seconds
-            i_avg = (currents[j] + currents[j + 1]) / 2.0
-            v_avg = (voltages[j] + voltages[j + 1]) / 2.0
-            power = v_avg * i_avg                    # Watts = V * A
-            energy_j += power * dt                   # Joules
-
-    peak_current = max(currents) if currents else 0.0
-    duration_ms = (timestamps[-1] - timestamps[0]) * 1000 if len(timestamps) > 1 else 0.0
-    rise_time_ms = compute_rise_time_ms(timestamps, currents)
-
-    # Save weld data
-    filename = f"weld_{weld_counter:04d}.json"
-    filepath = os.path.join(WELD_HISTORY_DIR, filename)
-
-    weld_record = {
-        "weld_number": weld_counter,
-        "timestamp": datetime.now().isoformat(),
-        "energy_joules": round(energy_j, 2),
-        "peak_current_amps": round(peak_current, 1),
-        "duration_ms": round(duration_ms, 1),
-        "rise_time_ms": round(rise_time_ms, 2),
-        "settings": load_settings(),
-        "data": weld_data
-    }
-
-    with open(filepath, 'w') as f:
-        json.dump(weld_record, f, indent=2)
-
-    # Clean up old welds
-    weld_files = sorted([f for f in os.listdir(WELD_HISTORY_DIR) if f.startswith("weld_")])
-    if len(weld_files) > MAX_WELD_HISTORY:
-        for old_file in weld_files[:-MAX_WELD_HISTORY]:
-            os.remove(os.path.join(WELD_HISTORY_DIR, old_file))
-
-    # Update counter in settings
-    settings = load_settings()
-    settings['weld_counter'] = weld_counter
-    save_settings(settings)
-
-    log(f"Weld #{weld_counter} saved: {energy_j:.2f}J, {peak_current:.1f}A peak, "
-        f"{duration_ms:.1f}ms, rise(10–90%)={rise_time_ms:.2f}ms")
-
-    return weld_record
-
-
-def get_weld_history_list():
-    """Get list of available weld history files"""
-    weld_files = sorted([f for f in os.listdir(WELD_HISTORY_DIR) if f.startswith("weld_")], reverse=True)
-    return weld_files[:MAX_WELD_HISTORY]
-
-
-def calculate_cell_balance():
-    """Calculate cell balance stats"""
-    c1 = cells_status.get("C1", 0.0)
-    c2 = cells_status.get("C2", 0.0)
-    c3 = cells_status.get("C3", 0.0)
-
-    if c1 == 0 and c2 == 0 and c3 == 0:
-        return {"delta": 0.0, "status": "unknown", "color": "gray"}
-
-    delta = max(c1, c2, c3) - min(c1, c2, c3)
-
-    if delta < 0.05:
-        status = "balanced"
-        color = "green"
-    elif delta < 0.10:
-        status = "slight_imbalance"
-        color = "yellow"
-    else:
-        status = "imbalanced"
-        color = "red"
-
-    return {"delta": round(delta, 3), "status": status, "color": color}
-
-
-# Routes
-@sock.route('/ws')
-def websocket_route(ws):
-    global esp32_ws, esp_connected, weld_counter
-    esp32_ws = ws
-    esp_connected = True
-
-    log(f"[WebSocket] ESP32 connected from {request.remote_addr}")
-
+def save_presets(presets):
+    """Save presets to JSON file"""
     try:
-        while True:
-            message = ws.receive()
-            if message is None:
-                break
-
-            log(f"[WebSocket] RX: {message}")
-
-            # Process ESP32 messages
-            if message.startswith("HELLO"):
-                log("✅ ESP32 handshake complete")
-                ws.send("STATUS")
-
-            elif message.startswith("ACK:"):
-                log(f"✅ ESP32 acknowledged: {message[4:]}")
-
-            elif message.startswith("FIRED,"):
-                parts = message.split(",")
-                if len(parts) >= 2:
-                    duration = int(parts[1])
-                    weld_counter += 1
-                    log(f"🔥 Weld #{weld_counter} fired! Duration: {duration} ms")
-                    socketio.emit('weld_fired', {'weld_number': weld_counter, 'duration_ms': duration})
-
-            elif message.startswith("STATUS,"):
-                log(f"📊 ESP32 status: {message}")
-                # Parse and broadcast to web UI
-                parts = message.split(',')
-                status_data = {}
-                for part in parts[1:]:  # Skip "STATUS"
-                    if '=' in part:
-                        key, val = part.split('=', 1)
-                        try:
-                            status_data[key] = float(val)
-                        except Exception:
-                            status_data[key] = val
-                socketio.emit('esp32_status', status_data)
-                # Update global esp_status for status_update broadcasts
-                with status_lock:
-                    esp_status.update(status_data)
-
-            elif message.startswith("ERROR:"):
-                log(f"⚠️ ESP32 error: {message[6:]}")
-
+        with open(PRESETS_FILE, 'w') as f:
+            json.dump(presets, f, indent=2)
+        return True
     except Exception as e:
-        log(f"[WebSocket] Error: {e}")
-    finally:
-        esp32_ws = None
-        esp_connected = False
-        log("[WebSocket] ESP32 disconnected")
+        log(f"⚠️ Failed to save presets: {e}")
+        return False
 
-
+# ========== WEB ROUTES ==========
 @app.route('/')
 def index():
+    """Redirect to control page"""
     return render_template('control.html')
-
 
 @app.route('/control')
 def control():
+    """Main control page"""
     return render_template('control.html')
-
-
-@app.route('/monitor')
-def monitor():
-    return render_template('monitor.html')
-
 
 @app.route('/logs')
 def logs():
-    return render_template('logs.html')
+    """Logs page"""
+    try:
+        with open(LOG_FILE, 'r') as f:
+            log_lines = f.readlines()[-100:]  # Last 100 lines
+        return render_template('logs.html', logs=log_lines)
+    except:
+        return render_template('logs.html', logs=[])
 
-
+# ========== API ROUTES ==========
 @app.route('/api/status')
 def api_status():
-    """Current system status"""
-    with status_lock:
-        balance = calculate_cell_balance()
-        return jsonify({
-            **esp_status,
-            **cells_status,
-            "temperature": temperature,
-            "pedal_active": pedal_active,
-            "weld_counter": weld_counter,
-            "esp_connected": esp_connected,
-            "cell_balance": balance
-        })
-
+    """Get current status"""
+    global esp_connected, last_status
+    return jsonify({
+        "status": "ok",
+        "esp_connected": esp_connected,
+        "data": last_status
+    })
 
 @app.route('/api/get_settings')
-def get_settings_route():
-    """Get saved settings"""
+def api_get_settings():
+    """Get current settings"""
     settings = load_settings()
     return jsonify({"status": "ok", "settings": settings})
 
-
 @app.route('/api/save_settings', methods=['POST'])
-def save_settings_route():
-    """Save settings"""
+def api_save_settings():
+    """Save settings and send to ESP32"""
     global esp_link
-
+    
     data = request.get_json()
-    save_settings(data)
-
-    # Send updated pulse to ESP32 via TCP link (ESP32Link), same as on startup
-    d1 = data.get('d1', 50)
-    cmd = f"SET_PULSE,{d1}"
-
-    if esp_link:
+    if not data:
+        return jsonify({"status": "error", "message": "No data provided"}), 400
+    
+    # Save to file
+    if not save_settings(data):
+        return jsonify({"status": "error", "message": "Failed to save settings"}), 500
+    
+    # Send to ESP32
+    if esp_link and esp_link.connected:
         try:
-            log(f"📤 Sending to ESP32 (TCP): {cmd}")
+            # Send pulse settings
+            mode = data.get('mode', 1)
+            d1 = data.get('d1', 50)
+            gap1 = data.get('gap1', 0)
+            d2 = data.get('d2', 0)
+            gap2 = data.get('gap2', 0)
+            d3 = data.get('d3', 0)
+            
+            cmd = f"SET_PULSE,{mode},{d1},{gap1},{d2},{gap2},{d3}"
+            log(f"⚡ Sending to ESP32 (TCP): {cmd}")
             esp_link.send_command(cmd)
+            
         except Exception as e:
-            log(f"⚠️ Failed to send to ESP32 via TCP: {e}")
-    else:
-        log("⚠️ ESP32 TCP link not initialized")
-
+            log(f"⚠️ Failed to send settings to ESP32: {e}")
+    
     return jsonify({"status": "ok"})
 
+@app.route('/api/set_power', methods=['POST'])
+def api_set_power():
+    """Set weld power percentage"""
+    global esp_link
+    data = request.get_json()
+    power = data.get('power', 100)
+    
+    if esp_link and esp_link.connected:
+        try:
+            cmd = f"SET_POWER,{power}"
+            log(f"⚡ Sending to ESP32 (TCP): {cmd}")
+            esp_link.send_command(cmd)
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            log(f"⚠️ Failed to set power: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    else:
+        log("⚠️ ESP32 TCP link not initialized for SET_POWER")
+        return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+
+@app.route('/api/set_preheat', methods=['POST'])
+def api_set_preheat():
+    """Set preheat configuration"""
+    global esp_link
+    data = request.get_json()
+    enabled = 1 if data.get('enabled', False) else 0
+    duration = data.get('duration', 20)
+    power = data.get('power', 30)
+    
+    if esp_link and esp_link.connected:
+        try:
+            cmd = f"SET_PREHEAT,{enabled},{duration},{power}"
+            log(f"🔥 Sending to ESP32 (TCP): {cmd}")
+            esp_link.send_command(cmd)
+            return jsonify({"status": "ok"})
+        except Exception as e:
+            log(f"⚠️ Failed to set preheat: {e}")
+            return jsonify({"status": "error", "message": str(e)}), 500
+    else:
+        log("⚠️ ESP32 TCP link not initialized for SET_PREHEAT")
+        return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 @app.route('/api/get_presets')
-def get_presets_route():
+def api_get_presets():
     """Get all presets"""
     presets = load_presets()
-    return jsonify({"status": "ok", "presets": presets})
-
+    settings = load_settings()
+    return jsonify({
+        "status": "ok",
+        "presets": presets,
+        "active_preset": settings.get('active_preset')
+    })
 
 @app.route('/api/save_preset', methods=['POST'])
-def save_preset_route():
+def api_save_preset():
     """Save a preset"""
     data = request.get_json()
     preset_id = data.get('preset_id')
     preset_data = data.get('data')
-
+    
+    if not preset_id or not preset_data:
+        return jsonify({"status": "error", "message": "Missing preset_id or data"}), 400
+    
     presets = load_presets()
     presets[preset_id] = preset_data
-    save_presets(presets)
-
+    
+    if not save_presets(presets):
+        return jsonify({"status": "error", "message": "Failed to save preset"}), 500
+    
     return jsonify({"status": "ok"})
-
-
-@app.route('/api/weld_history')
-def weld_history():
-    """Get list of weld history files"""
-    files = get_weld_history_list()
-
-    # Get summary info for each weld
-    welds = []
-    for filename in files:
-        filepath = os.path.join(WELD_HISTORY_DIR, filename)
-        try:
-            with open(filepath, 'r') as f:
-                data = json.load(f)
-                welds.append({
-                    "filename": filename,
-                    "weld_number": data.get("weld_number"),
-                    "timestamp": data.get("timestamp"),
-                    "energy_joules": data.get("energy_joules"),
-                    "peak_current_amps": data.get("peak_current_amps"),
-                    "duration_ms": data.get("duration_ms"),
-                    "rise_time_ms": data.get("rise_time_ms", None)
-                })
-        except Exception:
-            pass
-
-    return jsonify({"status": "ok", "welds": welds})
-
-
-@app.route('/api/weld_data/<filename>')
-def weld_data(filename):
-    """Get specific weld data"""
-    filepath = os.path.join(WELD_HISTORY_DIR, filename)
-    if os.path.exists(filepath):
-        with open(filepath, 'r') as f:
-            return jsonify(json.load(f))
-    return jsonify({"status": "error", "message": "Weld not found"}), 404
-
-
-@app.route('/api/clear_weld_history', methods=['POST'])
-def clear_weld_history():
-    """
-    Clear all weld history JSON files and reset weld counter.
-    Also resets the counter in settings so it stays consistent.
-    """
-    global weld_counter
-
-    # 1. Delete weld history JSONs in WELD_HISTORY_DIR
-    try:
-        if os.path.isdir(WELD_HISTORY_DIR):
-            for f in os.listdir(WELD_HISTORY_DIR):
-                if f.startswith("weld_") and f.endswith(".json"):
-                    try:
-                        os.remove(os.path.join(WELD_HISTORY_DIR, f))
-                    except OSError as e:
-                        log(f"⚠️ Failed to remove {f}: {e}")
-    except Exception as e:
-        log(f"⚠️ Error while clearing weld history files: {e}")
-
-    # 2. Reset weld counter
-    weld_counter = 0
-
-    # 3. Persist reset counter into settings.json
-    settings = load_settings()
-    settings['weld_counter'] = 0
-    save_settings(settings)
-
-    log("🧹 Weld history cleared and weld_counter reset to 0")
-    return jsonify({"status": "ok"})
-
-
-@app.route('/api/logs')
-def api_logs():
-    """Get recent logs"""
-    return jsonify({"logs": list(log_buffer)})
-
-
-# SocketIO events
-@socketio.on('connect')
-def handle_connect():
-    log("WebSocket client connected")
-    with status_lock:
-        balance = calculate_cell_balance()
-        emit('status_update', {
-            **esp_status,
-            **cells_status,
-            "temperature": temperature,
-            "weld_counter": weld_counter,
-            "esp_connected": esp_connected,
-            "cell_balance": balance
-        })
-
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    log("WebSocket client disconnected")
-
-
-@socketio.on('clear_weld_data')
-def handle_clear_weld_data():
-    """
-    Socket.IO handler: Clear weld history files and reset weld counter.
-    Emits 'weld_data_cleared' back to all clients when done.
-    """
-    global weld_counter
-
-    log("🧹 Received clear_weld_data request from client")
-
-    # 1. Delete weld history JSONs
-    try:
-        if os.path.isdir(WELD_HISTORY_DIR):
-            for f in os.listdir(WELD_HISTORY_DIR):
-                if f.startswith("weld_") and f.endswith(".json"):
-                    try:
-                        os.remove(os.path.join(WELD_HISTORY_DIR, f))
-                    except OSError as e:
-                        log(f"⚠️ Failed to remove {f}: {e}")
-    except Exception as e:
-        log(f"⚠️ Error while clearing weld history files: {e}")
-
-    # 2. Reset weld counter in memory
-    weld_counter = 0
-
-    # 3. Persist reset counter into settings.json
-    settings = load_settings()
-    settings['weld_counter'] = 0
-    save_settings(settings)
-
-    log("🧹 Weld history cleared and weld_counter reset to 0")
-
-    # 4. Notify all connected clients so they can refresh
-    socketio.emit('weld_data_cleared')
-
-
-# Background threads
-def status_broadcast_thread():
-    """Broadcast status updates (weld capture handled by on_esp_log)."""
-    global pedal_active
-
-    while True:
-        time.sleep(0.1)  # 10 Hz
-
-        with status_lock:
-            balance = calculate_cell_balance()
-            socketio.emit('status_update', {
-                **esp_status,
-                **cells_status,
-                "temperature": temperature,
-                "pedal_active": pedal_active,
-                "weld_counter": weld_counter,
-                "esp_connected": esp_connected,
-                "cell_balance": balance
-            })
-
-
-def cleanup():
-    """Cleanup GPIO on exit"""
-    try:
-        import RPi.GPIO as GPIO
-        GPIO.cleanup()
-        log("GPIO cleanup complete")
-    except Exception:
-        pass
-
-
-import atexit
-atexit.register(cleanup)
-
-
-if __name__ == '__main__':
-    print("=" * 60, flush=True)
-    print("🔥 Spot Welder Control Server", flush=True)
-    print("=" * 60, flush=True)
-
-    # Load weld counter
-    settings = load_settings()
-    weld_counter = settings.get('weld_counter', 0)
-    log(f"Weld counter: {weld_counter}")
-
-    # Skip Pi ADS1256 – ADC is handled on ESP32 via WDATA
-    log("Skipping Pi ADS1256 init (handled on ESP32)")
-    adc = None
-
-    # Initialize ESP32 link
-    log("Initializing ESP32 link...")
-    try:
-        esp_link = ESP32Link(
-            host='192.168.68.56',  # UPDATE THIS IP if your ESP32 has a different address
-            port=8888,
-            status_callback=on_esp_status,
-            weld_data_callback=on_esp_log
-        )
-
-        if esp_link.start():
-            log("✅ ESP32 link started")
-
-            # Send saved settings to ESP32 after brief delay
-            time.sleep(0.5)  # Brief delay for ESP32 to be ready
-            settings = load_settings()
-            d1 = settings.get('d1', 50)
-            cmd = f"SET_PULSE,{d1}"
-            log(f"📤 Syncing settings to ESP32: {cmd}")
-            esp_link.send_command(cmd)
-        else:
-            log("⚠️ ESP32 link failed to start")
-    except Exception as e:
-        log(f"⚠️ ESP32 link init error: {e}")
-
-    # Start background thread
-    broadcast_thread = threading.Thread(target=status_broadcast_thread, daemon=True)
-    broadcast_thread.start()
-    log("Background broadcast thread started")
-
-    # Run server
-    log("Starting Flask-SocketIO server on port 8080")
-    socketio.run(app, host='0.0.0.0', port=8080, debug=False, allow_unsafe_werkzeug=True)
-
 
 @app.route('/api/arm', methods=['POST'])
 def api_arm():
-    """ARM the welder"""
-    global esp32_ws
-    if esp32_ws:
-        try:
-            esp32_ws.send("ARM")
-            log("🔓 System ARMED")
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            log(f"⚠️ Failed to ARM: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+    """Arm the welder"""
+    global esp_link
+    if esp_link and esp_link.connected:
+        esp_link.send_command("ARM")
+        return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
-
 
 @app.route('/api/disarm', methods=['POST'])
 def api_disarm():
-    """DISARM the welder"""
-    global esp32_ws
-    if esp32_ws:
-        try:
-            esp32_ws.send("DISARM")
-            log("🔒 System DISARMED")
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            log(f"⚠️ Failed to DISARM: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
+    """Disarm the welder"""
+    global esp_link
+    if esp_link and esp_link.connected:
+        esp_link.send_command("DISARM")
+        return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
-
 
 @app.route('/api/fire', methods=['POST'])
 def api_fire():
-    """Manually fire a weld"""
-    global esp32_ws
-    if esp32_ws:
-        try:
-            # esp32_ws.send("FIRE")  # disabled: pedal-only mode
-            # log("🔥 Manual FIRE command sent")  # disabled: pedal-only mode
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            # log(f"⚠️ Failed to FIRE: {e}")  # disabled: pedal-only mode
-            return jsonify({"status": "error", "message": str(e)}), 500
+    """Manual fire"""
+    global esp_link
+    if esp_link and esp_link.connected:
+        esp_link.send_command("FIRE")
+        return jsonify({"status": "ok"})
     return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
-
 
 @app.route('/api/charge_on', methods=['POST'])
 def api_charge_on():
     """Turn charging ON"""
     global esp_link
-    if esp_link:
-        try:
-            cmd = "CHARGE_ON"
-            log(f"⚡ Sending to ESP32 (TCP): {cmd}")
-            esp_link.send_command(cmd)
-            return jsonify({"status": "ok"})
-        except Exception as e:
-            log(f"⚠️ Failed to turn charging ON via TCP: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-    else:
-        log("⚠️ ESP32 TCP link not initialized for CHARGE_ON")
-        return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
-
+    if esp_link and esp_link.connected:
+        esp_link.send_command("CHARGE_ON")
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
 
 @app.route('/api/charge_off', methods=['POST'])
 def api_charge_off():
     """Turn charging OFF"""
     global esp_link
-    if esp_link:
+    if esp_link and esp_link.connected:
+        esp_link.send_command("CHARGE_OFF")
+        return jsonify({"status": "ok"})
+    return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+
+# ========== SOCKETIO EVENTS ==========
+@socketio.on('connect')
+def handle_connect():
+    """Client connected"""
+    log(f"🌐 Client connected: {request.sid}")
+    # Send current status
+    emit('status_update', {**last_status, 'esp_connected': esp_connected})
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    """Client disconnected"""
+    log(f"🌐 Client disconnected: {request.sid}")
+
+# ========== STARTUP ==========
+# ========== STARTUP ==========
+# ========== STARTUP ==========
+def init_esp32_connection():
+    """Initialize ESP32 connection in background"""
+    global esp_link, esp_connected
+    
+    log("🔌 Starting ESP32 connection manager...")
+    
+    while True:
         try:
-            cmd = "CHARGE_OFF"
-            log(f"⏸️ Sending to ESP32 (TCP): {cmd}")
-            esp_link.send_command(cmd)
-            return jsonify({"status": "ok"})
+            # Check if we need to reconnect
+            if esp_link is None or not esp_link.connected:
+                
+                # Clean up old link if it exists
+                if esp_link is not None:
+                    try:
+                        esp_link.disconnect()
+                    except:
+                        pass
+                
+                # Create fresh connection
+                esp_link = ESP32Link(ESP32_IP, ESP32_PORT)
+                
+                if esp_link.connect():
+                    esp_connected = True
+                    socketio.emit('status_update', {'esp_connected': True})
+                    log("✅ ESP32 connected successfully!")
+                else:
+                    esp_connected = False
+                    socketio.emit('status_update', {'esp_connected': False})
+                    log("❌ Connection failed, retrying in 3 seconds...")
+                    time.sleep(3)
+            else:
+                # Already connected, just wait
+                time.sleep(1)
+                
         except Exception as e:
-            log(f"⚠️ Failed to turn charging OFF via TCP: {e}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-    else:
-        log("⚠️ ESP32 TCP link not initialized for CHARGE_OFF")
-        return jsonify({"status": "error", "message": "ESP32 not connected"}), 503
+            log(f"❌ Connection manager error: {e}")
+            esp_connected = False
+            socketio.emit('status_update', {'esp_connected': False})
+            time.sleep(3)
+
+# ========== MAIN ==========
+if __name__ == '__main__':
+    log("🚀 Starting Spot Welder Control Server")
+    log(f"📡 ESP32 Target: {ESP32_IP}:{ESP32_PORT}")
+    
+    # Start ESP32 connection thread
+    esp_thread = threading.Thread(target=init_esp32_connection, daemon=True)
+    esp_thread.start()
+    
+    # Start Flask server
+    log("🌐 Starting web server on http://0.0.0.0:8080")
+    socketio.run(app, host='0.0.0.0', port=8080, debug=False, allow_unsafe_werkzeug=True)
