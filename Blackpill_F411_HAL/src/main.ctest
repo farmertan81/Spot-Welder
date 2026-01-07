@@ -1,0 +1,81 @@
+#include <stdio.h>
+#include <string.h>
+
+#include "stm32f4xx_hal.h"
+
+UART_HandleTypeDef huart1;
+
+void send_status(void);
+
+int main(void) {
+    // Minimal clock setup - HSI 16 MHz
+    RCC->CR |= RCC_CR_HSION;
+    while (!(RCC->CR & RCC_CR_HSIRDY));
+    RCC->CFGR = 0;
+
+    // SysTick for delays
+    SysTick->LOAD = 16000 - 1;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_ENABLE_Msk |
+                    SysTick_CTRL_TICKINT_Msk;
+
+    // LED on PC13
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN;
+    GPIOC->MODER &= ~(3U << 26);
+    GPIOC->MODER |= (1U << 26);
+
+    // Blink 3 times (startup indicator)
+    for (int i = 0; i < 6; i++) {
+        GPIOC->ODR ^= (1 << 13);
+        for (volatile int d = 0; d < 1000000; d++);
+    }
+
+    // Init UART1
+    __HAL_RCC_USART1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Pin = GPIO_PIN_9 | GPIO_PIN_10;
+    gpio.Mode = GPIO_MODE_AF_PP;
+    gpio.Pull = GPIO_NOPULL;
+    gpio.Speed = GPIO_SPEED_FREQ_HIGH;
+    gpio.Alternate = GPIO_AF7_USART1;
+    HAL_GPIO_Init(GPIOA, &gpio);
+
+    huart1.Instance = USART1;
+    huart1.Init.BaudRate = 115200;
+    huart1.Init.WordLength = UART_WORDLENGTH_8B;
+    huart1.Init.StopBits = UART_STOPBITS_1;
+    huart1.Init.Parity = UART_PARITY_NONE;
+    huart1.Init.Mode = UART_MODE_TX_RX;
+    huart1.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart1.Init.OverSampling = UART_OVERSAMPLING_16;
+    HAL_UART_Init(&huart1);
+
+    char msg[] = "[STM32] Boot OK\r\n";
+    HAL_UART_Transmit(&huart1, (uint8_t*)msg, strlen(msg), 1000);
+
+    uint32_t last_send = 0;
+
+    while (1) {
+        // Send status every 1 second
+        if (HAL_GetTick() - last_send > 1000) {
+            send_status();
+            GPIOC->ODR ^= (1 << 13);  // Toggle LED
+            last_send = HAL_GetTick();
+        }
+    }
+}
+
+void send_status(void) {
+    char buf[128];
+    snprintf(buf, sizeof(buf),
+             "STATUS,enabled=1,state=READY,vpack=12.6,i=0.0,temp=25.0\r\n");
+    HAL_UART_Transmit(&huart1, (uint8_t*)buf, strlen(buf), 1000);
+}
+
+// SysTick handler for HAL_GetTick()
+volatile uint32_t uwTick = 0;
+void SysTick_Handler(void) { uwTick++; }
+
+uint32_t HAL_GetTick(void) { return uwTick; }

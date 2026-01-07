@@ -1,0 +1,31 @@
+#include <Arduino.h>
+
+// Define our custom pins
+#define STM32_TX_PIN 11  // ESP32 RX pin (receives from STM32 TX)
+#define STM32_RX_PIN 12  // ESP32 TX pin (sends to STM32 RX)
+
+HardwareSerial STM32Serial(1);  // Use UART1
+
+void setup() {
+    Serial.begin(115200);  // Debug output to PC
+
+    // Initialize connection to STM32
+    // .begin(baud, config, rxPin, txPin)
+    STM32Serial.begin(115200, SERIAL_8N1, STM32_TX_PIN, STM32_RX_PIN);
+
+    Serial.println("ESP32 to STM32 UART Link Initialized");
+}
+
+void loop() {
+    // Example: Forward everything from STM32 to PC Serial Monitor
+    if (STM32Serial.available()) {
+        Serial.write(STM32Serial.read());
+    }
+
+    // Example: Send a heartbeat to STM32 every second
+    static unsigned long lastTime = 0;
+    if (millis() - lastTime > 1000) {
+        STM32Serial.println("PING FROM ESP32");
+        lastTime = millis();
+    }
+}

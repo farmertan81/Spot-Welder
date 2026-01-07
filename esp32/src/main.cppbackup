@@ -12,18 +12,13 @@ SemaphoreHandle_t i2c_mutex = NULL;
 
 // -------------------- Pin Definitions --------------------
 #define FET_CHARGE 5
-#define FET_WELD 4   // SAFETY: held LOW, ESP32 no longer welds
-#define PEDAL_PIN 6  // UNUSED now (pedal moves to STM32)
+#define FET_WELD 4
+#define PEDAL_PIN 6
 #define I2C_SDA 2
 #define I2C_SCL 3
 #define THERM_PIN 7
 #define LED_PIN 21
 #define BUTTON_PIN 1
-
-// -------------------- STM32 UART bridge pins -------------
-#define STM32_TO_ESP32_PIN 11  // ESP32 RX  <- STM32 TX (PA9)
-#define ESP32_TO_STM32_PIN 12  // ESP32 TX  -> STM32 RX (PA10)
-HardwareSerial STM32Serial(2);
 
 // -------------------- WiFi / TCP Settings ----------------
 const char* ssid = "Jaime's Wi-Fi Network";
@@ -40,7 +35,7 @@ INA226 inaCell2(0x44);  // Node 2
 // -------------------- LED & Button -----------------------
 Adafruit_NeoPixel led(1, LED_PIN, NEO_RGB + NEO_KHZ800);
 bool system_enabled = true;
-volatile bool welding_now = false;  // driven by STM32 events
+volatile bool welding_now = false;
 
 // -------------------- Battery monitoring -----------------
 float vpack = 0.0;
@@ -56,8 +51,9 @@ const float VPACK_SCALE = 1.000;
 const float CHARGE_LIMIT = 9.16;
 const float CHARGE_RESUME = 8.70;
 const float HARD_LIMIT = 9.2;
+const float MIN_WELD_VOLTAGE = 8.5;
 
-// -------------------- Weld settings (forwarded to STM32) --
+// -------------------- Weld settings ----------------------
 uint8_t weld_mode = 1;  // 1=single, 2=double, 3=triple
 uint16_t weld_d1 = 10;
 uint16_t weld_gap1 = 0;
@@ -68,38 +64,45 @@ uint8_t weld_power_pct = 100;  // 50-100%
 bool preheat_enabled = false;
 uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
-uint16_t preheat_gap_ms = 3;
+uint16_t preheat_gap_ms = 3;  // default gap between preheat and main
 
-uint16_t weld_duration_ms = 10;  // legacy: still shown in STATUS
+uint16_t weld_duration_ms = 10;  // Keep for backward compatibility
 unsigned long last_weld_time = 0;
 const unsigned long WELD_COOLDOWN = 500;
+
+// SAFETY: Hard cap (can be adjusted for testing)
+const uint16_t MAX_WELD_DURATION_MS = 200;
+
+// -------------------- PWM Settings -----------------------
+#define PWM_CHANNEL 0
+#define PWM_FREQ 10000     // 10 kHz
+#define PWM_RESOLUTION 10  // 10-bit (0-1023)
 
 // -------------------- Thermistor -------------------------
 float temperature_c = NAN;
 float temp_ema = NAN;
 float temp_last_valid = NAN;
 
-const float SERIES_RESISTOR = 10000.0f;
-const float THERMISTOR_NOMINAL = 10000.0f;
-const float TEMPERATURE_NOMINAL = 25.0f;
-const float BETA_COEFF = 3950.0f;
+const float SERIES_RESISTOR = 10000.0f;     // 10kΩ series resistor
+const float THERMISTOR_NOMINAL = 10000.0f;  // 10kΩ @ 25°C
+const float TEMPERATURE_NOMINAL = 25.0f;    // 25°C (not 20°C)
+const float BETA_COEFF = 3950.0f;           // B-value from datasheet
 const float TEMP_EMA_ALPHA = 0.05f;
 const float TEMP_OUTLIER_THRESH = 5.0f;
+const float TEMP_WARN = 55.0f;    // Start warning
+const float TEMP_CUTOFF = 70.0f;  // Hard stop
 
 // Calibration offset in °C (matches Fluke at ambient)
 float TEMP_OFFSET_C = -2.2f;
 
 // -------------------- Forward declarations ---------------
+void fireWeld(int durationMs);
 void updateBattery();
 void updateTemperature();
 void controlCharger();
 void processCommand(String cmd);
 String buildStatus();
 void sendToPi(const String& msg);
-void forwardToStm32(const String& line);
-void pollStm32Uart();
-void updateLED();
-void handleButton();
 
 // -------------------- Cell reading helpers ---------------
 bool readCellsOnce(float& V1, float& V2, float& V3, float& C1, float& C2,
@@ -108,29 +111,19 @@ bool readCellsOnce(float& V1, float& V2, float& V3, float& C1, float& C2,
         return false;
     }
 
-    // Read node1 bus voltage register (0x02) directly for raw mV conversion
     Wire.beginTransmission(0x41);
     Wire.write(0x02);
     Wire.endTransmission(false);
     Wire.requestFrom((uint8_t)0x41, (uint8_t)2);
-    if (Wire.available() < 2) {
-        xSemaphoreGive(i2c_mutex);
-        return false;
-    }
     uint16_t raw1 = (Wire.read() << 8) | Wire.read();
-    float v_node1_raw = raw1 * 0.00125f;
+    float v_node1_raw = raw1 * 0.00125;
 
-    // Read node2 bus voltage register (0x02)
     Wire.beginTransmission(0x44);
     Wire.write(0x02);
     Wire.endTransmission(false);
     Wire.requestFrom((uint8_t)0x44, (uint8_t)2);
-    if (Wire.available() < 2) {
-        xSemaphoreGive(i2c_mutex);
-        return false;
-    }
     uint16_t raw2 = (Wire.read() << 8) | Wire.read();
-    float v_node2_raw = raw2 * 0.00125f;
+    float v_node2_raw = raw2 * 0.00125;
 
     xSemaphoreGive(i2c_mutex);
 
@@ -172,6 +165,7 @@ void updateTemperature() {
     float t_raw = readThermistorOnce();
     if (!isfinite(t_raw)) return;
 
+    // Apply calibration offset so it matches Fluke
     t_raw += TEMP_OFFSET_C;
 
     if (!isfinite(temp_last_valid)) {
@@ -195,14 +189,15 @@ void updateTemperature() {
     temperature_c = temp_ema;
 }
 
-// -------------------- Helper: Build STATUS line ----------
+// ---- Helper: Build STATUS line -------------------
 String buildStatus() {
     bool charge_on = digitalRead(FET_CHARGE);
     String state = charge_on ? "ON" : "OFF";
 
+    // Temperature string
     String t_str;
     if (isfinite(temperature_c)) {
-        t_str = String(temperature_c, 1);
+        t_str = String(temperature_c, 1);  // 1 decimal
     } else {
         t_str = "NaN";
     }
@@ -211,11 +206,11 @@ String buildStatus() {
     long cooldown_ms = (long)(WELD_COOLDOWN - (now - last_weld_time));
     if (cooldown_ms < 0) cooldown_ms = 0;
 
-    float display_current =
-        (fabs(current_charge) < 0.2f) ? 0.0f : current_charge;
+    // Apply 0.2A threshold to ignore noise
+    float display_current = (abs(current_charge) < 0.2) ? 0.0 : current_charge;
 
     String status = "STATUS";
-    status += ",enabled=" + String(system_enabled ? 1 : 0);
+    status += ",enabled=1";
     status += ",state=" + state;
     status += ",vpack=" + String(vpack, 3);
     status += ",i=" + String(display_current, 3);
@@ -247,67 +242,36 @@ void sendToPi(const String& msg) {
     }
 }
 
-// -------------------- UART forward helper ----------------
-void forwardToStm32(const String& line) {
-    STM32Serial.println(line);
-    Serial.printf("[UART->STM32] %s\n", line.c_str());
-}
-
-// -------------------- STM32 UART RX -> Pi relay ----------
-void pollStm32Uart() {
-    static String stmLine;
-
-    while (STM32Serial.available()) {
-        char ch = (char)STM32Serial.read();
-        if (ch == '\r') continue;
-
-        if (ch == '\n') {
-            stmLine.trim();
-            if (stmLine.length() > 0) {
-                Serial.printf("[STM32->UART] %s\n", stmLine.c_str());
-
-                if (stmLine.startsWith("EVENT,WELD_START")) {
-                    welding_now = true;
-                } else if (stmLine.startsWith("EVENT,WELD_DONE")) {
-                    welding_now = false;
-                    last_weld_time = millis();
-                }
-
-                sendToPi(stmLine);
-            }
-            stmLine = "";
-        } else {
-            if (stmLine.length() < 220) stmLine += ch;
-        }
-    }
-}
-
 // -------------------- Battery / Charger ------------------
 void updateBattery() {
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        // Read pack voltage (bus voltage)
         float raw_vpack = ina.readBusVoltage();
         vpack = raw_vpack * VPACK_SCALE;
 
-        // Shunt voltage reg (0x01): 2.5uV/bit (signed)
+        // Read shunt voltage directly (register 0x01)
         Wire.beginTransmission(0x40);
-        Wire.write(0x01);
+        Wire.write(0x01);  // Shunt voltage register
         Wire.endTransmission(false);
         Wire.requestFrom((uint8_t)0x40, (uint8_t)2);
 
         if (Wire.available() >= 2) {
             int16_t raw_shunt = (Wire.read() << 8) | Wire.read();
-            float shunt_voltage_v = raw_shunt * 0.0000025f;
 
-            // NOTE: your shunt is assumed 0.2 mΩ here:
-            // I = V / R
-            float calculated_current = shunt_voltage_v / 0.0002f;
+            // Convert to voltage: LSB = 2.5 µV
+            float shunt_voltage_v = raw_shunt * 0.0000025;  // 2.5 µV per bit
+
+            // Calculate current: I = V / R
+            // R = 0.0002 Ω (0.2 mΩ)
+            float calculated_current = shunt_voltage_v / 0.0002;
+
+            // Negative because charging flows opposite direction
             current_charge = -calculated_current;
         }
 
         xSemaphoreGive(i2c_mutex);
     }
 }
-
 void controlCharger() {
     if (!system_enabled || welding_now) {
         digitalWrite(FET_CHARGE, LOW);
@@ -335,155 +299,226 @@ void controlCharger() {
     }
 }
 
-// -------------------- Command Parser ---------------------
+// -------------------- Weld Logic (WITH PWM + PREHEAT) ----
+void fireWeld(int durationMs) {
+    // Temperature safety
+    if (isfinite(temperature_c) && temperature_c > TEMP_CUTOFF) {
+        Serial.printf("WELD: blocked, temp too high (%.1fC)\n", temperature_c);
+        return;
+    }
+
+    if (!system_enabled) {
+        Serial.println("WELD: blocked (system disabled)");
+        return;
+    }
+    if (welding_now) {
+        Serial.println("WELD: blocked (already welding)");
+        return;
+    }
+
+    // SAFETY: Hard cap
+    if (durationMs < 1) durationMs = 1;
+    if (durationMs > MAX_WELD_DURATION_MS) {
+        Serial.printf("⚠️ WELD: requested %d ms, capped to %d ms\n", durationMs,
+                      MAX_WELD_DURATION_MS);
+        durationMs = MAX_WELD_DURATION_MS;
+    }
+
+    welding_now = true;
+
+    // HARD INTERLOCK: ensure charger is OFF
+    digitalWrite(FET_CHARGE, LOW);
+    ledcWrite(PWM_CHANNEL, 0);  // Ensure PWM is off
+    delayMicroseconds(2000);    // deadtime
+
+    uint32_t total_start_us = micros();
+
+    // ========== PREHEAT PHASE (if enabled) ==========
+    if (preheat_enabled && preheat_ms > 0) {
+        Serial.printf("🔥 PREHEAT: %dms @ %d%%\n", preheat_ms, preheat_pct);
+        // Set PWM duty for preheat
+        uint16_t preheat_duty = (preheat_pct * 1023) / 100;
+        ledcWrite(PWM_CHANNEL, preheat_duty);
+
+        // Preheat pulse
+        delayMicroseconds(preheat_ms * 1000UL);
+
+        // Turn off between preheat and main pulse (5ms gap)
+        ledcWrite(PWM_CHANNEL, 0);
+        delayMicroseconds((uint32_t)preheat_gap_ms * 1000UL);
+    }
+
+    // ========== MAIN WELD PULSE ==========
+    Serial.printf("⚡ MAIN PULSE: %dms @ %d%%\n", durationMs, weld_power_pct);
+
+    // Set PWM duty for main pulse
+    uint16_t weld_duty = (weld_power_pct * 1023) / 100;
+    ledcWrite(PWM_CHANNEL, weld_duty);
+
+    // Main weld pulse (precise timing)
+    uint32_t weld_start_us = micros();
+    noInterrupts();
+    delayMicroseconds(durationMs * 1000UL);
+    asm volatile("nop");
+    interrupts();
+    uint32_t weld_actual_us = micros() - weld_start_us;
+
+    // ========== CLEANUP ==========
+    ledcWrite(PWM_CHANNEL, 0);  // Turn off PWM
+    welding_now = false;
+
+    uint32_t total_actual_us = micros() - total_start_us;
+
+    Serial.printf(
+        "✅ WELD_COMPLETE: main pulse = %lu us (%.2f ms), total = %lu us (%.2f "
+        "ms)\n",
+        (unsigned long)weld_actual_us, weld_actual_us / 1000.0f,
+        (unsigned long)total_actual_us, total_actual_us / 1000.0f);
+
+    last_weld_time = millis();
+
+    // Send weld complete message to Pi
+    String weld_msg = "WELD_COMPLETE";
+    weld_msg += ",duration_ms=" + String(weld_actual_us / 1000.0f, 2);
+    weld_msg += ",total_ms=" + String(total_actual_us / 1000.0f, 2);
+    weld_msg += ",power_pct=" + String(weld_power_pct);
+    if (preheat_enabled) {
+        weld_msg += ",preheat_ms=" + String(preheat_ms);
+        weld_msg += ",preheat_pct=" + String(preheat_pct);
+        weld_msg += ",preheat_gap_ms=" + String(preheat_gap_ms);
+    }
+    sendToPi(weld_msg);
+}
+
+// ---- Command Parser ----
 void processCommand(String cmd) {
     Serial.printf("[CMD] Processing: %s\n", cmd.c_str());
 
     if (cmd.startsWith("SET_PULSE,")) {
-        int idx = 10;
+        // Parse: SET_PULSE,mode,d1,gap1,d2,gap2,d3
+        int idx = 10;  // skip "SET_PULSE,"
         int commaPos;
 
+        // mode
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             weld_mode = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // d1
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             weld_d1 = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // gap1
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             weld_gap1 = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // d2
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             weld_d2 = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // gap2
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             weld_gap2 = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // d3 (last one, no comma)
         weld_d3 = cmd.substring(idx).toInt();
+
+        // Update legacy weld_duration_ms for fireWeld()
         weld_duration_ms = weld_d1;
 
-        Serial.printf("✅ Pulse: mode=%d d1=%d gap1=%d d2=%d gap2=%d d3=%d\n",
-                      weld_mode, weld_d1, weld_gap1, weld_d2, weld_gap2,
-                      weld_d3);
-
-        forwardToStm32(cmd);
+        Serial.printf(
+            "✅ Pulse settings: mode=%d d1=%d gap1=%d d2=%d gap2=%d d3=%d\n",
+            weld_mode, weld_d1, weld_gap1, weld_d2, weld_gap2, weld_d3);
         sendToPi("ACK:SET_PULSE," + String(weld_mode));
-        return;
-    }
-
-    if (cmd.startsWith("SET_POWER,")) {
+    } else if (cmd.startsWith("SET_POWER,")) {
         weld_power_pct = cmd.substring(10).toInt();
         if (weld_power_pct < 50) weld_power_pct = 50;
         if (weld_power_pct > 100) weld_power_pct = 100;
-
         Serial.printf("✅ Weld power set to %d%%\n", weld_power_pct);
-
-        forwardToStm32(cmd);
         sendToPi("ACK:SET_POWER," + String(weld_power_pct));
-        return;
-    }
-
-    if (cmd.startsWith("SET_PREHEAT,")) {
-        int idx = 12;
+    } else if (cmd.startsWith("SET_PREHEAT,")) {
+        // Parse: SET_PREHEAT,enabled,duration,power,gap_ms
+        int idx = 12;  // skip "SET_PREHEAT,"
         int commaPos;
 
+        // enabled
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             preheat_enabled = (cmd.substring(idx, commaPos).toInt() == 1);
             idx = commaPos + 1;
         }
 
+        // duration
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             preheat_ms = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         }
 
+        // power
         commaPos = cmd.indexOf(',', idx);
         if (commaPos > 0) {
             preheat_pct = cmd.substring(idx, commaPos).toInt();
             idx = commaPos + 1;
         } else {
+            // no gap provided
             preheat_pct = cmd.substring(idx).toInt();
             Serial.printf("✅ Preheat: %s, %dms, %d%% (gap unchanged=%dms)\n",
                           preheat_enabled ? "ON" : "OFF", preheat_ms,
                           preheat_pct, preheat_gap_ms);
-
-            forwardToStm32(cmd);
             sendToPi("ACK:SET_PREHEAT," + String(preheat_enabled ? 1 : 0));
             return;
         }
 
+        // gap_ms (last field)
         preheat_gap_ms = cmd.substring(idx).toInt();
 
         Serial.printf("✅ Preheat: %s, %dms, %d%%, gap=%dms\n",
                       preheat_enabled ? "ON" : "OFF", preheat_ms, preheat_pct,
                       preheat_gap_ms);
 
-        forwardToStm32(cmd);
         sendToPi("ACK:SET_PREHEAT," + String(preheat_enabled ? 1 : 0));
-        return;
-    }
 
-    if (cmd.startsWith("ARM,")) {
-        forwardToStm32(cmd);
-        sendToPi("ACK:ARM_FWD");
-        return;
-    }
-
-    if (cmd == "FIRE") {
-        Serial.println("⚠️ FIRE ignored (STM32 pedal-only mode)");
-        sendToPi("ACK:FIRE_IGNORED");
-        return;
-    }
-
-    if (cmd == "CHARGE_ON") {
+    } else if (cmd == "FIRE") {
+        Serial.println("⚠️ FIRE command ignored (pedal‑only mode)");
+    } else if (cmd == "CHARGE_ON") {
         digitalWrite(FET_CHARGE, HIGH);
         Serial.println("✅ Charging ON (manual)");
         sendToPi("ACK:CHARGE_ON");
-        return;
-    }
-
-    if (cmd == "CHARGE_OFF") {
+    } else if (cmd == "CHARGE_OFF") {
         digitalWrite(FET_CHARGE, LOW);
         Serial.println("✅ Charging OFF (manual)");
         sendToPi("ACK:CHARGE_OFF");
-        return;
+    } else if (cmd == "STATUS") {
+        String status = buildStatus();
+        sendToPi(status);
     }
-
-    if (cmd == "STATUS") {
-        sendToPi(buildStatus());
-        forwardToStm32("STATUS");
-        return;
-    }
-
-    // Unknown: ignore
 }
 
 // -------------------- LED update -------------------------
 void updateLED() {
     if (!system_enabled) {
-        led.setPixelColor(0, led.Color(255, 0, 0));
+        led.setPixelColor(0, led.Color(255, 0, 0));  // Red = disabled
     } else if (welding_now) {
-        led.setPixelColor(0, led.Color(255, 255, 255));
+        led.setPixelColor(0, led.Color(255, 255, 255));  // White = welding
     } else if (digitalRead(FET_CHARGE)) {
-        led.setPixelColor(0, led.Color(0, 0, 255));
+        led.setPixelColor(0, led.Color(0, 0, 255));  // Blue = charging
     } else {
-        led.setPixelColor(0, led.Color(0, 255, 0));
+        led.setPixelColor(0, led.Color(0, 255, 0));  // Green = ready
     }
     led.show();
 }
@@ -529,9 +564,6 @@ void handleButton() {
 
         if (!system_enabled) {
             digitalWrite(FET_CHARGE, LOW);
-            forwardToStm32("ARM,0");  // disarm when disabled
-        } else {
-            forwardToStm32("ARM,1");  // re-arm when enabled
         }
 
         waiting_for_double = false;
@@ -539,47 +571,11 @@ void handleButton() {
 
     was_pressed = is_pressed;
 }
-void ensureWiFiAndServer() {
-    static unsigned long last_attempt = 0;
-    static bool server_started = false;
-
-    // If we are connected, ensure server is started
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!server_started) {
-            Serial.println("✅ WiFi connected (re) - IP: " +
-                           WiFi.localIP().toString());
-            Serial.println("Starting TCP server on port 8888...");
-            server.begin();
-            server.setNoDelay(true);
-            server_started = true;
-        }
-        return;
-    }
-
-    // Not connected: mark server not started, drop any client
-    server_started = false;
-    if (client) {
-        client.stop();
-    }
-
-    // Retry WiFi every 5 seconds
-    unsigned long now = millis();
-    if (now - last_attempt > 5000) {
-        last_attempt = now;
-        Serial.println("⚠️ WiFi disconnected; retrying...");
-        WiFi.reconnect();  // or WiFi.begin(ssid, password) if you prefer
-    }
-}
 
 // -------------------- Setup ------------------------------
 void setup() {
     Serial.begin(115200);
-    delay(500);
-
-    // UART to STM32
-    STM32Serial.begin(115200, SERIAL_8N1, STM32_TO_ESP32_PIN,
-                      ESP32_TO_STM32_PIN);
-    Serial.println("✅ STM32 UART bridge ready (Serial2 @ 115200)");
+    delay(2000);
 
     // Create I²C mutex
     i2c_mutex = xSemaphoreCreateMutex();
@@ -589,38 +585,49 @@ void setup() {
         Serial.println("✅ I²C mutex created");
     }
 
-    Serial.println(
-        "\n=== ESP32 Weld Controller - GATEWAY MODE (STM32 weld) ===");
+    Serial.println();
+    Serial.println("*****************************");
+    Serial.println("***  SETUP() HAS STARTED  ***");
+    Serial.println("*****************************");
+    Serial.flush();
 
-    // Pins
+    Serial.println("\n=== ESP32 Weld Controller v3.1 - WITH PWM + PREHEAT ===");
+    Serial.printf("⚠️ SAFETY: Max weld duration capped at %d ms\n",
+                  MAX_WELD_DURATION_MS);
+
+    // Set all OTHER pins first (NOT FET_CHARGE yet!)
     pinMode(FET_WELD, OUTPUT);
-    digitalWrite(FET_WELD, LOW);  // ALWAYS LOW on ESP32
-
-    pinMode(PEDAL_PIN, INPUT_PULLUP);  // not used anymore
+    digitalWrite(FET_WELD, LOW);
+    pinMode(PEDAL_PIN, INPUT_PULLUP);
     pinMode(THERM_PIN, INPUT);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
 
     led.begin();
     led.setBrightness(50);
-    led.setPixelColor(0, led.Color(255, 255, 0));
+    led.setPixelColor(0, led.Color(255, 255, 0));  // Yellow = booting
     led.show();
+
+    // Setup PWM for FET_WELD
+    ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
+    ledcAttachPin(FET_WELD, PWM_CHANNEL);
+    ledcWrite(PWM_CHANNEL, 0);
+    Serial.printf("✅ PWM initialized: %d Hz, %d-bit resolution\n", PWM_FREQ,
+                  PWM_RESOLUTION);
 
     analogReadResolution(12);
 
-    // I²C
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(50000);
     Wire.setTimeOut(1000);
 
-    // Quick scan of expected INAs
-    Serial.println("\n=== I²C Device Check (expected 0x40, 0x41, 0x44) ===");
-    uint8_t addrs[] = {0x40, 0x41, 0x44};
+    Serial.println("\n=== I²C Device Scan ===");
+    uint8_t addrs[] = {0x40, 0x44, 0x41};
     for (uint8_t addr : addrs) {
         Wire.beginTransmission(addr);
         uint8_t err = Wire.endTransmission();
         Serial.printf("I2C addr 0x%02X -> %s\n", addr,
-                      (err == 0) ? "OK" : "NO ACK");
+                      err == 0 ? "OK" : "NO ACK");
         delay(10);
     }
 
@@ -628,7 +635,7 @@ void setup() {
         if (ina.begin(&Wire)) {
             Serial.println("✅ INA226 (pack) initialized");
 
-            // Configure pack INA (0x40)
+            // ==== MANUAL INA226 CONFIGURATION ====
             Wire.beginTransmission(0x40);
             Wire.write(0x00);
             Wire.write(0x45);
@@ -644,35 +651,92 @@ void setup() {
             Wire.endTransmission();
             delay(10);
 
+            Serial.printf("   Calibration: 0x%04X (%d)\n", cal_value,
+                          cal_value);
+            Serial.printf("   Expected: 0xA3EF (41967)\n");
+
+            Wire.beginTransmission(0x40);
+            Wire.write(0x00);
+            Wire.endTransmission(false);
+            Wire.requestFrom((uint8_t)0x40, (uint8_t)2);
+            uint16_t config = (Wire.read() << 8) | Wire.read();
+            Serial.printf("   INA Config: 0x%04X\n", config);
+            delay(10);
+
             if (inaCell1.begin(&Wire)) {
                 Serial.println("✅ INA226 cell1 (0x41) initialized");
             } else {
                 Serial.println("⚠️ INA226 cell1 (0x41) init failed");
             }
+            delay(10);
 
             if (inaCell2.begin(&Wire)) {
                 Serial.println("✅ INA226 cell2 (0x44) initialized");
             } else {
                 Serial.println("⚠️ INA226 cell2 (0x44) init failed");
             }
+            delay(10);
 
             updateBattery();
             updateTemperature();
             Serial.printf("   Initial Vpack: %.2fV\n", vpack);
             Serial.printf("   Initial Current: %.2fA\n", current_charge);
-            if (isfinite(temperature_c))
+            if (isfinite(temperature_c)) {
                 Serial.printf("   Initial Temp: %.1fC\n", temperature_c);
+            }
 
             controlCharger();
         } else {
             Serial.println("⚠️ INA226 init failed - charging disabled");
         }
+
         xSemaphoreGive(i2c_mutex);
     } else {
         Serial.println("❌ Failed to acquire I²C mutex in setup!");
     }
 
-    // WiFi
+    Serial.println("\n=== INA Raw Debug ===");
+    delay(100);
+
+    if (xSemaphoreTake(i2c_mutex, portMAX_DELAY) == pdTRUE) {
+        Wire.beginTransmission(0x40);
+        Wire.write(0x02);
+        Wire.endTransmission(false);
+        Wire.requestFrom((uint8_t)0x40, (uint8_t)2);
+        if (Wire.available() >= 2) {
+            uint16_t raw = (Wire.read() << 8) | Wire.read();
+            Serial.printf("0x40: raw=0x%04X  voltage=%.3fV\n", raw,
+                          raw * 0.00125);
+        }
+        delay(10);
+
+        Wire.beginTransmission(0x41);
+        Wire.write(0x02);
+        Wire.endTransmission(false);
+        Wire.requestFrom((uint8_t)0x41, (uint8_t)2);
+        if (Wire.available() >= 2) {
+            uint16_t raw = (Wire.read() << 8) | Wire.read();
+            Serial.printf("0x41: raw=0x%04X  voltage=%.3fV\n", raw,
+                          raw * 0.00125);
+        }
+        delay(10);
+
+        Wire.beginTransmission(0x44);
+        Wire.write(0x02);
+        Wire.endTransmission(false);
+        Wire.requestFrom((uint8_t)0x44, (uint8_t)2);
+        if (Wire.available() >= 2) {
+            uint16_t raw = (Wire.read() << 8) | Wire.read();
+            Serial.printf("0x44: raw=0x%04X  voltage=%.3fV\n", raw,
+                          raw * 0.00125);
+        }
+
+        xSemaphoreGive(i2c_mutex);
+    }
+
+    Serial.println("====\n");
+
+    // ⚡⚡⚡ WiFi INITIALIZATION (causes power surge) ⚡⚡⚡
     WiFi.mode(WIFI_STA);
     esp_wifi_set_protocol(
         WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -681,13 +745,14 @@ void setup() {
     Serial.println(ssid);
 
     WiFi.begin(ssid, password);
-    //  WiFi.setTxPower(WIFI_POWER_8_5dBm);
+    WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {
         delay(500);
         Serial.print(".");
         attempts++;
+
         if (attempts % 10 == 0) {
             Serial.print(" [");
             Serial.print((int)WiFi.status());
@@ -707,36 +772,33 @@ void setup() {
         Serial.println("\n❌ WiFi FAILED!");
     }
 
-    // Charger FET
+    // ⚡⚡⚡ NOW SET FET_CHARGE (after WiFi power surge is done) ⚡⚡⚡
     pinMode(FET_CHARGE, OUTPUT);
     digitalWrite(FET_CHARGE, LOW);
     Serial.println("✅ FET_CHARGE initialized (GPIO 5 set LOW)");
 
-    Serial.println("\n=== GATEWAY READY (STM32 does weld timing) ===");
-
-    // Push current settings to STM32 once at boot
-    forwardToStm32("SET_PULSE," + String(weld_mode) + "," + String(weld_d1) +
-                   "," + String(weld_gap1) + "," + String(weld_d2) + "," +
-                   String(weld_gap2) + "," + String(weld_d3));
-    forwardToStm32("SET_POWER," + String(weld_power_pct));
-    forwardToStm32("SET_PREHEAT," + String(preheat_enabled ? 1 : 0) + "," +
-                   String(preheat_ms) + "," + String(preheat_pct) + "," +
-                   String(preheat_gap_ms));
+    Serial.println("\n=== WELD CONTROLLER READY ===");
+    Serial.printf("Default settings:\n");
+    Serial.printf("  Pulse: %dms @ %d%%\n", weld_duration_ms, weld_power_pct);
+    Serial.printf("  Preheat: %s", preheat_enabled ? "ENABLED" : "DISABLED");
+    if (preheat_enabled) {
+        Serial.printf(" (%dms @ %d%%)", preheat_ms, preheat_pct);
+    }
+    Serial.println();
+    Serial.println("====\n");
 }
 
 // -------------------- Loop -------------------------------
 void loop() {
-    ensureWiFiAndServer();
-    pollStm32Uart();
-
-    // TCP accept/read
     if (WiFi.status() == WL_CONNECTED) {
         if (!client || !client.connected()) {
+            // Clean up old connection
             if (client) {
                 client.stop();
                 Serial.println("[TCP] Old connection closed");
             }
 
+            // Accept new connection
             WiFiClient newClient = server.available();
             if (newClient) {
                 client = newClient;
@@ -744,9 +806,9 @@ void loop() {
                 Serial.println("[TCP] Client connected from " +
                                client.remoteIP().toString());
 
-                // Send immediate status snapshots
-                sendToPi(buildStatus());
-                forwardToStm32("STATUS");
+                // Send initial config on connect
+                String config = buildStatus();
+                sendToPi(config);
             }
         } else if (client.available()) {
             String line = client.readStringUntil('\n');
@@ -758,7 +820,6 @@ void loop() {
         }
     }
 
-    // periodic monitoring
     if (millis() - last_battery_read >= BATTERY_READ_INTERVAL) {
         last_battery_read = millis();
         updateBattery();
@@ -769,10 +830,14 @@ void loop() {
         if (millis() - last_print >= 2000) {
             last_print = millis();
 
+            // Determine charging state based on voltage thresholds
             bool should_charge =
                 (vpack < CHARGE_RESUME && vpack < CHARGE_LIMIT);
             bool charging_active =
                 should_charge && !welding_now && system_enabled;
+            // Apply 0.2A threshold to ignore noise
+            float display_current =
+                (abs(current_charge) < 0.2) ? 0.0 : current_charge;
 
             Serial.printf("📊 Vpack=%.2fV I=%.2fA %s", vpack, current_charge,
                           charging_active ? "⚡CHARGING" : "⏸️IDLE");
@@ -782,7 +847,8 @@ void loop() {
                 Serial.println();
             }
 
-            sendToPi(buildStatus());
+            String status = buildStatus();
+            sendToPi(status);
 
             float V1, V2, V3, C1, C2, C3;
             if (readCellsOnce(V1, V2, V3, C1, C2, C3)) {
@@ -792,6 +858,35 @@ void loop() {
                     "CELLS,V1=%.3f,V2=%.3f,V3=%.3f,C1=%.3f,C2=%.3f,C3=%.3f", V1,
                     V2, V3, C1, C2, C3);
                 sendToPi(String(buf));
+            }
+        }
+    }
+
+    static int pedal_last_raw = HIGH;
+    static int pedal_stable = HIGH;
+    static unsigned long pedal_last_change_ms = 0;
+    const unsigned long PEDAL_DEBOUNCE_MS = 40;
+
+    int pedal_raw = digitalRead(PEDAL_PIN);
+    unsigned long now = millis();
+
+    if (pedal_raw != pedal_last_raw) {
+        pedal_last_change_ms = now;
+        pedal_last_raw = pedal_raw;
+    }
+
+    if ((now - pedal_last_change_ms) >= PEDAL_DEBOUNCE_MS) {
+        if (pedal_raw != pedal_stable) {
+            int prev_stable = pedal_stable;
+            pedal_stable = pedal_raw;
+
+            if (prev_stable == HIGH && pedal_stable == LOW) {
+                if (now - last_weld_time >= WELD_COOLDOWN) {
+                    Serial.println("🦶 Pedal pressed -> trigger weld");
+                    fireWeld(weld_duration_ms);
+                } else {
+                    Serial.println("🦶 Pedal pressed but cooldown active");
+                }
             }
         }
     }
