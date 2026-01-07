@@ -1,13 +1,14 @@
 {
   "mode": 1,
-  "d1": 10,
-  "gap1": 0,
-  "d2": 0,
+  "d1": 22,
+  "gap1": 3,
+  "d2": 20,
   "gap2": 0,
   "d3": 0,
-  "active_preset": "P1",
+  "active_preset": null,
   "power": 100,
   "preheat_enabled": true,
   "preheat_duration": 10,
-  "preheat_power": 30
+  "preheat_power": 35,
+  "preheat_gap_ms": 1
 }

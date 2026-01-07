@@ -359,11 +359,29 @@
 
 <body>
     <div class="container">
-        <header>
-            <h1>🔥 Spot Welder Control</h1>
+        <header style="display: flex; align-items: center; gap: 20px;">
+            <h1 style="margin: 0;">🔥 Spot Welder Control</h1>
 
-            <!-- NEW: Active Settings Display -->
-            <div style="background: #2a2a2a; padding: 10px 20px; border-radius: 8px; border: 2px solid #ff6b35;">
+            <!-- ARM/DISARM Button -->
+            <button id="armButton" onclick="toggleArmUI()" style="
+        font-size: 18px;
+        padding: 12px 30px;
+        border: 3px solid #ff4444;
+        border-radius: 8px;
+        background: #2a2a2a;
+        color: #ff4444;
+        cursor: pointer;
+        font-weight: bold;
+        transition: all 0.3s;
+        box-shadow: 0 4px 8px rgba(0,0,0,0.5);
+        white-space: nowrap;
+    ">
+                🔴 DISARMED
+            </button>
+
+            <!-- READY TO FIRE Display -->
+            <div
+                style="background: #2a2a2a; padding: 10px 20px; border-radius: 8px; border: 2px solid #ff6b35; flex: 1;">
                 <div style="font-size: 0.85em; color: #aaa; margin-bottom: 5px;">🎯 READY TO FIRE:</div>
                 <div id="active-settings" style="font-size: 1em; color: #fff; font-weight: bold;">
                     Loading...
@@ -492,7 +510,7 @@
                         </div>
                     </div>
 
-                    <!-- NEW: Power Control -->
+                    <!-- Power Control -->
                     <div class="form-group" style="margin-top: 20px;">
                         <label>Weld Power (%)</label>
                         <div style="display: flex; align-items: center; gap: 10px;">
@@ -504,7 +522,7 @@
                         </div>
                     </div>
 
-                    <!-- NEW: Preheat Section -->
+                    <!-- Preheat Section -->
                     <div class="form-group" style="margin-top: 20px; padding-top: 15px; border-top: 1px solid #444;">
                         <label style="display: flex; align-items: center; gap: 10px; cursor: pointer;">
                             <input type="checkbox" id="preheatEnable" style="width: auto; cursor: pointer;">
@@ -514,6 +532,7 @@
 
                     <div id="preheatControls"
                         style="display: none; margin-top: 15px; padding: 15px; background: #333; border-radius: 5px;">
+
                         <div class="form-group">
                             <label>Preheat Duration (ms)</label>
                             <div style="display: flex; align-items: center; gap: 10px;">
@@ -521,7 +540,8 @@
                                 <input type="number" id="preheatDuration" value="20" min="10" max="50" step="5"
                                     style="width: 80px; text-align: center;">
                                 <span id="preheatDurationValue"
-                                    style="color: #4CAF50; font-weight: bold; min-width: 50px;">20 ms</span>
+                                    style="color: #4CAF50; font-weight: bold; min-width: 50px;">20
+                                    ms</span>
                             </div>
                         </div>
 
@@ -535,6 +555,18 @@
                                     style="color: #4CAF50; font-weight: bold; min-width: 50px;">30%</span>
                             </div>
                         </div>
+
+                        <div class="form-group">
+                            <label>Preheat Gap (ms)</label>
+                            <div style="display: flex; align-items: center; gap: 10px;">
+                                <input type="range" id="preheatGapSlider" value="3" min="0" max="20" step="1">
+                                <input type="number" id="preheatGap" value="3" min="0" max="50" step="1"
+                                    style="width: 80px; text-align: center;">
+                                <span id="preheatGapValue" style="color: #4CAF50; font-weight: bold; min-width: 50px;">3
+                                    ms</span>
+                            </div>
+                        </div>
+
                     </div>
 
                     <button class="btn btn-primary"
@@ -542,536 +574,559 @@
                         onclick="saveSettings()">Save</button>
                 </div>
             </div>
-        </div>
-    </div>
-
-    <script>
-        const socket = io({
-            transports: ['websocket'],
-            upgrade: false,
-            reconnection: true,
-            reconnectionDelay: 1000,
-            reconnectionAttempts: 10
-        });
-        let presets = {};
-        let currentPreset = null;
-
-        // ========== SLIDER SYNC FUNCTIONS ==========
-        function syncSlider(sliderId, inputId, valueId, suffix = '') {
-            const slider = document.getElementById(sliderId);
-            const input = document.getElementById(inputId);
-            const value = document.getElementById(valueId);
-
-            if (!slider || !input || !value) return;
-
-            slider.oninput = function () {
-                input.value = this.value;
-                value.textContent = this.value + suffix;
-            };
-
-            input.oninput = function () {
-                slider.value = this.value;
-                value.textContent = this.value + suffix;
-            };
-        }
-
-        // Send preheat settings to ESP32 immediately
-        async function sendPreheatToESP32() {
-            const enabled = document.getElementById('preheatEnable').checked;
-            const duration = parseInt(document.getElementById('preheatDuration').value);
-            const power = parseInt(document.getElementById('preheatPower').value);
-
-            try {
-                await fetch('/api/set_preheat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        enabled: enabled,
-                        duration: duration,
-                        power: power
-                    })
+            <script>
+                const socket = io({
+                    transports: ['websocket'],
+                    upgrade: false,
+                    reconnection: true,
+                    reconnectionDelay: 1000,
+                    reconnectionAttempts: 10
                 });
-                console.log('✅ Preheat updated:', enabled, duration, power);
-            } catch (e) {
-                console.error('⚠️ Failed to set preheat:', e);
-            }
-        }
 
-        // Initialize sliders on page load
-        window.addEventListener('DOMContentLoaded', () => {
-            syncSlider('powerSlider', 'powerInput', 'powerValue', '%');
-            syncSlider('preheatDurationSlider', 'preheatDuration', 'preheatDurationValue', ' ms');
-            syncSlider('preheatPowerSlider', 'preheatPower', 'preheatPowerValue', '%');
+                let presets = {};
+                let currentPreset = null;
 
-            // Real-time preheat updates
-            ['preheatEnable', 'preheatDuration', 'preheatPower'].forEach(id => {
-                const el = document.getElementById(id);
-                if (el) {
-                    el.addEventListener('change', sendPreheatToESP32);
-                    // Initialize active settings display
-                    setTimeout(updateActiveSettings, 500); // Wait for settings to load
-                }
-            });
+                // ========== SLIDER SYNC FUNCTIONS ==========
+                function syncSlider(sliderId, inputId, valueId, suffix = '') {
+                    const slider = document.getElementById(sliderId);
+                    const input = document.getElementById(inputId);
+                    const value = document.getElementById(valueId);
 
-            // Preheat toggle
-            const preheatEnable = document.getElementById('preheatEnable');
-            const preheatControls = document.getElementById('preheatControls');
-            if (preheatEnable && preheatControls) {
-                preheatEnable.onchange = function () {
-                    preheatControls.style.display = this.checked ? 'block' : 'none';
-                    sendPreheatToESP32();
-                };
-            }
+                    if (!slider || !input || !value) return;
 
-            // Initialize gap visibility on page load
-            const modeSelect = document.getElementById('mode');
-            if (modeSelect) {
-                modeSelect.dispatchEvent(new Event('change'));
-            }
-        });
+                    slider.oninput = function () {
+                        input.value = this.value;
+                        value.textContent = this.value + suffix;
+                    };
 
-        // ========== SOCKET HANDLERS ==========
-        socket.on('esp32_status', function (data) {
-            console.log('📊 ESP32 Status:', data);
-            updateChargerCurrent(data);
-        });
-
-        socket.on('status_update', (data) => {
-            console.log('📊 Status Update:', data);
-
-            // Pack voltage
-            if (typeof data.vpack === 'number') {
-                document.getElementById('vpack').textContent = data.vpack.toFixed(2) + ' V';
-            }
-
-            // Temperature
-            if (typeof data.temperature === 'number') {
-                document.getElementById('temp').textContent = data.temperature.toFixed(1) + ' °C';
-            }
-
-            // Weld counter
-            if (typeof data.weld_counter === 'number') {
-                document.getElementById('counter').textContent = data.weld_counter;
-            }
-
-            // Cells
-            if (typeof data.C1 === 'number') {
-                document.getElementById('c1').textContent = data.C1.toFixed(2) + 'V';
-            }
-            if (typeof data.C2 === 'number') {
-                document.getElementById('c2').textContent = data.C2.toFixed(2) + 'V';
-            }
-            if (typeof data.C3 === 'number') {
-                document.getElementById('c3').textContent = data.C3.toFixed(2) + 'V';
-            }
-
-            // Connection status
-            if ('esp_connected' in data) {
-                document.getElementById('esp-status').classList.toggle('connected', !!data.esp_connected);
-            }
-
-            // Charger current
-            updateChargerCurrent(data);// ========== UPDATE "READY TO FIRE" FROM ESP32 ==========
-            // Only update if we have pulse data from ESP32
-            if (data.mode !== undefined) {
-                let modeText = '';
-                let pulseText = '';
-
-                const mode = parseInt(data.mode);
-                const d1 = data.d1 || 0;
-                const gap1 = data.gap1 || 0;
-                const d2 = data.d2 || 0;
-                const gap2 = data.gap2 || 0;
-                const d3 = data.d3 || 0;
-                const power = data.power_pct || 100;
-                const preheatEn = !!data.preheat_en;
-                const preheatMs = data.preheat_ms || 0;
-                const preheatPct = data.preheat_pct || 0;
-
-                if (mode === 1) {
-                    modeText = 'Single';
-                    pulseText = `P1: ${d1}ms`;
-                } else if (mode === 2) {
-                    modeText = 'Double';
-                    pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
-                } else if (mode === 3) {
-                    modeText = 'Triple';
-                    pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
+                    input.oninput = function () {
+                        slider.value = this.value;
+                        value.textContent = this.value + suffix;
+                    };
                 }
 
-                let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}%` : '';
+                // Send preheat settings to ESP32 immediately
+                async function sendPreheatToESP32() {
+                    const enabled = document.getElementById('preheatEnable').checked;
+                    const duration = parseInt(document.getElementById('preheatDuration').value, 10);
+                    const power = parseInt(document.getElementById('preheatPower').value, 10);
+                    const gap_ms = parseInt(document.getElementById('preheatGap').value, 10);
 
-                const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}`;
-
-                const activeSettingsEl = document.getElementById('active-settings');
-                if (activeSettingsEl) {
-                    activeSettingsEl.textContent = display;
-                    // Flash green when updated from ESP32
-                    activeSettingsEl.style.color = '#4CAF50';
-                    setTimeout(() => { activeSettingsEl.style.color = '#fff'; }, 500);
-                }
-            }
-
-        });
-
-        socket.on('pedal_active', (data) => {
-            const flash = document.getElementById('pulse-flash');
-            if (flash) {
-                flash.classList.toggle('active', !!data.active);
-            }
-        });
-
-        // ========== HELPER: UPDATE CHARGER CURRENT ==========
-        function updateChargerCurrent(data) {
-            const chargerEl = document.getElementById('charger-current');
-            if (!chargerEl) return;
-
-            let amps = null;
-            if (typeof data.current === 'number') amps = data.current;
-            else if (typeof data.i === 'number') amps = data.i;
-
-            if (amps !== null) {
-                chargerEl.textContent = amps.toFixed(2) + ' A';
-                const active = Math.abs(amps) > 0.01;
-                chargerEl.classList.toggle('charger-active', active);
-                chargerEl.classList.toggle('charger-idle', !active);
-            }
-        }
-
-        // ========== MODE SELECTOR ==========
-        document.getElementById('mode').addEventListener('change', (e) => {
-            const mode = parseInt(e.target.value);
-
-            // Show/hide pulse fields
-            document.getElementById('pulse2').classList.toggle('hidden', mode < 2);
-            document.getElementById('pulse3').classList.toggle('hidden', mode < 3);
-
-            // Show/hide gap fields based on mode
-            // Mode 1 (single pulse) = no gaps
-            // Mode 2 (double pulse) = gap1 only
-            // Mode 3 (triple pulse) = gap1 + gap2
-            const gap1Field = document.getElementById('gap1-field');
-            const gap2Field = document.getElementById('gap2-field');
-
-            if (gap1Field) gap1Field.style.display = mode >= 2 ? 'block' : 'none';
-            if (gap2Field) gap2Field.style.display = mode >= 3 ? 'block' : 'none';
-        });
-
-        // ========== LOAD SETTINGS ==========
-        async function loadSettings() {
-            const resp = await fetch('/api/get_settings');
-            const data = await resp.json();
-            if (data.status === 'ok') {
-                const s = data.settings;
-                document.getElementById('mode').value = s.mode || 1;
-                document.getElementById('d1').value = s.d1 || 50;
-                document.getElementById('gap1').value = s.gap1 || 0;
-                document.getElementById('d2').value = s.d2 || 0;
-                document.getElementById('gap2').value = s.gap2 || 0;
-                document.getElementById('d3').value = s.d3 || 0;
-
-                // Load power/preheat if saved
-                if (s.power) {
-                    document.getElementById('powerSlider').value = s.power;
-                    document.getElementById('powerInput').value = s.power;
-                    document.getElementById('powerValue').textContent = s.power + '%';
-                }
-                if (s.preheat_enabled !== undefined) {
-                    document.getElementById('preheatEnable').checked = s.preheat_enabled;
-                    document.getElementById('preheatControls').style.display = s.preheat_enabled ? 'block' : 'none';
-                }
-                if (s.preheat_duration) {
-                    document.getElementById('preheatDurationSlider').value = s.preheat_duration;
-                    document.getElementById('preheatDuration').value = s.preheat_duration;
-                    document.getElementById('preheatDurationValue').textContent = s.preheat_duration + ' ms';
-                }
-                if (s.preheat_power) {
-                    document.getElementById('preheatPowerSlider').value = s.preheat_power;
-                    document.getElementById('preheatPower').value = s.preheat_power;
-                    document.getElementById('preheatPowerValue').textContent = s.preheat_power + '%';
-                }
-
-                // Trigger mode change
-                document.getElementById('mode').dispatchEvent(new Event('change'));
-            }
-        }
-
-        // ========== SAVE SETTINGS ==========
-        async function saveSettings(silent = false) {
-            const settings = {
-                mode: parseInt(document.getElementById('mode').value),
-                d1: parseInt(document.getElementById('d1').value),
-                gap1: parseInt(document.getElementById('gap1').value),
-                d2: parseInt(document.getElementById('d2').value),
-                gap2: parseInt(document.getElementById('gap2').value),
-                d3: parseInt(document.getElementById('d3').value),
-                active_preset: currentPreset,
-                power: parseInt(document.getElementById('powerInput').value),
-                preheat_enabled: document.getElementById('preheatEnable').checked,
-                preheat_duration: parseInt(document.getElementById('preheatDuration').value),
-                preheat_power: parseInt(document.getElementById('preheatPower').value)
-            };
-
-            // Save to backend
-            const resp = await fetch('/api/save_settings', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(settings)
-            });
-
-            if (!resp.ok) {
-                if (!silent) alert('❌ Failed to save settings!');
-                return;
-            }
-
-            // Send power to ESP32
-            try {
-                await fetch('/api/set_power', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ power: settings.power })
-                });
-            } catch (e) {
-                console.error('⚠️ Failed to set power:', e);
-            }
-
-            if (!silent) alert('✅ Settings saved!');
-        }
-
-        // ========== LOAD PRESETS ==========
-        async function loadPresets() {
-            const resp = await fetch('/api/get_presets');
-            const data = await resp.json();
-            if (data.status === 'ok') {
-                presets = data.presets;
-                // Update preset names
-                for (let i = 1; i <= 5; i++) {
-                    const key = 'P' + i;
-                    const nameEl = document.getElementById('p' + i + '-name');
-                    if (nameEl && presets[key]) {
-                        nameEl.textContent = presets[key].name || key;
+                    try {
+                        await fetch('/api/set_preheat', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                enabled: enabled,
+                                duration: duration,
+                                power: power,
+                                gap_ms: gap_ms
+                            })
+                        });
+                        console.log('✅ Preheat updated:', enabled, duration, power, gap_ms);
+                    } catch (e) {
+                        console.error('⚠️ Failed to set preheat:', e);
                     }
                 }
 
-                // Get active preset from backend
-                const savedPreset = data.active_preset;
-                if (savedPreset && presets[savedPreset]) {
-                    currentPreset = savedPreset;
-                    const btn = document.querySelector('.preset-btn[onclick*="' + savedPreset + '"]');
-                    if (btn) btn.classList.add('active');
-                    // Update active settings display
-                    updateActiveSettings();
+                let preheatTimer = null;
+                function queuePreheatSend() {
+                    if (preheatTimer) clearTimeout(preheatTimer);
+                    preheatTimer = setTimeout(() => {
+                        sendPreheatToESP32();
+                        preheatTimer = null;
+                    }, 150);
                 }
-            }
-        }
 
-        // ========== LOAD PRESET ==========
-        async function loadPreset(presetId) {
-            if (!presets[presetId]) return;
+                // ========== MODE SELECTOR ==========
+                function onModeChanged(e) {
+                    const mode = parseInt(e.target.value, 10);
 
-            const p = presets[presetId];
-            document.getElementById('mode').value = p.mode || 1;
-            document.getElementById('d1').value = p.d1 || 50;
-            document.getElementById('gap1').value = p.gap1 || 0;
-            document.getElementById('d2').value = p.d2 || 0;
-            document.getElementById('gap2').value = p.gap2 || 0;
-            document.getElementById('d3').value = p.d3 || 0;
+                    // Show/hide pulse fields
+                    document.getElementById('pulse2').classList.toggle('hidden', mode < 2);
+                    document.getElementById('pulse3').classList.toggle('hidden', mode < 3);
 
-            // Load power/preheat from preset
-            if (p.power) {
-                document.getElementById('powerSlider').value = p.power;
-                document.getElementById('powerInput').value = p.power;
-                document.getElementById('powerValue').textContent = p.power + '%';
-            }
-            if (p.preheat_enabled !== undefined) {
-                document.getElementById('preheatEnable').checked = p.preheat_enabled;
-                document.getElementById('preheatControls').style.display = p.preheat_enabled ? 'block' : 'none';
-            }
-            if (p.preheat_duration) {
-                document.getElementById('preheatDurationSlider').value = p.preheat_duration;
-                document.getElementById('preheatDuration').value = p.preheat_duration;
-                document.getElementById('preheatDurationValue').textContent = p.preheat_duration + ' ms';
-            }
-            if (p.preheat_power) {
-                document.getElementById('preheatPowerSlider').value = p.preheat_power;
-                document.getElementById('preheatPower').value = p.preheat_power;
-                document.getElementById('preheatPowerValue').textContent = p.preheat_power + '%';
-            }
+                    // Show/hide gap fields based on mode
+                    const gap1Field = document.getElementById('gap1-field');
+                    const gap2Field = document.getElementById('gap2-field');
 
-            document.getElementById('mode').dispatchEvent(new Event('change'));
-            currentPreset = presetId;
+                    if (gap1Field) gap1Field.style.display = mode >= 2 ? 'block' : 'none';
+                    if (gap2Field) gap2Field.style.display = mode >= 3 ? 'block' : 'none';
+                }
 
-            // Highlight active preset
-            document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-            const btn = document.querySelector('.preset-btn[onclick*="' + presetId + '"]');
-            if (btn) btn.classList.add('active');
+                // ========== HELPER: UPDATE CHARGER CURRENT ==========
+                function updateChargerCurrent(data) {
+                    const chargerEl = document.getElementById('charger-current');
+                    if (!chargerEl) return;
 
-            // Auto-save settings to ESP32
-            await saveSettings(true);
-        }
+                    let amps = null;
+                    if (typeof data.current === 'number') amps = data.current;
+                    else if (typeof data.i === 'number') amps = data.i;
 
-        // ========== SAVE PRESET ==========
-        async function savePreset() {
-            const presetId = prompt('Save to which preset? (P1, P2, P3, P4, or P5):', currentPreset || 'P1');
-            if (!presetId || !['P1', 'P2', 'P3', 'P4', 'P5'].includes(presetId.toUpperCase())) {
-                alert('⚠️ Invalid preset! Please enter P1, P2, P3, P4, or P5');
-                return;
-            }
+                    if (amps !== null) {
+                        chargerEl.textContent = amps.toFixed(2) + ' A';
+                        const active = Math.abs(amps) > 0.01;
+                        chargerEl.classList.toggle('charger-active', active);
+                        chargerEl.classList.toggle('charger-idle', !active);
+                    }
+                }
 
-            const presetIdUpper = presetId.toUpperCase();
-            const name = prompt('Preset name for ' + presetIdUpper + ':', presets[presetIdUpper]?.name || presetIdUpper);
-            if (!name) return;
+                // ========== UPDATE ACTIVE SETTINGS DISPLAY ==========
+                function updateActiveSettings() {
+                    const mode = parseInt(document.getElementById('mode').value, 10);
+                    const d1 = document.getElementById('d1').value;
+                    const gap1 = document.getElementById('gap1').value;
+                    const d2 = document.getElementById('d2').value;
+                    const gap2 = document.getElementById('gap2').value;
+                    const d3 = document.getElementById('d3').value;
+                    const power = document.getElementById('powerInput').value;
 
-            const presetData = {
-                name: name,
-                mode: parseInt(document.getElementById('mode').value),
-                d1: parseInt(document.getElementById('d1').value),
-                gap1: parseInt(document.getElementById('gap1').value),
-                d2: parseInt(document.getElementById('d2').value),
-                gap2: parseInt(document.getElementById('gap2').value),
-                d3: parseInt(document.getElementById('d3').value),
-                power: parseInt(document.getElementById('powerInput').value),
-                preheat_enabled: document.getElementById('preheatEnable').checked,
-                preheat_duration: parseInt(document.getElementById('preheatDuration').value),
-                preheat_power: parseInt(document.getElementById('preheatPower').value)
-            };
+                    const preheatEn = document.getElementById('preheatEnable').checked;
+                    const preheatMs = document.getElementById('preheatDuration').value;
+                    const preheatPct = document.getElementById('preheatPower').value;
+                    const preheatGap = document.getElementById('preheatGap').value;
 
-            const resp = await fetch('/api/save_preset', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ preset_id: presetIdUpper, data: presetData })
-            });
+                    let modeText = '';
+                    let pulseText = '';
 
-            if (resp.ok) {
-                alert('✅ Preset saved!');
-                loadPresets();
-            }
-        }
+                    if (mode === 1) {
+                        modeText = 'Single';
+                        pulseText = `P1: ${d1}ms`;
+                    } else if (mode === 2) {
+                        modeText = 'Double';
+                        pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
+                    } else if (mode === 3) {
+                        modeText = 'Triple';
+                        pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
+                    }
 
-        // ========== INITIALIZE ==========
-        loadSettings();
-        loadPresets();
+                    let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}% gap=${preheatGap}ms` : '';
 
-        // Clear preset highlight when manual changes are made + update active settings
-        ['d1', 'gap1', 'd2', 'gap2', 'd3', 'mode', 'powerInput', 'preheatEnable', 'preheatDuration', 'preheatPower'].forEach(id => {
-            const el = document.getElementById(id);
-            if (el) {
-                el.addEventListener('input', () => {
-                    currentPreset = null;
-                    document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
-                    updateActiveSettings(); // ← NEW: Update display
-                });
-                el.addEventListener('change', updateActiveSettings); // ← NEW: Also on change
-            }
-        });
+                    const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}`;
+                    const el = document.getElementById('active-settings');
+                    if (el) el.textContent = display;
+                }
 
-        // ========== CONTROL BUTTONS ==========
-        let isArmed = false;
+                // ========== LOAD SETTINGS ==========
+                async function loadSettings() {
+                    const resp = await fetch('/api/get_settings');
+                    const data = await resp.json();
+                    if (data.status === 'ok') {
+                        const s = data.settings;
 
-        function toggleArm() {
-            const armBtn = document.getElementById('armBtn');
-            const fireBtn = document.getElementById('fireBtn');
+                        document.getElementById('mode').value = s.mode || 1;
+                        document.getElementById('d1').value = s.d1 || 50;
+                        document.getElementById('gap1').value = s.gap1 || 0;
+                        document.getElementById('d2').value = s.d2 || 0;
+                        document.getElementById('gap2').value = s.gap2 || 0;
+                        document.getElementById('d3').value = s.d3 || 0;
 
-            if (!armBtn || !fireBtn) return;
-
-            if (!isArmed) {
-                fetch('/api/arm', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'ok') {
-                            isArmed = true;
-                            armBtn.textContent = '🔓 DISARM';
-                            armBtn.classList.remove('btn-warning');
-                            armBtn.classList.add('btn-success');
-                            fireBtn.disabled = false;
+                        if (s.power !== undefined) {
+                            document.getElementById('powerSlider').value = s.power;
+                            document.getElementById('powerInput').value = s.power;
+                            document.getElementById('powerValue').textContent = s.power + '%';
                         }
-                    });
-            } else {
-                fetch('/api/disarm', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'ok') {
-                            isArmed = false;
-                            armBtn.textContent = '🔒 ARM';
-                            armBtn.classList.remove('btn-success');
-                            armBtn.classList.add('btn-warning');
-                            fireBtn.disabled = true;
+
+                        if (s.preheat_enabled !== undefined) {
+                            document.getElementById('preheatEnable').checked = s.preheat_enabled;
+                            document.getElementById('preheatControls').style.display = s.preheat_enabled ? 'block' : 'none';
                         }
+
+                        if (s.preheat_duration !== undefined) {
+                            document.getElementById('preheatDurationSlider').value = s.preheat_duration;
+                            document.getElementById('preheatDuration').value = s.preheat_duration;
+                            document.getElementById('preheatDurationValue').textContent = s.preheat_duration + ' ms';
+                        }
+
+                        if (s.preheat_power !== undefined) {
+                            document.getElementById('preheatPowerSlider').value = s.preheat_power;
+                            document.getElementById('preheatPower').value = s.preheat_power;
+                            document.getElementById('preheatPowerValue').textContent = s.preheat_power + '%';
+                        }
+
+                        if (s.preheat_gap_ms !== undefined) {
+                            document.getElementById('preheatGapSlider').value = s.preheat_gap_ms;
+                            document.getElementById('preheatGap').value = s.preheat_gap_ms;
+                            document.getElementById('preheatGapValue').textContent = s.preheat_gap_ms + ' ms';
+                        }
+
+                        // Trigger mode change + refresh display
+                        document.getElementById('mode').dispatchEvent(new Event('change'));
+                        updateActiveSettings();
+
+                        // Auto-apply UI -> device only if ESP32 is connected
+                        const st = await fetch('/api/status').then(r => r.json());
+                        if (st.esp_connected) {
+                            await saveSettings(true);
+                        } else {
+                            console.log('ESP not connected yet; not auto-applying');
+                        }
+                    }
+                }
+
+                // ========== SAVE SETTINGS ==========
+                async function saveSettings(silent = false) {
+                    const settings = {
+                        mode: parseInt(document.getElementById('mode').value, 10),
+                        d1: parseInt(document.getElementById('d1').value, 10),
+                        gap1: parseInt(document.getElementById('gap1').value, 10),
+                        d2: parseInt(document.getElementById('d2').value, 10),
+                        gap2: parseInt(document.getElementById('gap2').value, 10),
+                        d3: parseInt(document.getElementById('d3').value, 10),
+                        active_preset: currentPreset,
+                        power: parseInt(document.getElementById('powerInput').value, 10),
+
+                        preheat_enabled: document.getElementById('preheatEnable').checked,
+                        preheat_duration: parseInt(document.getElementById('preheatDuration').value, 10),
+                        preheat_power: parseInt(document.getElementById('preheatPower').value, 10),
+                        preheat_gap_ms: parseInt(document.getElementById('preheatGap').value, 10)
+                    };
+
+                    // Save to backend
+                    const resp = await fetch('/api/save_settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(settings)
                     });
-            }
-        }
 
-        function manualFire() {
-            if (!isArmed) return;
+                    if (!resp.ok) {
+                        if (!silent) alert('❌ Failed to save settings!');
+                        return;
+                    }
 
-            if (confirm('Fire weld?')) {
-                fetch('/api/fire', { method: 'POST' })
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.status === 'ok') {
-                            alert('Weld fired!');
-                            isArmed = false;
-                            const armBtn = document.getElementById('armBtn');
-                            const fireBtn = document.getElementById('fireBtn');
-                            if (armBtn) {
-                                armBtn.textContent = '🔒 ARM';
-                                armBtn.classList.remove('btn-success');
-                                armBtn.classList.add('btn-warning');
+                    // Send power to ESP32
+                    try {
+                        await fetch('/api/set_power', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ power: settings.power })
+                        });
+
+                        // Send preheat settings to ESP32 too (so Save applies it)
+                        await sendPreheatToESP32();
+
+                    } catch (e) {
+                        console.error('⚠️ Failed to set power/preheat:', e);
+                    }
+
+                    updateActiveSettings();
+                    if (!silent) alert('✅ Settings saved!');
+                }
+
+                // ========== LOAD PRESETS ==========
+                async function loadPresets() {
+                    const resp = await fetch('/api/get_presets');
+                    const data = await resp.json();
+                    if (data.status === 'ok') {
+                        presets = data.presets;
+
+                        for (let i = 1; i <= 5; i++) {
+                            const key = 'P' + i;
+                            const nameEl = document.getElementById('p' + i + '-name');
+                            if (nameEl && presets[key]) {
+                                nameEl.textContent = presets[key].name || key;
                             }
-                            if (fireBtn) fireBtn.disabled = true;
                         }
+
+                        const savedPreset = data.active_preset;
+                        if (savedPreset && presets[savedPreset]) {
+                            currentPreset = savedPreset;
+                            const btn = document.querySelector('.preset-btn[onclick*="' + savedPreset + '"]');
+                            if (btn) btn.classList.add('active');
+                            updateActiveSettings();
+                        }
+                    }
+                }
+
+                // ========== LOAD PRESET ==========
+                async function loadPreset(presetId) {
+                    if (!presets[presetId]) return;
+
+                    const p = presets[presetId];
+                    document.getElementById('mode').value = p.mode || 1;
+                    document.getElementById('d1').value = p.d1 || 50;
+                    document.getElementById('gap1').value = p.gap1 || 0;
+                    document.getElementById('d2').value = p.d2 || 0;
+                    document.getElementById('gap2').value = p.gap2 || 0;
+                    document.getElementById('d3').value = p.d3 || 0;
+
+                    if (p.power !== undefined) {
+                        document.getElementById('powerSlider').value = p.power;
+                        document.getElementById('powerInput').value = p.power;
+                        document.getElementById('powerValue').textContent = p.power + '%';
+                    }
+
+                    if (p.preheat_enabled !== undefined) {
+                        document.getElementById('preheatEnable').checked = p.preheat_enabled;
+                        document.getElementById('preheatControls').style.display = p.preheat_enabled ? 'block' : 'none';
+                    }
+
+                    if (p.preheat_duration !== undefined) {
+                        document.getElementById('preheatDurationSlider').value = p.preheat_duration;
+                        document.getElementById('preheatDuration').value = p.preheat_duration;
+                        document.getElementById('preheatDurationValue').textContent = p.preheat_duration + ' ms';
+                    }
+
+                    if (p.preheat_power !== undefined) {
+                        document.getElementById('preheatPowerSlider').value = p.preheat_power;
+                        document.getElementById('preheatPower').value = p.preheat_power;
+                        document.getElementById('preheatPowerValue').textContent = p.preheat_power + '%';
+                    }
+
+                    if (p.preheat_gap_ms !== undefined) {
+                        document.getElementById('preheatGapSlider').value = p.preheat_gap_ms;
+                        document.getElementById('preheatGap').value = p.preheat_gap_ms;
+                        document.getElementById('preheatGapValue').textContent = p.preheat_gap_ms + ' ms';
+                    }
+
+                    document.getElementById('mode').dispatchEvent(new Event('change'));
+                    currentPreset = presetId;
+
+                    // Highlight active preset
+                    document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+                    const btn = document.querySelector('.preset-btn[onclick*="' + presetId + '"]');
+                    if (btn) btn.classList.add('active');
+
+                    updateActiveSettings();
+
+                    // Auto-save settings to ESP32
+                    await saveSettings(true);
+                }
+
+                // ========== SAVE PRESET ==========
+                async function savePreset() {
+                    const presetId = prompt('Save to which preset? (P1, P2, P3, P4, or P5):', currentPreset || 'P1');
+                    if (!presetId || !['P1', 'P2', 'P3', 'P4', 'P5'].includes(presetId.toUpperCase())) {
+                        alert('⚠️ Invalid preset! Please enter P1, P2, P3, P4, or P5');
+                        return;
+                    }
+
+                    const presetIdUpper = presetId.toUpperCase();
+                    const name = prompt('Preset name for ' + presetIdUpper + ':', presets[presetIdUpper]?.name || presetIdUpper);
+                    if (!name) return;
+
+                    const presetData = {
+                        name: name,
+                        mode: parseInt(document.getElementById('mode').value, 10),
+                        d1: parseInt(document.getElementById('d1').value, 10),
+                        gap1: parseInt(document.getElementById('gap1').value, 10),
+                        d2: parseInt(document.getElementById('d2').value, 10),
+                        gap2: parseInt(document.getElementById('gap2').value, 10),
+                        d3: parseInt(document.getElementById('d3').value, 10),
+                        power: parseInt(document.getElementById('powerInput').value, 10),
+
+                        preheat_enabled: document.getElementById('preheatEnable').checked,
+                        preheat_duration: parseInt(document.getElementById('preheatDuration').value, 10),
+                        preheat_power: parseInt(document.getElementById('preheatPower').value, 10),
+                        preheat_gap_ms: parseInt(document.getElementById('preheatGap').value, 10)
+                    };
+
+                    const resp = await fetch('/api/save_preset', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ preset_id: presetIdUpper, data: presetData })
                     });
-            }
-        }
 
-        function chargeOn() {
-            fetch('/api/charge_on', { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.status === 'ok') alert('Charging ON');
+                    if (resp.ok) {
+                        alert('✅ Preset saved!');
+                        loadPresets();
+                    }
+                }
+
+                // ========== ARM/DISARM CONTROL ==========
+                let isArmed = false;
+
+                function toggleArmUI() {
+                    isArmed = !isArmed;
+                    const button = document.getElementById('armButton');
+                    if (!button) return;
+
+                    if (isArmed) {
+                        fetch('/api/arm', { method: 'POST' })
+                            .then(r => r.json())
+                            .then(data => {
+                                if (data.status === 'ok') {
+                                    button.innerHTML = '🟢 ARMED';
+                                    button.style.borderColor = '#44ff44';
+                                    button.style.color = '#44ff44';
+                                    button.style.background = '#1a3a1a';
+                                    button.style.boxShadow = '0 4px 12px rgba(68,255,68,0.4)';
+                                }
+                            });
+                    } else {
+                        fetch('/api/disarm', { method: 'POST' })
+                            .then(r => r.json())
+                            .then(data => {
+                                if (data.status === 'ok') {
+                                    button.innerHTML = '🔴 DISARMED';
+                                    button.style.borderColor = '#ff4444';
+                                    button.style.color = '#ff4444';
+                                    button.style.background = '#2a2a2a';
+                                    button.style.boxShadow = '0 4px 8px rgba(0,0,0,0.5)';
+                                }
+                            });
+                    }
+                }
+
+                function updateArmStateUI(enabled) {
+                    isArmed = (enabled === 1 || enabled === '1' || enabled === true);
+                    const button = document.getElementById('armButton');
+                    if (!button) return;
+
+                    if (isArmed) {
+                        button.innerHTML = '🟢 ARMED';
+                        button.style.borderColor = '#44ff44';
+                        button.style.color = '#44ff44';
+                        button.style.background = '#1a3a1a';
+                        button.style.boxShadow = '0 4px 12px rgba(68,255,68,0.4)';
+                    } else {
+                        button.innerHTML = '🔴 DISARMED';
+                        button.style.borderColor = '#ff4444';
+                        button.style.color = '#ff4444';
+                        button.style.background = '#2a2a2a';
+                        button.style.boxShadow = '0 4px 8px rgba(0,0,0,0.5)';
+                    }
+                }
+
+                // ========== SOCKET HANDLERS ==========
+                socket.on('status_update', (data) => {
+                    console.log('📊 Status Update:', data);
+
+                    if (typeof data.vpack === 'number') {
+                        document.getElementById('vpack').textContent = data.vpack.toFixed(2) + ' V';
+                    }
+
+                    if (typeof data.temperature === 'number') {
+                        document.getElementById('temp').textContent = data.temperature.toFixed(1) + ' °C';
+                    }
+
+                    if (typeof data.weld_counter === 'number') {
+                        document.getElementById('counter').textContent = data.weld_counter;
+                    }
+
+                    if (typeof data.C1 === 'number') document.getElementById('c1').textContent = data.C1.toFixed(2) + 'V';
+                    if (typeof data.C2 === 'number') document.getElementById('c2').textContent = data.C2.toFixed(2) + 'V';
+                    if (typeof data.C3 === 'number') document.getElementById('c3').textContent = data.C3.toFixed(2) + 'V';
+
+                    if ('esp_connected' in data) {
+                        document.getElementById('esp-status').classList.toggle('connected', !!data.esp_connected);
+                    }
+
+                    if ('enabled' in data) {
+                        updateArmStateUI(data.enabled);
+                    }
+
+                    updateChargerCurrent(data);
+
+                    // ========== ALWAYS UPDATE & FLASH GREEN = "THESE ARE THE LIVE SETTINGS" ==========
+                    if (data.mode !== undefined) {
+                        const mode = parseInt(data.mode, 10);
+                        const d1 = data.d1 || 0;
+                        const gap1 = data.gap1 || 0;
+                        const d2 = data.d2 || 0;
+                        const gap2 = data.gap2 || 0;
+                        const d3 = data.d3 || 0;
+                        const power = data.power_pct || 100;
+
+                        const preheatEn = !!data.preheat_en;
+                        const preheatMs = data.preheat_ms || 0;
+                        const preheatPct = data.preheat_pct || 0;
+                        const preheatGap = data.preheat_gap_ms || 0;
+
+                        let modeText = '';
+                        let pulseText = '';
+
+                        if (mode === 1) {
+                            modeText = 'Single';
+                            pulseText = `P1: ${d1}ms`;
+                        } else if (mode === 2) {
+                            modeText = 'Double';
+                            pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
+                        } else if (mode === 3) {
+                            modeText = 'Triple';
+                            pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
+                        }
+
+                        let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}% gap=${preheatGap}ms` : '';
+                        const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}`;
+
+                        const activeSettingsEl = document.getElementById('active-settings');
+                        if (activeSettingsEl) {
+                            activeSettingsEl.textContent = display;
+
+                            // ✅ FLASH GREEN EVERY UPDATE = "CONFIRMED LIVE SETTINGS"
+                            activeSettingsEl.style.color = '#4CAF50';
+                            setTimeout(() => {
+                                activeSettingsEl.style.color = '#fff';
+                            }, 300);
+                        }
+                    }
                 });
-        }
 
-        function chargeOff() {
-            fetch('/api/charge_off', { method: 'POST' })
-                .then(r => r.json())
-                .then(data => {
-                    if (data.status === 'ok') alert('Charging OFF');
+                socket.on('pedal_active', (data) => {
+                    const flash = document.getElementById('pulse-flash');
+                    if (flash) flash.classList.toggle('active', !!data.active);
                 });
-        }
-        // ========== UPDATE ACTIVE SETTINGS DISPLAY ==========
-        function updateActiveSettings() {
-            const mode = parseInt(document.getElementById('mode').value);
-            const d1 = document.getElementById('d1').value;
-            const gap1 = document.getElementById('gap1').value;
-            const d2 = document.getElementById('d2').value;
-            const gap2 = document.getElementById('gap2').value;
-            const d3 = document.getElementById('d3').value;
-            const power = document.getElementById('powerInput').value;
-            const preheatEn = document.getElementById('preheatEnable').checked;
-            const preheatMs = document.getElementById('preheatDuration').value;
-            const preheatPct = document.getElementById('preheatPower').value;
 
-            let modeText = '';
-            let pulseText = '';
+                // ========== INITIALIZE ==========
+                window.addEventListener('DOMContentLoaded', () => {
+                    syncSlider('powerSlider', 'powerInput', 'powerValue', '%');
+                    syncSlider('preheatDurationSlider', 'preheatDuration', 'preheatDurationValue', ' ms');
+                    syncSlider('preheatPowerSlider', 'preheatPower', 'preheatPowerValue', '%');
+                    syncSlider('preheatGapSlider', 'preheatGap', 'preheatGapValue', ' ms');
 
-            if (mode === 1) {
-                modeText = 'Single';
-                pulseText = `P1: ${d1}ms`;
-            } else if (mode === 2) {
-                modeText = 'Double';
-                pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms`;
-            } else if (mode === 3) {
-                modeText = 'Triple';
-                pulseText = `P1: ${d1}ms | Gap: ${gap1}ms | P2: ${d2}ms | Gap: ${gap2}ms | P3: ${d3}ms`;
-            }
+                    const modeEl = document.getElementById('mode');
+                    if (modeEl) {
+                        modeEl.addEventListener('change', onModeChanged);
+                        modeEl.dispatchEvent(new Event('change'));
+                    }
 
-            let preheatText = preheatEn ? ` | 🔥Pre: ${preheatMs}ms@${preheatPct}%` : '';
+                    const preheatEnable = document.getElementById('preheatEnable');
+                    const preheatControls = document.getElementById('preheatControls');
+                    if (preheatEnable && preheatControls) {
+                        preheatEnable.addEventListener('change', () => {
+                            preheatControls.style.display = preheatEnable.checked ? 'block' : 'none';
+                            sendPreheatToESP32();
+                            updateActiveSettings();
+                        });
+                    }
 
-            const display = `${modeText} | ${pulseText} | ⚡${power}%${preheatText}`;
-            document.getElementById('active-settings').textContent = display;
-        }
-    </script>
+                    ['preheatDuration', 'preheatPower', 'preheatGap'].forEach(id => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+                        el.addEventListener('change', () => { sendPreheatToESP32(); updateActiveSettings(); });
+                    });
+
+                    ['preheatDurationSlider', 'preheatPowerSlider', 'preheatGapSlider'].forEach(id => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+                        el.addEventListener('input', () => { queuePreheatSend(); updateActiveSettings(); });
+                    });
+
+                    [
+                        'd1', 'gap1', 'd2', 'gap2', 'd3', 'mode',
+                        'powerInput', 'powerSlider',
+                        'preheatEnable', 'preheatDuration', 'preheatDurationSlider',
+                        'preheatPower', 'preheatPowerSlider',
+                        'preheatGap', 'preheatGapSlider'
+                    ].forEach(id => {
+                        const el = document.getElementById(id);
+                        if (!el) return;
+
+                        el.addEventListener('input', () => {
+                            currentPreset = null;
+                            document.querySelectorAll('.preset-btn').forEach(btn => btn.classList.remove('active'));
+                            updateActiveSettings();
+                        });
+
+                        el.addEventListener('change', updateActiveSettings);
+                    });
+
+                    loadSettings();
+                    loadPresets();
+                    setTimeout(updateActiveSettings, 200);
+                });
+            </script>
 </body>
 
 </html>
