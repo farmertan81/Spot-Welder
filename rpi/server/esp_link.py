@@ -83,11 +83,8 @@ class ESP32Link:
                                 self._handle_line(line)
 
                     except socket.timeout:
-                        # no data yet; if we've been idle too long, treat as disconnect  ### CHANGED
-                        if time.time() - self.last_data_time > 5:
-                            print("[ESP32Link] ⚠️ No data received for 5 seconds, assuming disconnect")
-                            raise ConnectionError("No data from ESP32 for 5 seconds")
-                        continue
+                            continue
+  
                     except Exception as e:
                         print(f"[ESP32Link] Read error: {e}")
                         traceback.print_exc()
