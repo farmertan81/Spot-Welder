@@ -7,10 +7,10 @@
 
 #include "../lib/INA226/INA226.h"
 
-// -------------------- I²C Mutex --------------------
+// ---- I²C Mutex ----
 SemaphoreHandle_t i2c_mutex = NULL;
 
-// -------------------- Pin Definitions --------------------
+// ---- Pin Definitions ----
 #define FET_CHARGE 5
 #define FET_WELD 4   // SAFETY: held LOW, ESP32 no longer welds
 #define PEDAL_PIN 6  // UNUSED now (pedal moves to STM32)
@@ -20,46 +20,48 @@ SemaphoreHandle_t i2c_mutex = NULL;
 #define LED_PIN 21
 #define BUTTON_PIN 1
 
-// -------------------- STM32 UART bridge pins -------------
+// ---- STM32 UART bridge pins ----
 #define STM32_TO_ESP32_PIN 11  // ESP32 RX  <- STM32 TX (PA9)
 #define ESP32_TO_STM32_PIN 12  // ESP32 TX  -> STM32 RX (PA10)
 HardwareSerial STM32Serial(2);
 
-// -------------------- WiFi / TCP Settings ----------------
+// ---- WiFi / TCP Settings ----
 const char* ssid = "Jaime's Wi-Fi Network";
 const char* password = "jackaustin";
 
 WiFiServer server(8888);
 WiFiClient client;
 
-// -------------------- INA226 (cell voltage only) ---------
+static uint32_t lastTcpRxMs = 0;
+static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;  // 10min
+
+// ---- INA226 (cell voltage only) ----
 INA226 ina(0x40);       // Pack voltage
 INA226 inaCell1(0x41);  // Node 1
 INA226 inaCell2(0x44);  // Node 2
 
-// -------------------- LED & Button -----------------------
+// ---- LED & Button ----
 Adafruit_NeoPixel led(1, LED_PIN, NEO_RGB + NEO_KHZ800);
-bool system_enabled = true;
 volatile bool welding_now = false;  // driven by STM32 events
 
-// -------------------- Battery monitoring -----------------
-float vpack = 0.0;
-float current_charge = 0.0;
+// ---- Battery monitoring ----
+float vpack = 0.0f;
+float current_charge = 0.0f;
 unsigned long last_battery_read = 0;
 const unsigned long BATTERY_READ_INTERVAL = 100;
 
-const float V_NODE1_SCALE = 1.290;
-const float V_NODE2_SCALE = 1.490;
-const float VPACK_SCALE = 1.000;
+const float V_NODE1_SCALE = 1.000f;
+const float V_NODE2_SCALE = 0.9860f;
+const float VPACK_SCALE = 1.000f;
 
-// -------------------- Battery thresholds -----------------
-const float CHARGE_LIMIT = 9.16;
-const float CHARGE_RESUME = 8.70;
-const float HARD_LIMIT = 9.2;
+// ---- Battery thresholds ----
+const float CHARGE_LIMIT = 9.05f;
+const float CHARGE_RESUME = 8.70f;
+const float HARD_LIMIT = 9.10f;
 
-// -------------------- Weld settings (forwarded to STM32) --
+// ---- Weld settings (forwarded to STM32, mirrored locally only) ----
 uint8_t weld_mode = 1;  // 1=single, 2=double, 3=triple
-uint16_t weld_d1 = 10;
+uint16_t weld_d1 = 5;
 uint16_t weld_gap1 = 0;
 uint16_t weld_d2 = 0;
 uint16_t weld_gap2 = 0;
@@ -70,28 +72,16 @@ uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
-uint16_t weld_duration_ms = 10;  // legacy: still shown in STATUS
+uint16_t weld_duration_ms = 5;  // legacy: still shown in STATUS
 unsigned long last_weld_time = 0;
 const unsigned long WELD_COOLDOWN = 500;
 
-// -------------------- Thermistor -------------------------
+// ---- Thermistor / status mirrored from STM32 ----
 float temperature_c = NAN;
-float temp_ema = NAN;
-float temp_last_valid = NAN;
+static uint32_t last_temp_update_ms = 0;
 
-const float SERIES_RESISTOR = 10000.0f;
-const float THERMISTOR_NOMINAL = 10000.0f;
-const float TEMPERATURE_NOMINAL = 25.0f;
-const float BETA_COEFF = 3950.0f;
-const float TEMP_EMA_ALPHA = 0.05f;
-const float TEMP_OUTLIER_THRESH = 5.0f;
-
-// Calibration offset in °C (matches Fluke at ambient)
-float TEMP_OFFSET_C = -2.2f;
-
-// -------------------- Forward declarations ---------------
+// ---- Forward declarations ----
 void updateBattery();
-void updateTemperature();
 void controlCharger();
 void processCommand(String cmd);
 String buildStatus();
@@ -100,43 +90,54 @@ void forwardToStm32(const String& line);
 void pollStm32Uart();
 void updateLED();
 void handleButton();
+void requestStm32Status();
+void setUiConnected(bool connected);
+void serviceReadyHeartbeat();
+void ensureWiFiAndServer();
 
-// -------------------- Cell reading helpers ---------------
+// ---- STM truth (source of truth for UI) ----
+static bool stm_armed = false;
+static bool stm_ready = false;
+static uint32_t stm_last_status_ms = 0;
+static bool stm_synced = false;
+static float stm_weld_current = 0.0f;
+
+// ---- STM32 READY heartbeat ----
+static bool uiConnected = false;
+static uint32_t lastReadySentMs = 0;
+static const uint32_t READY_PERIOD_MS = 250;
+
+// ---- Cell reading helpers ----
+static bool readBusV_0x02(uint8_t addr, float& v_out) {
+    Wire.beginTransmission(addr);
+    Wire.write(0x02);  // Bus Voltage register
+    if (Wire.endTransmission(false) != 0) return false;
+
+    if (Wire.requestFrom(addr, (uint8_t)2) != 2) return false;
+    if (Wire.available() < 2) return false;
+
+    uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+    v_out = raw * 0.00125f;  // 1.25mV/bit
+    return true;
+}
+
 bool readCellsOnce(float& V1, float& V2, float& V3, float& C1, float& C2,
                    float& C3) {
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         return false;
     }
 
-    // Read node1 bus voltage register (0x02) directly for raw mV conversion
-    Wire.beginTransmission(0x41);
-    Wire.write(0x02);
-    Wire.endTransmission(false);
-    Wire.requestFrom((uint8_t)0x41, (uint8_t)2);
-    if (Wire.available() < 2) {
-        xSemaphoreGive(i2c_mutex);
-        return false;
-    }
-    uint16_t raw1 = (Wire.read() << 8) | Wire.read();
-    float v_node1_raw = raw1 * 0.00125f;
-
-    // Read node2 bus voltage register (0x02)
-    Wire.beginTransmission(0x44);
-    Wire.write(0x02);
-    Wire.endTransmission(false);
-    Wire.requestFrom((uint8_t)0x44, (uint8_t)2);
-    if (Wire.available() < 2) {
-        xSemaphoreGive(i2c_mutex);
-        return false;
-    }
-    uint16_t raw2 = (Wire.read() << 8) | Wire.read();
-    float v_node2_raw = raw2 * 0.00125f;
+    float v1_raw = NAN, v2_raw = NAN, vp_raw = NAN;
+    bool ok = readBusV_0x02(0x41, v1_raw) && readBusV_0x02(0x44, v2_raw) &&
+              readBusV_0x02(0x40, vp_raw);
 
     xSemaphoreGive(i2c_mutex);
 
-    float v_node1 = v_node1_raw * V_NODE1_SCALE;
-    float v_node2 = v_node2_raw * V_NODE2_SCALE;
-    float v_pack = vpack;
+    if (!ok) return false;
+
+    float v_node1 = v1_raw * V_NODE1_SCALE;
+    float v_node2 = v2_raw * V_NODE2_SCALE;
+    float v_pack = vp_raw * VPACK_SCALE;
 
     V1 = v_node1;
     V2 = v_node2;
@@ -149,79 +150,86 @@ bool readCellsOnce(float& V1, float& V2, float& V3, float& C1, float& C2,
     return true;
 }
 
-// -------------------- Thermistor helpers -----------------
-float readThermistorOnce() {
-    int raw = analogRead(THERM_PIN);
-    if (raw <= 0) raw = 1;
-    if (raw >= 4095) raw = 4094;
+float getDisplayCurrent() {
+    bool charging_active = (digitalRead(FET_CHARGE) == HIGH);
 
-    float v = 3.3f * ((float)raw / 4095.0f);
-    float r_therm = SERIES_RESISTOR * (v / (3.3f - v));
-
-    float steinhart = r_therm / THERMISTOR_NOMINAL;
-    steinhart = logf(steinhart);
-    steinhart /= BETA_COEFF;
-    steinhart += 1.0f / (TEMPERATURE_NOMINAL + 273.15f);
-    steinhart = 1.0f / steinhart;
-    steinhart -= 273.15f;
-
-    return steinhart;
-}
-
-void updateTemperature() {
-    float t_raw = readThermistorOnce();
-    if (!isfinite(t_raw)) return;
-
-    t_raw += TEMP_OFFSET_C;
-
-    if (!isfinite(temp_last_valid)) {
-        temp_last_valid = t_raw;
-        temp_ema = t_raw;
-        temperature_c = t_raw;
-        return;
+    if (!welding_now && !charging_active) {
+        return 0.0f;
     }
 
-    float diff = fabsf(t_raw - temp_last_valid);
-    if (diff > TEMP_OUTLIER_THRESH) return;
-
-    temp_last_valid = t_raw;
-
-    if (!isfinite(temp_ema)) {
-        temp_ema = t_raw;
-    } else {
-        temp_ema = TEMP_EMA_ALPHA * t_raw + (1.0f - TEMP_EMA_ALPHA) * temp_ema;
-    }
-
-    temperature_c = temp_ema;
+    return (fabs(current_charge) < 0.2f) ? 0.0f : current_charge;
 }
 
-// -------------------- Helper: Build STATUS line ----------
+// ---- small parsing helpers ----
+static bool extractFieldValue(const String& line, const String& key,
+                              String& out) {
+    int idx = line.indexOf(key);
+    if (idx < 0) return false;
+
+    int start = idx + key.length();
+    int end = line.indexOf(',', start);
+    if (end < 0) end = line.length();
+
+    out = line.substring(start, end);
+    out.trim();
+    return out.length() > 0;
+}
+
+static bool extractIntField(const String& line, const String& key, int& out) {
+    String s;
+    if (!extractFieldValue(line, key, s)) return false;
+    out = s.toInt();
+    return true;
+}
+
+static bool extractFloatField(const String& line, const String& key,
+                              float& out) {
+    String s;
+    if (!extractFieldValue(line, key, s)) return false;
+    if (s == "ERR" || s == "NaN") return false;
+    out = s.toFloat();
+    return true;
+}
+
+// ---- Helper: Build STATUS line ----
 String buildStatus() {
-    bool charge_on = digitalRead(FET_CHARGE);
-    String state = charge_on ? "ON" : "OFF";
+    bool charge_on = (digitalRead(FET_CHARGE) == HIGH);
+    bool enabled = stm_armed;
 
-    String t_str;
-    if (isfinite(temperature_c)) {
-        t_str = String(temperature_c, 1);
+    String state;
+    if (!enabled) {
+        state = "DISABLED";
+    } else if (welding_now) {
+        state = "WELDING";
+    } else if (charge_on) {
+        state = "CHARGING";
     } else {
-        t_str = "NaN";
+        state = "IDLE";
     }
+
+    bool temp_stale = (millis() - last_temp_update_ms) > 5000;
+    String t_str = (!temp_stale && isfinite(temperature_c))
+                       ? String(temperature_c, 1)
+                       : "ERR";
 
     unsigned long now = millis();
     long cooldown_ms = (long)(WELD_COOLDOWN - (now - last_weld_time));
     if (cooldown_ms < 0) cooldown_ms = 0;
 
-    float display_current =
-        (fabs(current_charge) < 0.2f) ? 0.0f : current_charge;
+    float display_current = getDisplayCurrent();
 
     String status = "STATUS";
-    status += ",enabled=" + String(system_enabled ? 1 : 0);
+    status += ",enabled=" + String(enabled ? 1 : 0);
     status += ",state=" + state;
     status += ",vpack=" + String(vpack, 3);
-    status += ",i=" + String(display_current, 3);
+    float ichg = (fabs(current_charge) < 0.2f) ? 0.0f : current_charge;
+    float iweld = (fabs(stm_weld_current) < 0.2f) ? 0.0f : stm_weld_current;
+
+    status += ",ichg=" + String(ichg, 3);
+    status += ",iweld=" + String(iweld, 3);
     status += ",temp=" + t_str;
     status += ",cooldown_ms=" + String(cooldown_ms);
-    status += ",pulse_ms=" + String(weld_duration_ms);
+    status += ",pulse_ms=" + String(weld_d1);
     status += ",power_pct=" + String(weld_power_pct);
     status += ",preheat_en=" + String(preheat_enabled ? 1 : 0);
     status += ",preheat_ms=" + String(preheat_ms);
@@ -237,71 +245,144 @@ String buildStatus() {
     return status;
 }
 
-// -------------------- Helper: Send line to Pi ------------
+// ---- Helper: Send line to Pi ----
 void sendToPi(const String& msg) {
     if (client && client.connected()) {
-        client.println(msg);
+        client.print(msg);
+        client.print("\n");
         Serial.printf("[TCP] TX: %s\n", msg.c_str());
-    } else {
-        Serial.printf("[TCP] Not connected, drop: %s\n", msg.c_str());
     }
 }
 
-// -------------------- UART forward helper ----------------
+// ---- UART forward helper ----
+// FIX: Added flush() to guarantee bytes are physically sent before returning.
+//      Without flush(), bytes can sit in the ESP32 TX FIFO/buffer and arrive
+//      late or get coalesced — especially problematic for time-critical
+//      commands like ARM,1 that the STM32 must process immediately.
 void forwardToStm32(const String& line) {
-    STM32Serial.println(line);
-    Serial.printf("[UART->STM32] %s\n", line.c_str());
+    String out = line;
+    out.trim();
+    if (out.length() == 0) return;
+
+    // Send command + CRLF line ending (STM32 parser expects \n or \r)
+    STM32Serial.print(out);
+    STM32Serial.print("\r\n");
+    STM32Serial.flush();  // FIX: Block until all bytes physically transmitted
+
+    if (!out.startsWith("READY,")) {
+        Serial.printf("[UART->STM32] %s (len=%d)\n", out.c_str(), out.length());
+    }
 }
 
-// -------------------- STM32 UART RX -> Pi relay ----------
+void requestStm32Status() { forwardToStm32("STATUS"); }
+
+// ---- STM32 UART RX -> Pi relay ----
+static inline bool isNoisyKeepaliveLine(const String& s) {
+    return s.startsWith("ACK,READY");
+}
+
 void pollStm32Uart() {
     static String stmLine;
 
     while (STM32Serial.available()) {
         char ch = (char)STM32Serial.read();
-        if (ch == '\r') continue;
+
+        if (ch == '\r') {
+            continue;
+        }
 
         if (ch == '\n') {
             stmLine.trim();
-            if (stmLine.length() > 0) {
-                Serial.printf("[STM32->UART] %s\n", stmLine.c_str());
 
-                if (stmLine.startsWith("EVENT,WELD_START")) {
-                    welding_now = true;
-                } else if (stmLine.startsWith("EVENT,WELD_DONE")) {
-                    welding_now = false;
-                    last_weld_time = millis();
+            if (stmLine.length() > 0) {
+                if (!isNoisyKeepaliveLine(stmLine)) {
+                    Serial.printf("[STM32->UART] %s\n", stmLine.c_str());
                 }
 
-                sendToPi(stmLine);
+                if (stmLine.startsWith("ACK,ARM,")) {
+                    int v = stmLine.substring(8).toInt();
+                    stm_armed = (v == 1);
+                    stm_synced = true;
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("ACK,READY,")) {
+                    int v = stmLine.substring(10).toInt();
+                    stm_ready = (v == 1);
+
+                } else if (stmLine.startsWith("ACK,SET_PULSE,")) {
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("ACK,SET_POWER,")) {
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("ACK,SET_PREHEAT,")) {
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("STATUS,")) {
+                    int iv = 0;
+                    float fv = NAN;
+
+                    if (extractIntField(stmLine, "armed=", iv)) {
+                        stm_armed = (iv == 1);
+                    }
+
+                    if (extractIntField(stmLine, "ready=", iv)) {
+                        stm_ready = (iv == 1);
+                    }
+
+                    if (extractFloatField(stmLine, "temp=", fv)) {
+                        temperature_c = fv;
+                        last_temp_update_ms = millis();
+                    }
+
+                    if (extractFloatField(stmLine, "i=", fv)) {
+                        stm_weld_current = fv;
+                    }
+
+                    stm_last_status_ms = millis();
+                    stm_synced = true;
+
+                    static uint32_t lastStatusForwardMs = 0;
+                    uint32_t now = millis();
+                    if ((now - lastStatusForwardMs) >= 500) {
+                        sendToPi(buildStatus());
+                        lastStatusForwardMs = now;
+                    }
+                }
             }
+
             stmLine = "";
         } else {
-            if (stmLine.length() < 220) stmLine += ch;
+            if (stmLine.length() < 220) {
+                stmLine += ch;
+            } else {
+                // prevent runaway line growth
+                stmLine = "";
+            }
         }
     }
 }
-
-// -------------------- Battery / Charger ------------------
+// ---- Battery / Charger ----
 void updateBattery() {
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         float raw_vpack = ina.readBusVoltage();
         vpack = raw_vpack * VPACK_SCALE;
 
-        // Shunt voltage reg (0x01): 2.5uV/bit (signed)
+        // Read shunt voltage register directly from INA at 0x40
         Wire.beginTransmission(0x40);
-        Wire.write(0x01);
-        Wire.endTransmission(false);
-        Wire.requestFrom((uint8_t)0x40, (uint8_t)2);
-
-        if (Wire.available() >= 2) {
-            int16_t raw_shunt = (Wire.read() << 8) | Wire.read();
-            float shunt_voltage_v = raw_shunt * 0.0000025f;
-
-            // NOTE: your shunt is assumed 0.2 mΩ here:
-            // I = V / R
-            float calculated_current = shunt_voltage_v / 0.0002f;
-            current_charge = -calculated_current;
+        Wire.write(0x01);  // shunt voltage reg
+        if (Wire.endTransmission(false) == 0) {
+            if (Wire.requestFrom((uint8_t)0x40, (uint8_t)2) == 2 &&
+                Wire.available() >= 2) {
+                int16_t raw_shunt = ((int16_t)Wire.read() << 8) | Wire.read();
+                float shunt_voltage_v = raw_shunt * 0.0000025f;
+                float calculated_current = shunt_voltage_v / 0.0002f;
+                current_charge = -calculated_current;
+            }
         }
 
         xSemaphoreGive(i2c_mutex);
@@ -309,7 +390,7 @@ void updateBattery() {
 }
 
 void controlCharger() {
-    if (!system_enabled || welding_now) {
+    if (!stm_armed) {
         digitalWrite(FET_CHARGE, LOW);
         return;
     }
@@ -335,45 +416,58 @@ void controlCharger() {
     }
 }
 
-// -------------------- Command Parser ---------------------
+// ---- Command Parser ----
 void processCommand(String cmd) {
+    cmd.trim();
+    if (cmd.length() == 0) return;
+
+    if (cmd == "PING") {
+        sendToPi("ACK:PING");
+        return;
+    }
+
+    if (cmd == "CELLS") {
+        float V1, V2, V3, C1, C2, C3;
+        if (readCellsOnce(V1, V2, V3, C1, C2, C3)) {
+            char buf[160];
+            snprintf(buf, sizeof(buf),
+                     "CELLS,V1=%.3f,V2=%.3f,V3=%.3f,C1=%.3f,C2=%.3f,C3=%.3f",
+                     V1, V2, V3, C1, C2, C3);
+            sendToPi(String(buf));
+        } else {
+            sendToPi("ERR:CELLS_READ_FAIL");
+        }
+        return;
+    }
+
+    if (cmd.startsWith("ACK,")) {
+        Serial.printf("[TCP] Ignoring UI ACK: %s\n", cmd.c_str());
+        return;
+    }
+
     Serial.printf("[CMD] Processing: %s\n", cmd.c_str());
 
     if (cmd.startsWith("SET_PULSE,")) {
-        int idx = 10;
-        int commaPos;
+        int values[6] = {0};
+        int start = 10;
 
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            weld_mode = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
+        for (int i = 0; i < 5; i++) {
+            int commaPos = cmd.indexOf(',', start);
+            if (commaPos < 0) {
+                sendToPi("ERR:BAD_SET_PULSE");
+                return;
+            }
+            values[i] = cmd.substring(start, commaPos).toInt();
+            start = commaPos + 1;
         }
+        values[5] = cmd.substring(start).toInt();
 
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            weld_d1 = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        }
-
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            weld_gap1 = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        }
-
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            weld_d2 = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        }
-
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            weld_gap2 = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        }
-
-        weld_d3 = cmd.substring(idx).toInt();
+        weld_mode = values[0];
+        weld_d1 = values[1];
+        weld_gap1 = values[2];
+        weld_d2 = values[3];
+        weld_gap2 = values[4];
+        weld_d3 = values[5];
         weld_duration_ms = weld_d1;
 
         Serial.printf("✅ Pulse: mode=%d d1=%d gap1=%d d2=%d gap2=%d d3=%d\n",
@@ -381,7 +475,6 @@ void processCommand(String cmd) {
                       weld_d3);
 
         forwardToStm32(cmd);
-        sendToPi("ACK:SET_PULSE," + String(weld_mode));
         return;
     }
 
@@ -393,55 +486,40 @@ void processCommand(String cmd) {
         Serial.printf("✅ Weld power set to %d%%\n", weld_power_pct);
 
         forwardToStm32(cmd);
-        sendToPi("ACK:SET_POWER," + String(weld_power_pct));
         return;
     }
 
     if (cmd.startsWith("SET_PREHEAT,")) {
-        int idx = 12;
-        int commaPos;
+        int values[4] = {0};
+        int start = 12;
 
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            preheat_enabled = (cmd.substring(idx, commaPos).toInt() == 1);
-            idx = commaPos + 1;
+        for (int i = 0; i < 3; i++) {
+            int commaPos = cmd.indexOf(',', start);
+            if (commaPos < 0) {
+                sendToPi("ERR:BAD_SET_PREHEAT");
+                return;
+            }
+            values[i] = cmd.substring(start, commaPos).toInt();
+            start = commaPos + 1;
         }
+        values[3] = cmd.substring(start).toInt();
 
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            preheat_ms = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        }
-
-        commaPos = cmd.indexOf(',', idx);
-        if (commaPos > 0) {
-            preheat_pct = cmd.substring(idx, commaPos).toInt();
-            idx = commaPos + 1;
-        } else {
-            preheat_pct = cmd.substring(idx).toInt();
-            Serial.printf("✅ Preheat: %s, %dms, %d%% (gap unchanged=%dms)\n",
-                          preheat_enabled ? "ON" : "OFF", preheat_ms,
-                          preheat_pct, preheat_gap_ms);
-
-            forwardToStm32(cmd);
-            sendToPi("ACK:SET_PREHEAT," + String(preheat_enabled ? 1 : 0));
-            return;
-        }
-
-        preheat_gap_ms = cmd.substring(idx).toInt();
+        preheat_enabled = (values[0] == 1);
+        preheat_ms = values[1];
+        preheat_pct = values[2];
+        preheat_gap_ms = values[3];
 
         Serial.printf("✅ Preheat: %s, %dms, %d%%, gap=%dms\n",
                       preheat_enabled ? "ON" : "OFF", preheat_ms, preheat_pct,
                       preheat_gap_ms);
 
         forwardToStm32(cmd);
-        sendToPi("ACK:SET_PREHEAT," + String(preheat_enabled ? 1 : 0));
         return;
     }
 
     if (cmd.startsWith("ARM,")) {
+        // Forward only; real success comes back from STM32 as ACK,ARM,x
         forwardToStm32(cmd);
-        sendToPi("ACK:ARM_FWD");
         return;
     }
 
@@ -455,6 +533,7 @@ void processCommand(String cmd) {
         digitalWrite(FET_CHARGE, HIGH);
         Serial.println("✅ Charging ON (manual)");
         sendToPi("ACK:CHARGE_ON");
+        sendToPi(buildStatus());
         return;
     }
 
@@ -462,21 +541,22 @@ void processCommand(String cmd) {
         digitalWrite(FET_CHARGE, LOW);
         Serial.println("✅ Charging OFF (manual)");
         sendToPi("ACK:CHARGE_OFF");
+        sendToPi(buildStatus());
         return;
     }
 
     if (cmd == "STATUS") {
         sendToPi(buildStatus());
-        forwardToStm32("STATUS");
+        requestStm32Status();
         return;
     }
 
-    // Unknown: ignore
+    sendToPi("ERR:UNKNOWN_CMD");
 }
 
-// -------------------- LED update -------------------------
+// ---- LED update ----
 void updateLED() {
-    if (!system_enabled) {
+    if (!stm_armed) {
         led.setPixelColor(0, led.Color(255, 0, 0));
     } else if (welding_now) {
         led.setPixelColor(0, led.Color(255, 255, 255));
@@ -488,7 +568,7 @@ void updateLED() {
     led.show();
 }
 
-// -------------------- Button handler ---------------------
+// ---- Button handler ----
 void handleButton() {
     static unsigned long press_start = 0;
     static unsigned long last_release = 0;
@@ -523,27 +603,60 @@ void handleButton() {
     }
 
     if (waiting_for_double && (millis() - double_tap_window > 500)) {
-        system_enabled = !system_enabled;
-        Serial.printf("🔘 Single tap → system %s\n",
-                      system_enabled ? "ENABLED" : "DISABLED");
-
-        if (!system_enabled) {
-            digitalWrite(FET_CHARGE, LOW);
-            forwardToStm32("ARM,0");  // disarm when disabled
-        } else {
-            forwardToStm32("ARM,1");  // re-arm when enabled
-        }
-
+        bool target = !stm_armed;
+        forwardToStm32(String("ARM,") + (target ? "1" : "0"));
         waiting_for_double = false;
     }
 
     was_pressed = is_pressed;
 }
+
+// ---- READY heartbeat impl ----
+void setUiConnected(bool connected) {
+    if (connected == uiConnected) return;
+    uiConnected = connected;
+
+    if (uiConnected) {
+        Serial.println("[READY] UI connected -> READY,1 (no auto-arm)");
+        forwardToStm32("READY,1");
+        lastReadySentMs = millis();
+        stm_synced = false;
+        requestStm32Status();
+    } else {
+        Serial.println("[READY] UI disconnected -> READY,0 + ARM,0");
+        forwardToStm32("READY,0");
+        forwardToStm32("ARM,0");
+        lastReadySentMs = 0;
+        stm_synced = false;
+    }
+}
+
+void serviceReadyHeartbeat() {
+    if (!uiConnected) return;
+
+    uint32_t now = millis();
+
+    static uint32_t lastArmRetry = 0;
+    static int armRetryCount = 0;
+
+    if (!stm_armed && armRetryCount < 5 && (now - lastArmRetry) >= 2000) {
+        forwardToStm32("READY,1");
+        forwardToStm32("ARM,1");
+        lastArmRetry = now;
+        armRetryCount++;
+        return;
+    }
+
+    if (stm_armed && (now - lastReadySentMs) >= READY_PERIOD_MS) {
+        forwardToStm32("READY,1");
+        lastReadySentMs = now;
+    }
+}
+
 void ensureWiFiAndServer() {
     static unsigned long last_attempt = 0;
     static bool server_started = false;
 
-    // If we are connected, ensure server is started
     if (WiFi.status() == WL_CONNECTED) {
         if (!server_started) {
             Serial.println("✅ WiFi connected (re) - IP: " +
@@ -556,32 +669,34 @@ void ensureWiFiAndServer() {
         return;
     }
 
-    // Not connected: mark server not started, drop any client
     server_started = false;
+    server.stop();
+
     if (client) {
         client.stop();
     }
 
-    // Retry WiFi every 5 seconds
+    setUiConnected(false);
+
     unsigned long now = millis();
     if (now - last_attempt > 5000) {
         last_attempt = now;
         Serial.println("⚠️ WiFi disconnected; retrying...");
-        WiFi.reconnect();  // or WiFi.begin(ssid, password) if you prefer
+        WiFi.disconnect(true);
+        delay(200);
+        WiFi.begin(ssid, password);
     }
 }
 
-// -------------------- Setup ------------------------------
+// ---- Setup ----
 void setup() {
     Serial.begin(115200);
     delay(500);
 
-    // UART to STM32
     STM32Serial.begin(115200, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
     Serial.println("✅ STM32 UART bridge ready (Serial2 @ 115200)");
 
-    // Create I²C mutex
     i2c_mutex = xSemaphoreCreateMutex();
     if (i2c_mutex == NULL) {
         Serial.println("❌ Failed to create I²C mutex!");
@@ -592,12 +707,10 @@ void setup() {
     Serial.println(
         "\n=== ESP32 Weld Controller - GATEWAY MODE (STM32 weld) ===");
 
-    // Pins
     pinMode(FET_WELD, OUTPUT);
-    digitalWrite(FET_WELD, LOW);  // ALWAYS LOW on ESP32
+    digitalWrite(FET_WELD, LOW);
 
-    pinMode(PEDAL_PIN, INPUT_PULLUP);  // not used anymore
-    pinMode(THERM_PIN, INPUT);
+    pinMode(PEDAL_PIN, INPUT_PULLUP);
     pinMode(BUTTON_PIN, INPUT_PULLUP);
     pinMode(LED_PIN, OUTPUT);
 
@@ -608,12 +721,10 @@ void setup() {
 
     analogReadResolution(12);
 
-    // I²C
     Wire.begin(I2C_SDA, I2C_SCL);
     Wire.setClock(50000);
     Wire.setTimeOut(1000);
 
-    // Quick scan of expected INAs
     Serial.println("\n=== I²C Device Check (expected 0x40, 0x41, 0x44) ===");
     uint8_t addrs[] = {0x40, 0x41, 0x44};
     for (uint8_t addr : addrs) {
@@ -628,7 +739,7 @@ void setup() {
         if (ina.begin(&Wire)) {
             Serial.println("✅ INA226 (pack) initialized");
 
-            // Configure pack INA (0x40)
+            // Config register
             Wire.beginTransmission(0x40);
             Wire.write(0x00);
             Wire.write(0x45);
@@ -636,6 +747,7 @@ void setup() {
             Wire.endTransmission();
             delay(10);
 
+            // Calibration register
             uint16_t cal_value = 41967;
             Wire.beginTransmission(0x40);
             Wire.write(0x05);
@@ -657,12 +769,6 @@ void setup() {
             }
 
             updateBattery();
-            updateTemperature();
-            Serial.printf("   Initial Vpack: %.2fV\n", vpack);
-            Serial.printf("   Initial Current: %.2fA\n", current_charge);
-            if (isfinite(temperature_c))
-                Serial.printf("   Initial Temp: %.1fC\n", temperature_c);
-
             controlCharger();
         } else {
             Serial.println("⚠️ INA226 init failed - charging disabled");
@@ -672,7 +778,6 @@ void setup() {
         Serial.println("❌ Failed to acquire I²C mutex in setup!");
     }
 
-    // WiFi
     WiFi.mode(WIFI_STA);
     esp_wifi_set_protocol(
         WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
@@ -681,7 +786,6 @@ void setup() {
     Serial.println(ssid);
 
     WiFi.begin(ssid, password);
-    //  WiFi.setTxPower(WIFI_POWER_8_5dBm);
 
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {
@@ -699,90 +803,94 @@ void setup() {
         Serial.println("\n✅ WiFi CONNECTED!");
         Serial.print("IP: ");
         Serial.println(WiFi.localIP());
-
-        Serial.println("Starting TCP server on port 8888...");
-        server.begin();
-        server.setNoDelay(true);
     } else {
         Serial.println("\n❌ WiFi FAILED!");
     }
 
-    // Charger FET
     pinMode(FET_CHARGE, OUTPUT);
     digitalWrite(FET_CHARGE, LOW);
     Serial.println("✅ FET_CHARGE initialized (GPIO 5 set LOW)");
 
     Serial.println("\n=== GATEWAY READY (STM32 does weld timing) ===");
+    delay(500);
 
-    // Push current settings to STM32 once at boot
-    forwardToStm32("SET_PULSE," + String(weld_mode) + "," + String(weld_d1) +
-                   "," + String(weld_gap1) + "," + String(weld_d2) + "," +
-                   String(weld_gap2) + "," + String(weld_d3));
-    forwardToStm32("SET_POWER," + String(weld_power_pct));
-    forwardToStm32("SET_PREHEAT," + String(preheat_enabled ? 1 : 0) + "," +
-                   String(preheat_ms) + "," + String(preheat_pct) + "," +
-                   String(preheat_gap_ms));
+    // Intentionally DO NOT push defaults into STM32 at boot.
+    // STM32 is the source of truth; UI/user commands update settings
+    // explicitly.
+    requestStm32Status();
 }
 
-// -------------------- Loop -------------------------------
+// ---- Loop ----
 void loop() {
     ensureWiFiAndServer();
     pollStm32Uart();
+    serviceReadyHeartbeat();
 
-    // TCP accept/read
     if (WiFi.status() == WL_CONNECTED) {
-        if (!client || !client.connected()) {
-            if (client) {
+        WiFiClient newClient = server.available();
+        if (newClient) {
+            if (client && client.connected()) {
+                Serial.println(
+                    "[TCP] New client arrived -> dropping old client");
                 client.stop();
-                Serial.println("[TCP] Old connection closed");
             }
 
-            WiFiClient newClient = server.available();
-            if (newClient) {
-                client = newClient;
-                client.setNoDelay(true);
-                Serial.println("[TCP] Client connected from " +
-                               client.remoteIP().toString());
+            client = newClient;
+            client.setNoDelay(true);
+            Serial.println("[TCP] Client connected from " +
+                           client.remoteIP().toString());
 
-                // Send immediate status snapshots
-                sendToPi(buildStatus());
-                forwardToStm32("STATUS");
+            lastTcpRxMs = millis();
+            setUiConnected(true);
+            sendToPi(buildStatus());
+            requestStm32Status();
+        }
+
+        if (client && !client.connected()) {
+            Serial.println("[TCP] Client disconnected");
+            client.stop();
+            setUiConnected(false);
+        }
+
+        if (client && client.connected() && TCP_IDLE_TIMEOUT_MS > 0) {
+            if ((millis() - lastTcpRxMs) > TCP_IDLE_TIMEOUT_MS) {
+                Serial.println("[TCP] Idle timeout -> dropping client");
+                client.stop();
+                setUiConnected(false);
             }
-        } else if (client.available()) {
+        }
+
+        if (client && client.connected() && client.available()) {
             String line = client.readStringUntil('\n');
             line.trim();
             if (line.length() > 0) {
+                lastTcpRxMs = millis();
                 Serial.printf("[TCP] RX: %s\n", line.c_str());
                 processCommand(line);
             }
         }
     }
 
-    // periodic monitoring
     if (millis() - last_battery_read >= BATTERY_READ_INTERVAL) {
         last_battery_read = millis();
         updateBattery();
-        updateTemperature();
         controlCharger();
 
         static unsigned long last_print = 0;
         if (millis() - last_print >= 2000) {
             last_print = millis();
 
-            bool should_charge =
-                (vpack < CHARGE_RESUME && vpack < CHARGE_LIMIT);
-            bool charging_active =
-                should_charge && !welding_now && system_enabled;
+            bool charging_active = (digitalRead(FET_CHARGE) == HIGH);
 
-            Serial.printf("📊 Vpack=%.2fV I=%.2fA %s", vpack, current_charge,
+            Serial.printf("📊 Vpack=%.2fV I=%.2fA %s", vpack,
+                          getDisplayCurrent(),
                           charging_active ? "⚡CHARGING" : "⏸️IDLE");
+
             if (isfinite(temperature_c)) {
                 Serial.printf("  Temp=%.1fC\n", temperature_c);
             } else {
                 Serial.println();
             }
-
-            sendToPi(buildStatus());
 
             float V1, V2, V3, C1, C2, C3;
             if (readCellsOnce(V1, V2, V3, C1, C2, C3)) {
