@@ -55,7 +55,7 @@ const float V_NODE2_SCALE = 0.9860f;
 const float VPACK_SCALE = 1.000f;
 
 // ---- Battery thresholds ----
-const float CHARGE_LIMIT = 9.05f;
+const float CHARGE_LIMIT = 9.065f;
 const float CHARGE_RESUME = 8.70f;
 const float HARD_LIMIT = 9.10f;
 
@@ -216,13 +216,11 @@ String buildStatus() {
     long cooldown_ms = (long)(WELD_COOLDOWN - (now - last_weld_time));
     if (cooldown_ms < 0) cooldown_ms = 0;
 
-    float display_current = getDisplayCurrent();
-
     String status = "STATUS";
     status += ",enabled=" + String(enabled ? 1 : 0);
     status += ",state=" + state;
     status += ",vpack=" + String(vpack, 3);
-    float ichg = (fabs(current_charge) < 0.2f) ? 0.0f : current_charge;
+    float ichg = getDisplayCurrent();
     float iweld = (fabs(stm_weld_current) < 0.2f) ? 0.0f : stm_weld_current;
 
     status += ",ichg=" + String(ichg, 3);
