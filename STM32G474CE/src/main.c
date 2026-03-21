@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,18 +11,22 @@ static void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
+static void MX_ADC1_Init(void);
 
 static void uartSend(const char* s);
 static inline void pwmOff(void);
 static inline void pwmOnDuty(uint16_t duty);
 static void clampParams(void);
 static void applyArmTimeout(void);
+static void applyReadyTimeout(void);
 static uint16_t pctToDuty(uint8_t pct);
 static inline void delayMsExact(uint16_t ms);
 static void doPulseMsPwm(uint16_t ms, uint16_t duty);
 static void fireRecipe(void);
 static void parseCommand(char* line);
 static void pollPedal(void);
+static uint32_t adcReadChannel(uint32_t channel);
+static float readThermistor(void);
 
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
@@ -30,6 +35,13 @@ static void pollPedal(void);
 #define PEDAL_PIN GPIO_PIN_12  // PB12 input pull-up, active low
 #define LED_PORT GPIOC
 #define LED_PIN GPIO_PIN_6  // PC6 proof-of-life LED
+
+/* ============ Thermistor / ADC ============ */
+#define THERM_SERIES_R 10000.0f
+#define THERM_NOMINAL_R 10000.0f
+#define THERM_NOMINAL_T 25.0f
+#define THERM_BETA 3950.0f
+#define THERM_OFFSET_C 0.0f
 
 /* ============ Limits / Timing ============ */
 static const uint32_t WELD_COOLDOWN_MS = 500;
@@ -55,6 +67,7 @@ static const uint32_t TIM1_ARR = 16999;
 /* ============ HAL handles ============ */
 UART_HandleTypeDef huart1;
 TIM_HandleTypeDef htim1;
+ADC_HandleTypeDef hadc1;
 
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;  // 1=single, 2=double, 3=triple
@@ -85,6 +98,8 @@ static uint32_t ready_until_ms = 0;
 static GPIO_PinState pedal_last_raw = GPIO_PIN_SET;
 static GPIO_PinState pedal_stable = GPIO_PIN_SET;
 static uint32_t pedal_last_change_ms = 0;
+
+static float temp_filtered_c = 25.0f;
 
 /* ============ UART RX Buffer ============ */
 /* FIX: Double-buffered RX to prevent race between ISR and main loop */
@@ -286,11 +301,11 @@ static void SystemClock_Config(void) {
 
     RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
     RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-    RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;  // 16/4=4MHz
-    RCC_OscInitStruct.PLL.PLLN = 85;             // 4*85=340MHz
+    RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+    RCC_OscInitStruct.PLL.PLLN = 85;
     RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
     RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
-    RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;  // 340/2=170MHz
+    RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
 
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
         while (1) {
@@ -345,6 +360,13 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* PA0..PA4 as analog inputs */
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
+    GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 static void MX_USART1_UART_Init(void) {
@@ -398,6 +420,73 @@ static void MX_TIM1_Init(void) {
     }
 }
 
+static void MX_ADC1_Init(void) {
+    __HAL_RCC_ADC12_CLK_ENABLE();
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.GainCompensation = 0;
+    hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc1.Init.LowPowerAutoWait = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+    hadc1.Init.OversamplingMode = DISABLE;
+
+    if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+        while (1) {
+        }
+    }
+
+    HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+}
+
+static uint32_t adcReadChannel(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        return 0xFFFF;
+    }
+
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK) {
+        HAL_ADC_Stop(&hadc1);
+        return 0xFFFF;
+    }
+
+    uint32_t val = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return val;
+}
+
+static float readThermistor(void) {
+    uint32_t raw = adcReadChannel(ADC_CHANNEL_1);
+    if (raw == 0xFFFF || raw < 10 || raw > 4085) return -99.0f;
+
+    float v = (float)raw * (3.3f / 4095.0f);
+    if (v <= 0.01f || v >= 3.29f) return -99.0f;
+
+    float r_ntc = THERM_SERIES_R * ((3.3f / v) - 1.0f);
+    if (r_ntc <= 0.0f) return -99.0f;
+
+    float s = logf(r_ntc / THERM_NOMINAL_R) / THERM_BETA;
+    s += 1.0f / (THERM_NOMINAL_T + 273.15f);
+    return (1.0f / s) - 273.15f + THERM_OFFSET_C;
+}
+
 /* ============ UART RX Interrupt Callback ============ */
 /* FIX: Uses double-buffer (rx_build -> rx_ready) to prevent race condition */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
@@ -408,18 +497,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
         if (c == '\n' || c == '\r') {
             if (rx_idx > 0) {
                 rx_build[rx_idx] = '\0';
-                /* Only copy if main loop has consumed the previous line */
                 if (!rx_line_ready) {
                     memcpy(rx_ready, rx_build, rx_idx + 1);
                     rx_line_ready = true;
                 }
-                /* else: dropped line (main loop too slow) — rare */
                 rx_idx = 0;
             }
         } else if (rx_idx < RX_LINE_MAX - 1) {
             rx_build[rx_idx++] = c;
         } else {
-            /* Buffer overflow — discard and reset */
             rx_idx = 0;
         }
 
@@ -427,17 +513,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
     }
 }
 
-/* ============================================================
-   FIX: UART Error Callback — THIS IS THE CRITICAL FIX
-   ============================================================
-   Without this function, any UART error (overrun, framing, noise)
-   causes the HAL to stop calling RxCpltCallback permanently.
-   The RX interrupt is silently dead and the STM32 ignores all
-   future commands from the ESP32.
-
-   This callback clears the error flags and re-arms the RX
-   interrupt so reception continues after transient errors.
-   ============================================================ */
 void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
     if (huart->Instance == USART1) {
         uint32_t err = huart->ErrorCode;
@@ -445,23 +520,20 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 
         if (err & HAL_UART_ERROR_ORE) uart_rx_overruns++;
 
-        /* Clear all error flags in the hardware */
-        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_OREF); /* Overrun   */
-        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_FEF);  /* Framing   */
-        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_NEF);  /* Noise     */
-        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF);  /* Parity    */
+        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_OREF);
+        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_FEF);
+        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_NEF);
+        __HAL_UART_CLEAR_FLAG(huart, UART_CLEAR_PEF);
         huart->ErrorCode = HAL_UART_ERROR_NONE;
 
-        /* Re-arm RX interrupt — this is what keeps reception alive */
         HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
     }
 }
 
 /* ============ Command Parser ============ */
 static void parseCommand(char* line) {
-    char response[128];
+    char response[160];
 
-    /* READY heartbeat interlock */
     if (strncmp(line, "READY,", 6) == 0) {
         int v = atoi(line + 6);
         if (v == 1) {
@@ -589,10 +661,10 @@ static void parseCommand(char* line) {
 
         snprintf(response, sizeof(response),
                  "STATUS,armed=%d,ready=%d,cooldown_ms=%ld,welding=%d,mode=%d,"
-                 "power_pct=%d,preheat_en=%d",
+                 "power_pct=%d,preheat_en=%d,temp=%.1f",
                  armed ? 1 : 0, system_ready ? 1 : 0, (long)cd,
                  welding_now ? 1 : 0, weld_mode, weld_power_pct,
-                 preheat_enabled ? 1 : 0);
+                 preheat_enabled ? 1 : 0, temp_filtered_c);
         uartSend(response);
         return;
     }
@@ -630,7 +702,6 @@ int main(void) {
 
     MX_GPIO_Init();
 
-    /* quick boot blink marker */
     for (int i = 0; i < 3; i++) {
         HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
         HAL_Delay(80);
@@ -638,13 +709,13 @@ int main(void) {
 
     MX_USART1_UART_Init();
     MX_TIM1_Init();
+    MX_ADC1_Init();
 
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     pwmOff();
 
     boot_ms = HAL_GetTick();
 
-    /* init debounce state */
     GPIO_PinState r = HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN);
     pedal_last_raw = r;
     pedal_stable = r;
@@ -659,16 +730,26 @@ int main(void) {
         applyArmTimeout();
         applyReadyTimeout();
 
-        /* FIX: Process from rx_ready (double-buffered, safe from ISR) */
+        {
+            static uint32_t last_temp_ms = 0;
+            uint32_t now = HAL_GetTick();
+            if ((now - last_temp_ms) >= 1000) {
+                last_temp_ms = now;
+                float t = readThermistor();
+                if (t > -50.0f && t < 200.0f) {
+                    temp_filtered_c = (0.1f * t) + (0.9f * temp_filtered_c);
+                }
+            }
+        }
+
         if (rx_line_ready) {
             char local_line[RX_LINE_MAX];
             memcpy(local_line, rx_ready, sizeof(local_line));
-            rx_line_ready = false; /* Release buffer for ISR */
+            rx_line_ready = false;
             parseCommand(local_line);
         }
 
 #if DEBUG_UART_RX
-        /* RX Health heartbeat: confirms UART RX interrupt is alive */
         {
             static uint32_t last_health = 0;
             uint32_t now = HAL_GetTick();
@@ -682,7 +763,6 @@ int main(void) {
                          (unsigned long)uart_rx_overruns);
                 uartSend(hb);
 
-                /* Safety: if RX interrupt somehow got stuck, re-arm it */
                 if (huart1.RxState == HAL_UART_STATE_READY) {
                     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
                     uartSend("RXHEALTH,REARM");
@@ -698,5 +778,4 @@ void SysTick_Handler(void) {
     HAL_SYSTICK_IRQHandler();
 }
 
-/* UART interrupt handler */
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }

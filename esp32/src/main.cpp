@@ -636,18 +636,7 @@ void serviceReadyHeartbeat() {
 
     uint32_t now = millis();
 
-    static uint32_t lastArmRetry = 0;
-    static int armRetryCount = 0;
-
-    if (!stm_armed && armRetryCount < 5 && (now - lastArmRetry) >= 2000) {
-        forwardToStm32("READY,1");
-        forwardToStm32("ARM,1");
-        lastArmRetry = now;
-        armRetryCount++;
-        return;
-    }
-
-    if (stm_armed && (now - lastReadySentMs) >= READY_PERIOD_MS) {
+    if ((now - lastReadySentMs) >= READY_PERIOD_MS) {
         forwardToStm32("READY,1");
         lastReadySentMs = now;
     }
@@ -825,6 +814,14 @@ void loop() {
     ensureWiFiAndServer();
     pollStm32Uart();
     serviceReadyHeartbeat();
+
+    static uint32_t lastStatusReqMs = 0;
+    uint32_t now = millis();
+
+    if (uiConnected && (now - lastStatusReqMs) >= 1000) {
+        requestStm32Status();
+        lastStatusReqMs = now;
+    }
 
     if (WiFi.status() == WL_CONNECTED) {
         WiFiClient newClient = server.available();
