@@ -27,14 +27,15 @@ static void parseCommand(char* line);
 static void pollPedal(void);
 static uint32_t adcReadChannel(uint32_t channel);
 static float readThermistor(void);
+static float readCapVoltage(void);
 
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
-#define WELD_TIM_CH TIM_CHANNEL_1  // PA8 = TIM1_CH1 (AF6 on G4)
+#define WELD_TIM_CH TIM_CHANNEL_1
 #define PEDAL_PORT GPIOB
-#define PEDAL_PIN GPIO_PIN_12  // PB12 input pull-up, active low
+#define PEDAL_PIN GPIO_PIN_12
 #define LED_PORT GPIOC
-#define LED_PIN GPIO_PIN_6  // PC6 proof-of-life LED
+#define LED_PIN GPIO_PIN_6
 
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
@@ -43,24 +44,18 @@ static float readThermistor(void);
 #define THERM_BETA 3950.0f
 #define THERM_OFFSET_C 0.0f
 
+#define V_CAP_DIVIDER 8.26f
+
 /* ============ Limits / Timing ============ */
 static const uint32_t WELD_COOLDOWN_MS = 500;
 static const uint16_t MAX_WELD_MS = 200;
 static const uint32_t PEDAL_DEBOUNCE_MS = 40;
 static const uint32_t BOOT_INHIBIT_MS = 5000;
-static const uint32_t ARM_TIMEOUT_MS = 0;  // 0 = disabled
-
-/* READY interlock: ESP/UI must keep us "ready" via heartbeat */
-static const uint32_t READY_TIMEOUT_MS =
-    1500;  // must receive READY,1 at least this often
+static const uint32_t ARM_TIMEOUT_MS = 0;
+static const uint32_t READY_TIMEOUT_MS = 1500;
 
 /* ============ PWM Settings ============ */
-/* Your logical 10-bit duty interface (0..1023) */
 static const uint16_t PWM_MAX = 1023;
-
-/* Hardware timer settings for ~10kHz at 170MHz SYSCLK:
-   f_pwm = 170e6 / ((PSC+1)*(ARR+1))
-   choose PSC=0, ARR=16999 => 10kHz */
 static const uint16_t TIM1_PSC = 0;
 static const uint32_t TIM1_ARR = 16999;
 
@@ -70,17 +65,17 @@ TIM_HandleTypeDef htim1;
 ADC_HandleTypeDef hadc1;
 
 /* ============ Weld Params (defaults) ============ */
-static volatile uint8_t weld_mode = 1;  // 1=single, 2=double, 3=triple
+static volatile uint8_t weld_mode = 1;
 static volatile uint16_t weld_d1_ms = 10;
 static volatile uint16_t weld_gap1_ms = 0;
 static volatile uint16_t weld_d2_ms = 0;
 static volatile uint16_t weld_gap2_ms = 0;
 static volatile uint16_t weld_d3_ms = 0;
 
-static volatile uint8_t weld_power_pct = 100;  // 50-100%
+static volatile uint8_t weld_power_pct = 100;
 static volatile bool preheat_enabled = false;
 static volatile uint16_t preheat_ms = 20;
-static volatile uint8_t preheat_pct = 30;  // 0-100%
+static volatile uint8_t preheat_pct = 30;
 static volatile uint16_t preheat_gap_ms = 3;
 
 /* ============ State ============ */
@@ -91,7 +86,6 @@ static bool armed = false;
 static uint32_t armed_until_ms = 0;
 static uint32_t boot_ms = 0;
 
-/* READY interlock state */
 static bool system_ready = false;
 static uint32_t ready_until_ms = 0;
 
@@ -102,15 +96,14 @@ static uint32_t pedal_last_change_ms = 0;
 static float temp_filtered_c = 25.0f;
 
 /* ============ UART RX Buffer ============ */
-/* FIX: Double-buffered RX to prevent race between ISR and main loop */
 #define RX_LINE_MAX 128
 static uint8_t rx_byte;
-static char rx_build[RX_LINE_MAX]; /* ISR builds incoming line here         */
+static char rx_build[RX_LINE_MAX];
 static uint8_t rx_idx = 0;
-static char rx_ready[RX_LINE_MAX]; /* Completed line copied here for main() */
+static char rx_ready[RX_LINE_MAX];
 static volatile bool rx_line_ready = false;
 
-/* FIX: Debug/error-recovery counters (set to 0 for production) */
+/* ============ UART debug ============ */
 #define DEBUG_UART_RX 1
 static volatile uint32_t uart_rx_bytes = 0;
 static volatile uint32_t uart_rx_errors = 0;
@@ -126,7 +119,6 @@ static inline void pwmOff(void) {
     __HAL_TIM_SET_COMPARE(&htim1, WELD_TIM_CH, 0);
 }
 
-/* duty is 0..1023 (PWM_MAX). We map it to 0..ARR for 10kHz carrier. */
 static inline void pwmOnDuty(uint16_t duty) {
     if (duty > PWM_MAX) duty = PWM_MAX;
 
@@ -288,7 +280,6 @@ static void fireRecipe(void) {
     uartSend(buf);
 }
 
-/* ===== Clock: HSI -> PLL -> 170MHz ===== */
 static void SystemClock_Config(void) {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
@@ -332,20 +323,17 @@ static void MX_GPIO_Init(void) {
 
     GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    /* LED PC6 */
     GPIO_InitStruct.Pin = LED_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
     HAL_GPIO_Init(LED_PORT, &GPIO_InitStruct);
 
-    /* PB12 pedal input pull-up */
     GPIO_InitStruct.Pin = PEDAL_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(PEDAL_PORT, &GPIO_InitStruct);
 
-    /* PA8 TIM1_CH1 AF6 */
     GPIO_InitStruct.Pin = GPIO_PIN_8;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -353,7 +341,6 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Alternate = GPIO_AF6_TIM1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* PA9/PA10 USART1 AF7 */
     GPIO_InitStruct.Pin = GPIO_PIN_9 | GPIO_PIN_10;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -361,9 +348,8 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* PA0..PA4 as analog inputs */
-    GPIO_InitStruct.Pin =
-        GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
+    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 |
+                          GPIO_PIN_4 | GPIO_PIN_5;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
@@ -487,8 +473,24 @@ static float readThermistor(void) {
     return (1.0f / s) - 273.15f + THERM_OFFSET_C;
 }
 
-/* ============ UART RX Interrupt Callback ============ */
-/* FIX: Uses double-buffer (rx_build -> rx_ready) to prevent race condition */
+static float readCapVoltage(void) {
+    uint32_t sumP = 0, sumN = 0;
+    const int samples = 16;
+
+    for (int i = 0; i < samples; i++) {
+        uint32_t p = adcReadChannel(ADC_CHANNEL_4);
+        uint32_t n = adcReadChannel(ADC_CHANNEL_5);
+        if (p == 0xFFFF || n == 0xFFFF) return 0.0f;
+        sumP += p;
+        sumN += n;
+    }
+
+    float vP = ((float)sumP / samples) * (3.3f / 4095.0f);
+    float vN = ((float)sumN / samples) * (3.3f / 4095.0f);
+
+    return (vP - vN) * V_CAP_DIVIDER;
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
     if (huart->Instance == USART1) {
         char c = (char)rx_byte;
@@ -530,9 +532,8 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
     }
 }
 
-/* ============ Command Parser ============ */
 static void parseCommand(char* line) {
-    char response[160];
+    char response[192];
 
     if (strncmp(line, "READY,", 6) == 0) {
         int v = atoi(line + 6);
@@ -659,12 +660,14 @@ static void parseCommand(char* line) {
             (int32_t)WELD_COOLDOWN_MS - (int32_t)(HAL_GetTick() - last_weld_ms);
         if (cd < 0) cd = 0;
 
+        float vcap = readCapVoltage();
+
         snprintf(response, sizeof(response),
                  "STATUS,armed=%d,ready=%d,cooldown_ms=%ld,welding=%d,mode=%d,"
-                 "power_pct=%d,preheat_en=%d,temp=%.1f",
+                 "power_pct=%d,preheat_en=%d,temp=%.1f,vcap=%.2f",
                  armed ? 1 : 0, system_ready ? 1 : 0, (long)cd,
                  welding_now ? 1 : 0, weld_mode, weld_power_pct,
-                 preheat_enabled ? 1 : 0, temp_filtered_c);
+                 preheat_enabled ? 1 : 0, temp_filtered_c, vcap);
         uartSend(response);
         return;
     }
@@ -744,8 +747,10 @@ int main(void) {
 
         if (rx_line_ready) {
             char local_line[RX_LINE_MAX];
+            __disable_irq();
             memcpy(local_line, rx_ready, sizeof(local_line));
             rx_line_ready = false;
+            __enable_irq();
             parseCommand(local_line);
         }
 
