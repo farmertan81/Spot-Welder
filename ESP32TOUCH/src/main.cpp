@@ -1,42 +1,100 @@
 #include <Arduino.h>
-#include <Arduino_GFX_Library.h>
+#include <Wire.h>
 
-#define GFX_BL 2
+#define TOUCH_SDA 19
+#define TOUCH_SCL 20
+#define TOUCH_ADDR 0x5D
 
-Arduino_ESP32RGBPanel* bus = new Arduino_ESP32RGBPanel(
-    40, 41, 39, 42,      // DE, VSYNC, HSYNC, PCLK
-    45, 48, 47, 21, 14,  // R0-R4
-    5, 6, 7, 15, 16, 4,  // G0-G5
-    8, 3, 46, 9, 1,      // B0-B4
-    0, 8, 4, 8,          // HSYNC polarity, front porch, pulse width, back porch
-    0, 8, 4, 8,          // VSYNC polarity, front porch, pulse width, back porch
-    1,                   // PCLK active negative
-    16000000             // prefer speed
-);
+#define GT911_REG_PRODUCT_ID 0x8140
+#define GT911_REG_STATUS 0x814E
+#define GT911_REG_POINTS 0x814F
 
-Arduino_RGB_Display* gfx = new Arduino_RGB_Display(800, 480, bus, 0, true);
+bool gt911Read(uint16_t reg, uint8_t* data, size_t len) {
+    Wire.beginTransmission(TOUCH_ADDR);
+    Wire.write(reg >> 8);
+    Wire.write(reg & 0xFF);
+    if (Wire.endTransmission(false) != 0) return false;
+
+    size_t n = Wire.requestFrom((int)TOUCH_ADDR, (int)len);
+    if (n != len) return false;
+
+    for (size_t i = 0; i < len; i++) data[i] = Wire.read();
+
+    return true;
+}
+
+bool gt911Write8(uint16_t reg, uint8_t value) {
+    Wire.beginTransmission(TOUCH_ADDR);
+    Wire.write(reg >> 8);
+    Wire.write(reg & 0xFF);
+    Wire.write(value);
+    return Wire.endTransmission() == 0;
+}
+
+void printProductID() {
+    uint8_t buf[4];
+    if (gt911Read(GT911_REG_PRODUCT_ID, buf, 4)) {
+        Serial.print("GT911 Product ID: ");
+        for (int i = 0; i < 4; i++) Serial.write(buf[i]);
+        Serial.println();
+    } else {
+        Serial.println("Failed to read GT911 product ID");
+    }
+}
+
+void readTouch() {
+    uint8_t status = 0;
+    if (!gt911Read(GT911_REG_STATUS, &status, 1)) {
+        Serial.println("Failed to read touch status");
+        delay(200);
+        return;
+    }
+
+    if ((status & 0x80) == 0) {
+        delay(20);
+        return;
+    }
+
+    uint8_t points = status & 0x0F;
+    if (points == 0 || points > 5) {
+        gt911Write8(GT911_REG_STATUS, 0);
+        delay(20);
+        return;
+    }
+
+    uint8_t data[8];
+    if (!gt911Read(GT911_REG_POINTS, data, 8)) {
+        Serial.println("Failed to read touch point data");
+        gt911Write8(GT911_REG_STATUS, 0);
+        delay(20);
+        return;
+    }
+
+    uint16_t x = data[1] | (data[2] << 8);
+    uint16_t y = data[3] | (data[4] << 8);
+
+    Serial.print("Touch: x=");
+    Serial.print(x);
+    Serial.print(" y=");
+    Serial.print(y);
+    Serial.print(" points=");
+    Serial.println(points);
+
+    gt911Write8(GT911_REG_STATUS, 0);
+    delay(20);
+}
 
 void setup() {
     Serial.begin(115200);
-    delay(500);
-    Serial.println("Booting display test...");
+    delay(1000);
 
-    pinMode(GFX_BL, OUTPUT);
-    digitalWrite(GFX_BL, HIGH);
+    Serial.println();
+    Serial.println("GT911 touch read test");
 
-    gfx->begin();
-    gfx->fillScreen(BLACK);
+    Wire.begin(TOUCH_SDA, TOUCH_SCL);
+    delay(100);
 
-    gfx->setTextColor(WHITE);
-    gfx->setTextSize(2);
-    gfx->setCursor(40, 40);
-    gfx->println("SPOT WELDER");
-
-    gfx->setTextColor(GREEN);
-    gfx->setCursor(40, 80);
-    gfx->println("DISPLAY TEST OK");
-
-    Serial.println("Display initialized");
+    printProductID();
 }
 
-void loop() { delay(1000); }
+void loop() { readTouch(); }
