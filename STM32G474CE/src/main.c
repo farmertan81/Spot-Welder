@@ -25,9 +25,11 @@ static void doPulseMsPwm(uint16_t ms, uint16_t duty);
 static void fireRecipe(void);
 static void parseCommand(char* line);
 static void pollPedal(void);
+static void pollContactTrigger(void);
 static uint32_t adcReadChannel(uint32_t channel);
 static float readThermistor(void);
 static float readCapVoltage(void);
+static bool contactDetected(void);
 
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
@@ -36,6 +38,9 @@ static float readCapVoltage(void);
 #define PEDAL_PIN GPIO_PIN_12
 #define LED_PORT GPIOC
 #define LED_PIN GPIO_PIN_6
+
+#define CONTACT_PORT GPIOA
+#define CONTACT_PIN GPIO_PIN_6
 
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
@@ -78,6 +83,10 @@ static volatile uint16_t preheat_ms = 20;
 static volatile uint8_t preheat_pct = 30;
 static volatile uint16_t preheat_gap_ms = 3;
 
+/* ============ Trigger Settings ============ */
+static volatile uint8_t trigger_mode = 1;        // 1 = pedal, 2 = contact
+static volatile uint8_t contact_hold_steps = 2;  // each step = 500 ms
+
 /* ============ State ============ */
 static volatile bool welding_now = false;
 static uint32_t last_weld_ms = 0;
@@ -94,6 +103,11 @@ static GPIO_PinState pedal_stable = GPIO_PIN_SET;
 static uint32_t pedal_last_change_ms = 0;
 
 static float temp_filtered_c = 25.0f;
+
+/* ============ Contact trigger state ============ */
+static bool contact_hold_active = false;
+static uint32_t contact_hold_start_ms = 0;
+static bool contact_fire_lock = false;
 
 /* ============ UART RX Buffer ============ */
 #define RX_LINE_MAX 128
@@ -129,6 +143,10 @@ static inline void pwmOnDuty(uint16_t duty) {
     __HAL_TIM_SET_COMPARE(&htim1, WELD_TIM_CH, ccr);
 }
 
+static bool contactDetected(void) {
+    return HAL_GPIO_ReadPin(CONTACT_PORT, CONTACT_PIN) == GPIO_PIN_RESET;
+}
+
 static void clampParams(void) {
     if (weld_mode < 1) weld_mode = 1;
     if (weld_mode > 3) weld_mode = 3;
@@ -142,6 +160,12 @@ static void clampParams(void) {
 
     if (preheat_pct > 100) preheat_pct = 100;
     if (preheat_ms > MAX_WELD_MS) preheat_ms = MAX_WELD_MS;
+
+    if (trigger_mode < 1) trigger_mode = 1;
+    if (trigger_mode > 2) trigger_mode = 2;
+
+    if (contact_hold_steps < 1) contact_hold_steps = 1;
+    if (contact_hold_steps > 10) contact_hold_steps = 10;
 }
 
 static void applyArmTimeout(void) {
@@ -214,6 +238,11 @@ static void fireRecipe(void) {
 
     if (!armed) {
         uartSend("DENY,NOT_ARMED");
+        return;
+    }
+
+    if (!contactDetected()) {
+        uartSend("DENY,NO_CONTACT");
         return;
     }
 
@@ -348,10 +377,15 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Alternate = GPIO_AF7_USART1;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    GPIO_InitStruct.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 |
-                          GPIO_PIN_4 | GPIO_PIN_5;
+    GPIO_InitStruct.Pin =
+        GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
     GPIO_InitStruct.Mode = GPIO_MODE_ANALOG;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_6;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
@@ -638,6 +672,30 @@ static void parseCommand(char* line) {
         return;
     }
 
+    if (strncmp(line, "SET_TRIGGER_MODE,", 17) == 0) {
+        int v = atoi(line + 17);
+        if (v < 1) v = 1;
+        if (v > 2) v = 2;
+        trigger_mode = (uint8_t)v;
+
+        snprintf(response, sizeof(response), "ACK,SET_TRIGGER_MODE,mode=%d",
+                 trigger_mode);
+        uartSend(response);
+        return;
+    }
+
+    if (strncmp(line, "SET_CONTACT_HOLD,", 17) == 0) {
+        int v = atoi(line + 17);
+        if (v < 1) v = 1;
+        if (v > 10) v = 10;
+        contact_hold_steps = (uint8_t)v;
+
+        snprintf(response, sizeof(response), "ACK,SET_CONTACT_HOLD,steps=%d",
+                 contact_hold_steps);
+        uartSend(response);
+        return;
+    }
+
     if (strcmp(line, "CMD,FIRE") == 0) {
         fireRecipe();
         return;
@@ -662,12 +720,17 @@ static void parseCommand(char* line) {
 
         float vcap = readCapVoltage();
 
-        snprintf(response, sizeof(response),
-                 "STATUS,armed=%d,ready=%d,cooldown_ms=%ld,welding=%d,mode=%d,"
-                 "power_pct=%d,preheat_en=%d,temp=%.1f,vcap=%.2f",
-                 armed ? 1 : 0, system_ready ? 1 : 0, (long)cd,
-                 welding_now ? 1 : 0, weld_mode, weld_power_pct,
-                 preheat_enabled ? 1 : 0, temp_filtered_c, vcap);
+        snprintf(
+            response, sizeof(response),
+            "STATUS,armed=%d,ready=%d,contact=%d,cooldown_ms=%ld,welding=%d,"
+            "mode=%d,power_pct=%d,preheat_en=%d,temp=%.1f,vcap=%.2f,"
+            "trigger_mode=%d,contact_hold_steps=%d,contact_raw=%d,pa6=%d",
+            armed ? 1 : 0, system_ready ? 1 : 0, contactDetected() ? 1 : 0,
+            (long)cd, welding_now ? 1 : 0, weld_mode, weld_power_pct,
+            preheat_enabled ? 1 : 0, temp_filtered_c, vcap, trigger_mode,
+            contact_hold_steps, contactDetected() ? 1 : 0,
+            (HAL_GPIO_ReadPin(CONTACT_PORT, CONTACT_PIN) == GPIO_PIN_SET) ? 1
+                                                                          : 0);
         uartSend(response);
         return;
     }
@@ -691,9 +754,47 @@ static void pollPedal(void) {
 
             if (prev == GPIO_PIN_SET && pedal_stable == GPIO_PIN_RESET) {
                 uartSend("EVENT,PEDAL_PRESS");
-                fireRecipe();
+                if (trigger_mode == 1) {
+                    fireRecipe();
+                }
             }
         }
+    }
+}
+
+static void pollContactTrigger(void) {
+    if (trigger_mode != 2) {
+        contact_hold_active = false;
+        contact_hold_start_ms = 0;
+        contact_fire_lock = false;
+        return;
+    }
+
+    bool contact_now = contactDetected();
+    uint32_t now = HAL_GetTick();
+    uint32_t hold_ms_required = (uint32_t)contact_hold_steps * 500U;
+
+    if (!contact_now) {
+        contact_hold_active = false;
+        contact_hold_start_ms = 0;
+        contact_fire_lock = false;
+        return;
+    }
+
+    if (contact_fire_lock) {
+        return;
+    }
+
+    if (!contact_hold_active) {
+        contact_hold_active = true;
+        contact_hold_start_ms = now;
+        return;
+    }
+
+    if ((now - contact_hold_start_ms) >= hold_ms_required) {
+        uartSend("EVENT,CONTACT_TRIGGER");
+        fireRecipe();
+        contact_fire_lock = true;
     }
 }
 
@@ -730,8 +831,21 @@ int main(void) {
 
     while (1) {
         pollPedal();
+        pollContactTrigger();
         applyArmTimeout();
         applyReadyTimeout();
+
+        {
+            static int last_contact_dbg = -1;
+            int c = contactDetected() ? 1 : 0;
+            if (c != last_contact_dbg) {
+                last_contact_dbg = c;
+                if (c)
+                    uartSend("DBG,CONTACT=1");
+                else
+                    uartSend("DBG,CONTACT=0");
+            }
+        }
 
         {
             static uint32_t last_temp_ms = 0;

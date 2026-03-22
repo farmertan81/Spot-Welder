@@ -12,8 +12,8 @@ SemaphoreHandle_t i2c_mutex = NULL;
 
 // ---- Pin Definitions ----
 #define FET_CHARGE 5
-#define FET_WELD 4   // SAFETY: held LOW, ESP32 no longer welds
-#define PEDAL_PIN 6  // UNUSED now (pedal moves to STM32)
+#define FET_WELD 4
+#define PEDAL_PIN 6
 #define I2C_SDA 2
 #define I2C_SCL 3
 #define THERM_PIN 7
@@ -21,8 +21,8 @@ SemaphoreHandle_t i2c_mutex = NULL;
 #define BUTTON_PIN 1
 
 // ---- STM32 UART bridge pins ----
-#define STM32_TO_ESP32_PIN 11  // ESP32 RX  <- STM32 TX (PA9)
-#define ESP32_TO_STM32_PIN 12  // ESP32 TX  -> STM32 RX (PA10)
+#define STM32_TO_ESP32_PIN 11
+#define ESP32_TO_STM32_PIN 12
 HardwareSerial STM32Serial(2);
 
 // ---- WiFi / TCP Settings ----
@@ -33,16 +33,16 @@ WiFiServer server(8888);
 WiFiClient client;
 
 static uint32_t lastTcpRxMs = 0;
-static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;  // 10min
+static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;
 
 // ---- INA226 (cell voltage only) ----
-INA226 ina(0x40);       // Pack voltage
-INA226 inaCell1(0x41);  // Node 1
-INA226 inaCell2(0x44);  // Node 2
+INA226 ina(0x40);
+INA226 inaCell1(0x41);
+INA226 inaCell2(0x44);
 
 // ---- LED & Button ----
 Adafruit_NeoPixel led(1, LED_PIN, NEO_RGB + NEO_KHZ800);
-volatile bool welding_now = false;  // driven by STM32 events
+volatile bool welding_now = false;
 
 // ---- Battery monitoring ----
 float vpack = 0.0f;
@@ -60,19 +60,23 @@ const float CHARGE_RESUME = 8.70f;
 const float HARD_LIMIT = 9.10f;
 
 // ---- Weld settings (forwarded to STM32, mirrored locally only) ----
-uint8_t weld_mode = 1;  // 1=single, 2=double, 3=triple
+uint8_t weld_mode = 1;
 uint16_t weld_d1 = 5;
 uint16_t weld_gap1 = 0;
 uint16_t weld_d2 = 0;
 uint16_t weld_gap2 = 0;
 uint16_t weld_d3 = 0;
-uint8_t weld_power_pct = 100;  // 50-100%
+uint8_t weld_power_pct = 100;
 bool preheat_enabled = false;
 uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
-uint16_t weld_duration_ms = 5;  // legacy: still shown in STATUS
+// ---- Trigger settings (mirrored locally for UI/status) ----
+uint8_t trigger_mode = 1;        // 1 = pedal, 2 = contact
+uint8_t contact_hold_steps = 2;  // each step = 0.5s
+
+uint16_t weld_duration_ms = 5;
 unsigned long last_weld_time = 0;
 const unsigned long WELD_COOLDOWN = 500;
 
@@ -110,14 +114,14 @@ static const uint32_t READY_PERIOD_MS = 250;
 // ---- Cell reading helpers ----
 static bool readBusV_0x02(uint8_t addr, float& v_out) {
     Wire.beginTransmission(addr);
-    Wire.write(0x02);  // Bus Voltage register
+    Wire.write(0x02);
     if (Wire.endTransmission(false) != 0) return false;
 
     if (Wire.requestFrom(addr, (uint8_t)2) != 2) return false;
     if (Wire.available() < 2) return false;
 
     uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
-    v_out = raw * 0.00125f;  // 1.25mV/bit
+    v_out = raw * 0.00125f;
     return true;
 }
 
@@ -220,8 +224,9 @@ String buildStatus() {
     status += ",enabled=" + String(enabled ? 1 : 0);
     status += ",state=" + state;
     status += ",vpack=" + String(vpack, 3);
+
     float ichg = getDisplayCurrent();
-    float iweld = (fabs(stm_weld_current) < 0.2f) ? 0.0f : stm_weld_current;
+    float iweld = (fabs(stm_weld_current) < 0.002f) ? 0.0f : stm_weld_current;
 
     status += ",ichg=" + String(ichg, 3);
     status += ",iweld=" + String(iweld, 3);
@@ -239,6 +244,8 @@ String buildStatus() {
     status += ",d2=" + String(weld_d2);
     status += ",gap2=" + String(weld_gap2);
     status += ",d3=" + String(weld_d3);
+    status += ",trigger_mode=" + String(trigger_mode);
+    status += ",contact_hold_steps=" + String(contact_hold_steps);
 
     return status;
 }
@@ -253,19 +260,14 @@ void sendToPi(const String& msg) {
 }
 
 // ---- UART forward helper ----
-// FIX: Added flush() to guarantee bytes are physically sent before returning.
-//      Without flush(), bytes can sit in the ESP32 TX FIFO/buffer and arrive
-//      late or get coalesced — especially problematic for time-critical
-//      commands like ARM,1 that the STM32 must process immediately.
 void forwardToStm32(const String& line) {
     String out = line;
     out.trim();
     if (out.length() == 0) return;
 
-    // Send command + CRLF line ending (STM32 parser expects \n or \r)
     STM32Serial.print(out);
     STM32Serial.print("\r\n");
-    STM32Serial.flush();  // FIX: Block until all bytes physically transmitted
+    STM32Serial.flush();
 
     if (!out.startsWith("READY,")) {
         Serial.printf("[UART->STM32] %s (len=%d)\n", out.c_str(), out.length());
@@ -320,6 +322,22 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
+                } else if (stmLine.startsWith("ACK,SET_TRIGGER_MODE,")) {
+                    int iv = 0;
+                    if (extractIntField(stmLine, "mode=", iv)) {
+                        trigger_mode = (uint8_t)iv;
+                    }
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("ACK,SET_CONTACT_HOLD,")) {
+                    int iv = 0;
+                    if (extractIntField(stmLine, "steps=", iv)) {
+                        contact_hold_steps = (uint8_t)iv;
+                    }
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
                 } else if (stmLine.startsWith("STATUS,")) {
                     int iv = 0;
                     float fv = NAN;
@@ -337,8 +355,18 @@ void pollStm32Uart() {
                         last_temp_update_ms = millis();
                     }
 
-                    if (extractFloatField(stmLine, "i=", fv)) {
+                    if (extractFloatField(stmLine, "iwfilt=", fv)) {
                         stm_weld_current = fv;
+                    } else if (extractFloatField(stmLine, "iweld_v=", fv)) {
+                        stm_weld_current = fv;
+                    }
+
+                    if (extractIntField(stmLine, "trigger_mode=", iv)) {
+                        trigger_mode = (uint8_t)iv;
+                    }
+
+                    if (extractIntField(stmLine, "contact_hold_steps=", iv)) {
+                        contact_hold_steps = (uint8_t)iv;
                     }
 
                     stm_last_status_ms = millis();
@@ -350,6 +378,36 @@ void pollStm32Uart() {
                         sendToPi(buildStatus());
                         lastStatusForwardMs = now;
                     }
+
+                } else if (stmLine.startsWith("EVENT,WELD_START")) {
+                    welding_now = true;
+                    last_weld_time = millis();
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("EVENT,WELD_DONE")) {
+                    welding_now = false;
+                    last_weld_time = millis();
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("EVENT,PEDAL_PRESS") ||
+                           stmLine.startsWith("EVENT,ARM_TIMEOUT") ||
+                           stmLine.startsWith("EVENT,READY_TIMEOUT") ||
+                           stmLine.startsWith("DENY,") ||
+                           stmLine.startsWith("ERR,")) {
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("IWDBG,")) {
+                    sendToPi(stmLine);
+
+                } else if (stmLine.startsWith("ACK,IWZERO,")) {
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("RXHEALTH,")) {
+                    // optional: keep as serial-only noise
                 }
             }
 
@@ -358,21 +416,20 @@ void pollStm32Uart() {
             if (stmLine.length() < 220) {
                 stmLine += ch;
             } else {
-                // prevent runaway line growth
                 stmLine = "";
             }
         }
     }
 }
+
 // ---- Battery / Charger ----
 void updateBattery() {
     if (xSemaphoreTake(i2c_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         float raw_vpack = ina.readBusVoltage();
         vpack = raw_vpack * VPACK_SCALE;
 
-        // Read shunt voltage register directly from INA at 0x40
         Wire.beginTransmission(0x40);
-        Wire.write(0x01);  // shunt voltage reg
+        Wire.write(0x01);
         if (Wire.endTransmission(false) == 0) {
             if (Wire.requestFrom((uint8_t)0x40, (uint8_t)2) == 2 &&
                 Wire.available() >= 2) {
@@ -515,8 +572,42 @@ void processCommand(String cmd) {
         return;
     }
 
+    if (cmd.startsWith("SET_TRIGGER_MODE,")) {
+        int mode = cmd.substring(strlen("SET_TRIGGER_MODE,")).toInt();
+        if (mode < 1) mode = 1;
+        if (mode > 2) mode = 2;
+        trigger_mode = (uint8_t)mode;
+
+        Serial.printf("✅ Trigger mode set to %d (%s)\n", trigger_mode,
+                      (trigger_mode == 2) ? "contact" : "pedal");
+
+        forwardToStm32(cmd);
+        sendToPi("ACK,SET_TRIGGER_MODE,mode=" + String(trigger_mode));
+        sendToPi(buildStatus());
+        return;
+    }
+
+    if (cmd.startsWith("SET_CONTACT_HOLD,")) {
+        int steps = cmd.substring(strlen("SET_CONTACT_HOLD,")).toInt();
+        if (steps < 1) steps = 1;
+        if (steps > 10) steps = 10;
+        contact_hold_steps = (uint8_t)steps;
+
+        Serial.printf("✅ Contact hold set to %d step(s)\n",
+                      contact_hold_steps);
+
+        forwardToStm32(cmd);
+        sendToPi("ACK,SET_CONTACT_HOLD,steps=" + String(contact_hold_steps));
+        sendToPi(buildStatus());
+        return;
+    }
+
     if (cmd.startsWith("ARM,")) {
-        // Forward only; real success comes back from STM32 as ACK,ARM,x
+        forwardToStm32(cmd);
+        return;
+    }
+
+    if (cmd == "IWZERO" || cmd == "IWDBG") {
         forwardToStm32(cmd);
         return;
     }
@@ -726,7 +817,6 @@ void setup() {
         if (ina.begin(&Wire)) {
             Serial.println("✅ INA226 (pack) initialized");
 
-            // Config register
             Wire.beginTransmission(0x40);
             Wire.write(0x00);
             Wire.write(0x45);
@@ -734,7 +824,6 @@ void setup() {
             Wire.endTransmission();
             delay(10);
 
-            // Calibration register
             uint16_t cal_value = 41967;
             Wire.beginTransmission(0x40);
             Wire.write(0x05);
@@ -801,9 +890,6 @@ void setup() {
     Serial.println("\n=== GATEWAY READY (STM32 does weld timing) ===");
     delay(500);
 
-    // Intentionally DO NOT push defaults into STM32 at boot.
-    // STM32 is the source of truth; UI/user commands update settings
-    // explicitly.
     requestStm32Status();
 }
 
