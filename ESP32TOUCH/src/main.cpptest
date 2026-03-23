@@ -1,0 +1,663 @@
+/*
+ * ============================================================================
+ * ESP32-8048S043C — I2C Bus Diagnostic Scanner
+ * ============================================================================
+ *
+ * PURPOSE:
+ *   Comprehensive I2C bus diagnostic for the Spot Welder project.
+ *   Detects all devices, tests multiple speeds, checks bus health,
+ *   and specifically looks for INA226 sensors + GT911 touch controller.
+ *
+ * HARDWARE:
+ *   Board: Sunton ESP32-S3 8048S043C (4.3" 800x480 capacitive touch)
+ *   I2C Bus: GPIO19 (SDA) / GPIO20 (SCL)
+ *   Expected devices:
+ *     - 0x5D: GT911 capacitive touch controller (on-board, via FPC)
+ *     - 0x40: INA226 pack voltage/current sensor (external board)
+ *     - 0x41: INA226 cell 1 voltage sensor (external board)
+ *     - 0x44: INA226 cell 2 voltage sensor (external board)
+ *
+ * CONNECTIONS (from schematic):
+ *   ESP32 GPIO19 -> SDA (4.7kΩ pull-up to 3.3V via R4 on display board)
+ *   ESP32 GPIO20 -> SCL (4.7kΩ pull-up to 3.3V via R3 on display board)
+ *   Touch FPC: GND, GND, VDD(3.3V), INT(IO38), RST, SCL(IO20), SDA(IO19), GND
+ *   P3/P4 connectors break out: GND, 3.3V, IO17, IO18, IO19, IO20
+ *
+ * WHAT THIS DOES:
+ *   1. Scans all 112 valid I2C addresses (0x08-0x77)
+ *   2. Tests at multiple clock speeds (10kHz, 50kHz, 100kHz, 400kHz)
+ *   3. Identifies known devices by address
+ *   4. Tests bus capacitance/quality with repeated reads
+ *   5. Checks for I2C pin conflicts with other GPIO functions
+ *   6. Reads INA226 manufacturer/device ID registers if found
+ *   7. Reports detailed diagnostics via Serial (115200 baud)
+ *
+ * UPLOAD & RUN:
+ *   pio run -e i2c_diag -t upload
+ *   pio device monitor -b 115200
+ *
+ * Author: Spot Welder Debug Tool
+ * Date: 2026-03-22
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <driver/gpio.h>
+
+// ---- Pin Definitions ----
+#ifndef I2C_SDA_PIN
+#define I2C_SDA_PIN 19
+#endif
+#ifndef I2C_SCL_PIN
+#define I2C_SCL_PIN 20
+#endif
+
+// ---- Known Device Database ----
+struct KnownDevice {
+    uint8_t addr;
+    const char* name;
+    const char* description;
+};
+
+static const KnownDevice KNOWN_DEVICES[] = {
+    {0x14, "GT911 (alt)", "Goodix touch controller (alternate addr)"},
+    {0x40, "INA226 (pack)", "TI current/voltage sensor - pack measurement"},
+    {0x41, "INA226 (cell1)", "TI current/voltage sensor - cell 1 node"},
+    {0x44, "INA226 (cell2)", "TI current/voltage sensor - cell 2 node"},
+    {0x45, "INA226 (alt)", "TI current/voltage sensor - alternate addr"},
+    {0x48, "ADS1115/INA219", "ADC or current sensor"},
+    {0x49, "ADS1115 (alt)", "ADC alternate address"},
+    {0x5D, "GT911", "Goodix capacitive touch controller"},
+    {0x68, "DS3231/MPU6050", "RTC or IMU"},
+    {0x76, "BME280/BMP280", "Environmental sensor"},
+    {0x77, "BME280 (alt)", "Environmental sensor alternate"},
+};
+static const int NUM_KNOWN = sizeof(KNOWN_DEVICES) / sizeof(KNOWN_DEVICES[0]);
+
+static const char* lookupDevice(uint8_t addr) {
+    for (int i = 0; i < NUM_KNOWN; i++) {
+        if (KNOWN_DEVICES[i].addr == addr) return KNOWN_DEVICES[i].name;
+    }
+    return "Unknown";
+}
+
+static const char* lookupDescription(uint8_t addr) {
+    for (int i = 0; i < NUM_KNOWN; i++) {
+        if (KNOWN_DEVICES[i].addr == addr) return KNOWN_DEVICES[i].description;
+    }
+    return "";
+}
+
+// ---- I2C Error Decoder ----
+static const char* i2cErrorStr(uint8_t err) {
+    switch (err) {
+        case 0:
+            return "OK (ACK)";
+        case 1:
+            return "DATA_TOO_LONG";
+        case 2:
+            return "NACK on address";
+        case 3:
+            return "NACK on data";
+        case 4:
+            return "OTHER error";
+        case 5:
+            return "TIMEOUT";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+// ---- GPIO State Check ----
+void checkGpioPinState() {
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════╗");
+    Serial.println("║           GPIO PIN STATE CHECK                       ║");
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+
+    // Read raw pin states before I2C init
+    pinMode(I2C_SDA_PIN, INPUT);
+    pinMode(I2C_SCL_PIN, INPUT);
+    delay(10);
+
+    int sda_state = digitalRead(I2C_SDA_PIN);
+    int scl_state = digitalRead(I2C_SCL_PIN);
+
+    Serial.printf("  SDA (GPIO%d): %s\n", I2C_SDA_PIN,
+                  sda_state ? "HIGH ✅" : "LOW ⚠️");
+    Serial.printf("  SCL (GPIO%d): %s\n", I2C_SCL_PIN,
+                  scl_state ? "HIGH ✅" : "LOW ⚠️");
+
+    if (!sda_state) {
+        Serial.println(
+            "  ⚠️  SDA is LOW — possible bus stuck / short to GND / missing "
+            "pull-up");
+    }
+    if (!scl_state) {
+        Serial.println(
+            "  ⚠️  SCL is LOW — possible bus stuck / short to GND / missing "
+            "pull-up");
+    }
+    if (sda_state && scl_state) {
+        Serial.println(
+            "  ✅ Both lines idle HIGH — pull-ups appear to be working");
+    }
+
+    // Check for shorts between SDA and SCL
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delay(1);
+    int scl_when_sda_low = digitalRead(I2C_SCL_PIN);
+    pinMode(I2C_SDA_PIN, INPUT);
+    delay(1);
+
+    if (!scl_when_sda_low) {
+        Serial.println(
+            "  ⚠️  SCL went LOW when SDA pulled LOW — possible short between "
+            "SDA/SCL!");
+    } else {
+        Serial.println("  ✅ SDA/SCL not shorted together");
+    }
+
+    // Also check the secondary I2C pins that are on the same connector
+    Serial.println("\n  Other connector pins:");
+    int pins[] = {17, 18, 38};
+    const char* names[] = {"IO17 (P4 header)", "IO18 (GT911 INT)",
+                           "IO38 (GT911 RST)"};
+    for (int i = 0; i < 3; i++) {
+        pinMode(pins[i], INPUT);
+        delay(1);
+        Serial.printf("  GPIO%d (%s): %s\n", pins[i], names[i],
+                      digitalRead(pins[i]) ? "HIGH" : "LOW");
+    }
+}
+
+// ---- Bus Recovery (unstick) ----
+void attemptBusRecovery() {
+    Serial.println("\n  Attempting I2C bus recovery (9 clock pulses)...");
+
+    Wire.end();
+    delay(10);
+
+    pinMode(I2C_SCL_PIN, OUTPUT);
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+
+    for (int i = 0; i < 9; i++) {
+        digitalWrite(I2C_SCL_PIN, LOW);
+        delayMicroseconds(5);
+        digitalWrite(I2C_SCL_PIN, HIGH);
+        delayMicroseconds(5);
+
+        if (digitalRead(I2C_SDA_PIN)) {
+            Serial.printf("  Bus released after %d clock pulses\n", i + 1);
+            break;
+        }
+    }
+
+    // Generate STOP condition
+    pinMode(I2C_SDA_PIN, OUTPUT);
+    digitalWrite(I2C_SDA_PIN, LOW);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SCL_PIN, HIGH);
+    delayMicroseconds(5);
+    digitalWrite(I2C_SDA_PIN, HIGH);
+    delayMicroseconds(5);
+
+    Serial.println("  Bus recovery complete");
+}
+
+// ---- Full I2C Scan at a Given Speed ----
+int scanBusAtSpeed(uint32_t speed_hz, bool verbose) {
+    Wire.end();
+    delay(50);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(speed_hz);
+    Wire.setTimeOut(50);  // 50ms timeout per transaction
+    delay(100);           // Let bus settle
+
+    int found = 0;
+    float speed_khz = speed_hz / 1000.0f;
+
+    if (verbose) {
+        Serial.printf(
+            "\n  ┌─── Scanning at %.0f kHz ───────────────────────────┐\n",
+            speed_khz);
+    }
+
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission(true);
+
+        if (err == 0) {
+            found++;
+            if (verbose) {
+                Serial.printf("  │ 0x%02X  ✅ ACK   %-20s %s\n", addr,
+                              lookupDevice(addr), lookupDescription(addr));
+            }
+        } else if (verbose && (addr == 0x40 || addr == 0x41 || addr == 0x44 ||
+                               addr == 0x5D)) {
+            // Always show status of expected devices
+            Serial.printf("  │ 0x%02X  ❌ %-6s %-20s << EXPECTED!\n", addr,
+                          i2cErrorStr(err), lookupDevice(addr));
+        }
+
+        delay(2);  // Small delay between probes
+    }
+
+    if (verbose) {
+        Serial.printf(
+            "  └─── Found %d device(s) at %.0f kHz ──────────────────┘\n",
+            found, speed_khz);
+    }
+
+    return found;
+}
+
+// ---- Reliability Test ----
+void reliabilityTest(uint8_t addr, const char* name, int iterations) {
+    Serial.printf("\n  Reliability test for 0x%02X (%s) — %d iterations:\n",
+                  addr, name, iterations);
+
+    int ok_count = 0;
+    int nack_count = 0;
+    int timeout_count = 0;
+    int other_count = 0;
+
+    for (int i = 0; i < iterations; i++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission(true);
+
+        switch (err) {
+            case 0:
+                ok_count++;
+                break;
+            case 2:
+                nack_count++;
+                break;
+            case 5:
+                timeout_count++;
+                break;
+            default:
+                other_count++;
+                break;
+        }
+        delay(5);
+    }
+
+    Serial.printf("    ACK: %d/%d (%.1f%%)\n", ok_count, iterations,
+                  ok_count * 100.0f / iterations);
+    if (nack_count > 0)
+        Serial.printf("    NACK: %d/%d (%.1f%%)\n", nack_count, iterations,
+                      nack_count * 100.0f / iterations);
+    if (timeout_count > 0)
+        Serial.printf("    TIMEOUT: %d/%d (%.1f%%)\n", timeout_count,
+                      iterations, timeout_count * 100.0f / iterations);
+    if (other_count > 0)
+        Serial.printf("    OTHER: %d/%d (%.1f%%)\n", other_count, iterations,
+                      other_count * 100.0f / iterations);
+
+    if (ok_count == iterations) {
+        Serial.println("    ✅ 100% reliable");
+    } else if (ok_count > 0) {
+        Serial.println("    ⚠️  Intermittent — check wiring/pull-ups");
+    } else {
+        Serial.println("    ❌ Device not responding at all");
+    }
+}
+
+// ---- Read INA226 Registers (if found) ----
+void probeINA226(uint8_t addr) {
+    Wire.beginTransmission(addr);
+    uint8_t err = Wire.endTransmission();
+    if (err != 0) {
+        Serial.printf("  INA226 @ 0x%02X: Not responding (err=%d)\n", addr,
+                      err);
+        return;
+    }
+
+    Serial.printf("\n  ═══ INA226 @ 0x%02X Register Dump ═══\n", addr);
+
+    // Register map
+    struct {
+        uint8_t reg;
+        const char* name;
+    } regs[] = {
+        {0x00, "Configuration"},   {0x01, "Shunt Voltage"},
+        {0x02, "Bus Voltage"},     {0x03, "Power"},
+        {0x04, "Current"},         {0x05, "Calibration"},
+        {0x06, "Mask/Enable"},     {0x07, "Alert Limit"},
+        {0xFE, "Manufacturer ID"}, {0xFF, "Die ID"},
+    };
+
+    for (auto& r : regs) {
+        Wire.beginTransmission(addr);
+        Wire.write(r.reg);
+        if (Wire.endTransmission(false) != 0) {
+            Serial.printf("    Reg 0x%02X (%s): READ ERROR\n", r.reg, r.name);
+            continue;
+        }
+
+        if (Wire.requestFrom(addr, (uint8_t)2) == 2) {
+            uint16_t val = ((uint16_t)Wire.read() << 8) | Wire.read();
+            Serial.printf("    Reg 0x%02X %-18s = 0x%04X", r.reg, r.name, val);
+
+            // Decode specific registers
+            if (r.reg == 0x02) {
+                float bus_v = val * 0.00125f;
+                Serial.printf("  (%.3f V)", bus_v);
+            } else if (r.reg == 0x01) {
+                float shunt_v = (int16_t)val * 0.0000025f;
+                Serial.printf("  (%.6f V)", shunt_v);
+            } else if (r.reg == 0xFE) {
+                if (val == 0x5449) {
+                    Serial.printf("  ('TI' ✅ — confirmed Texas Instruments)");
+                } else {
+                    Serial.printf("  (expected 0x5449 'TI' ⚠️)");
+                }
+            } else if (r.reg == 0xFF) {
+                if (val == 0x2260) {
+                    Serial.printf("  (INA226 ✅ confirmed)");
+                } else {
+                    Serial.printf("  (expected 0x2260 for INA226)");
+                }
+            } else if (r.reg == 0x00) {
+                Serial.printf("  (default=0x4127)");
+            }
+
+            Serial.println();
+        } else {
+            Serial.printf("    Reg 0x%02X (%s): NO DATA\n", r.reg, r.name);
+        }
+
+        delay(5);
+    }
+}
+
+// ---- INA226 Address Configuration Reference ----
+void printINA226AddressTable() {
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════╗");
+    Serial.println("║     INA226 Address Configuration Reference            ║");
+    Serial.println("╠══════════════════════════════════════════════════════╣");
+    Serial.println("║  A1    A0    Address                                 ║");
+    Serial.println("║  GND   GND   0x40                                    ║");
+    Serial.println("║  GND   VS    0x41                                    ║");
+    Serial.println("║  GND   SDA   0x42                                    ║");
+    Serial.println("║  GND   SCL   0x43                                    ║");
+    Serial.println("║  VS    GND   0x44                                    ║");
+    Serial.println("║  VS    VS    0x45                                    ║");
+    Serial.println("║  VS    SDA   0x46                                    ║");
+    Serial.println("║  VS    SCL   0x47                                    ║");
+    Serial.println("║  SDA   GND   0x48                                    ║");
+    Serial.println("║  SDA   VS    0x49                                    ║");
+    Serial.println("║  SDA   SDA   0x4A                                    ║");
+    Serial.println("║  SDA   SCL   0x4B                                    ║");
+    Serial.println("║  SCL   GND   0x4C                                    ║");
+    Serial.println("║  SCL   VS    0x4D                                    ║");
+    Serial.println("║  SCL   SDA   0x4E                                    ║");
+    Serial.println("║  SCL   SCL   0x4F                                    ║");
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+    Serial.println(
+        "  Your expected: 0x40 (A1=GND,A0=GND), 0x41 (A1=GND,A0=VS), 0x44 "
+        "(A1=VS,A0=GND)");
+}
+
+// ======================== SETUP ========================
+void setup() {
+    Serial.begin(115200);
+    delay(2000);  // Wait for serial monitor to connect
+
+    Serial.println();
+    Serial.println(
+        "╔══════════════════════════════════════════════════════════════╗");
+    Serial.println(
+        "║  ESP32-8048S043C — I2C BUS DIAGNOSTIC SCANNER               ║");
+    Serial.println(
+        "║  Spot Welder Project — INA226 Debug Tool                    ║");
+    Serial.println(
+        "╠══════════════════════════════════════════════════════════════╣");
+    Serial.printf(
+        "║  SDA Pin: GPIO%d                                             ║\n",
+        I2C_SDA_PIN);
+    Serial.printf(
+        "║  SCL Pin: GPIO%d                                             ║\n",
+        I2C_SCL_PIN);
+    Serial.println(
+        "║  Expected: 0x5D (GT911), 0x40/0x41/0x44 (INA226)            ║");
+    Serial.println(
+        "╚══════════════════════════════════════════════════════════════╝");
+
+    // ============ PHASE 1: Raw GPIO Check ============
+    checkGpioPinState();
+
+    // ============ PHASE 2: Bus Recovery ============
+    attemptBusRecovery();
+
+    // ============ PHASE 3: Multi-Speed Scan ============
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════╗");
+    Serial.println("║           I2C BUS SCAN — MULTIPLE SPEEDS              ║");
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+
+    uint32_t speeds[] = {10000, 50000, 100000, 400000};
+    const char* speed_names[] = {"10 kHz (ultra-slow)", "50 kHz (safe)",
+                                 "100 kHz (standard)", "400 kHz (fast)"};
+
+    int best_count = 0;
+    uint32_t best_speed = 0;
+
+    for (int s = 0; s < 4; s++) {
+        int count = scanBusAtSpeed(speeds[s], true);
+        if (count > best_count) {
+            best_count = count;
+            best_speed = speeds[s];
+        }
+    }
+
+    Serial.printf("\n  📊 Best result: %d device(s) at %lu Hz\n", best_count,
+                  best_speed);
+
+    // ============ PHASE 4: Detailed Scan at Best Speed ============
+    if (best_speed > 0) {
+        Wire.end();
+        delay(50);
+        Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+        Wire.setClock(best_speed);
+        Wire.setTimeOut(100);
+        delay(100);
+
+        Serial.println(
+            "\n"
+            "╔══════════════════════════════════════════════════════╗");
+        Serial.println(
+            "║           FULL ADDRESS MAP (0x08 - 0x77)              ║");
+        Serial.println(
+            "╚══════════════════════════════════════════════════════╝");
+
+        Serial.println("\n     0  1  2  3  4  5  6  7  8  9  A  B  C  D  E  F");
+        for (uint8_t row = 0; row <= 0x70; row += 0x10) {
+            Serial.printf("%02X: ", row);
+            for (uint8_t col = 0; col < 0x10; col++) {
+                uint8_t addr = row + col;
+                if (addr < 0x08 || addr > 0x77) {
+                    Serial.print("   ");
+                    continue;
+                }
+                Wire.beginTransmission(addr);
+                uint8_t err = Wire.endTransmission(true);
+                if (err == 0) {
+                    Serial.printf("%02X ", addr);
+                } else {
+                    Serial.print("-- ");
+                }
+                delay(2);
+            }
+            Serial.println();
+        }
+    }
+
+    // ============ PHASE 5: Reliability Tests ============
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════╗");
+    Serial.println("║           RELIABILITY TESTS (50 iterations each)      ║");
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+
+    // Test expected devices
+    uint8_t test_addrs[] = {0x5D, 0x40, 0x41, 0x44};
+    const char* test_names[] = {"GT911", "INA226(pack)", "INA226(cell1)",
+                                "INA226(cell2)"};
+    for (int i = 0; i < 4; i++) {
+        reliabilityTest(test_addrs[i], test_names[i], 50);
+    }
+
+    // ============ PHASE 6: INA226 Deep Probe ============
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════╗");
+    Serial.println("║           INA226 REGISTER PROBE                       ║");
+    Serial.println("╚══════════════════════════════════════════════════════╝");
+
+    // Probe ALL possible INA226 addresses (0x40-0x4F)
+    Serial.println("  Probing all possible INA226 addresses (0x40-0x4F)...");
+    for (uint8_t addr = 0x40; addr <= 0x4F; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            probeINA226(addr);
+        }
+    }
+
+    // ============ PHASE 7: Address Reference ============
+    printINA226AddressTable();
+
+    // ============ SUMMARY ============
+    Serial.println(
+        "\n"
+        "╔══════════════════════════════════════════════════════════════╗");
+    Serial.println(
+        "║                    DIAGNOSTIC SUMMARY                        ║");
+    Serial.println(
+        "╠══════════════════════════════════════════════════════════════╣");
+
+    // Final check of expected devices
+    Wire.end();
+    delay(50);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    Wire.setTimeOut(100);
+    delay(100);
+
+    struct {
+        uint8_t addr;
+        const char* name;
+        bool found;
+    } expected[] = {
+        {0x5D, "GT911 Touch", false},
+        {0x40, "INA226 Pack", false},
+        {0x41, "INA226 Cell1", false},
+        {0x44, "INA226 Cell2", false},
+    };
+
+    for (auto& dev : expected) {
+        Wire.beginTransmission(dev.addr);
+        dev.found = (Wire.endTransmission() == 0);
+        Serial.printf("║  0x%02X %-18s %s                          ║\n",
+                      dev.addr, dev.name,
+                      dev.found ? "✅ FOUND" : "❌ MISSING");
+    }
+
+    Serial.println(
+        "╠══════════════════════════════════════════════════════════════╣");
+
+    bool gt911_ok = expected[0].found;
+    bool any_ina = expected[1].found || expected[2].found || expected[3].found;
+
+    if (gt911_ok && !any_ina) {
+        Serial.println(
+            "║  DIAGNOSIS: GT911 works but NO INA226 detected.            ║");
+        Serial.println(
+            "║                                                            ║");
+        Serial.println(
+            "║  This confirms a HARDWARE issue between the display board   ║");
+        Serial.println(
+            "║  I2C bus and your external INA226 board. Check:             ║");
+        Serial.println(
+            "║                                                            ║");
+        Serial.println(
+            "║  1. Physical connection P3/P4 connector → INA226 board     ║");
+        Serial.println(
+            "║  2. Power (3.3V/VS) reaching INA226 chips                  ║");
+        Serial.println(
+            "║  3. SDA/SCL traces from connector to INA226 pins           ║");
+        Serial.println(
+            "║  4. INA226 address pin (A0/A1) connections                 ║");
+        Serial.println(
+            "║  5. Solder joints on INA226 and connector                  ║");
+        Serial.println(
+            "║  6. Pull-up resistors on external board (if any)            ║");
+    } else if (gt911_ok && any_ina) {
+        Serial.println(
+            "║  ✅ Both GT911 and INA226(s) detected! Bus working.         ║");
+    } else if (!gt911_ok && !any_ina) {
+        Serial.println(
+            "║  ❌ NO devices found at all. Complete bus failure.           ║");
+        Serial.println(
+            "║  Check: pull-ups, power supply, pin connections.            ║");
+    }
+
+    Serial.println(
+        "╚══════════════════════════════════════════════════════════════╝");
+    Serial.println(
+        "\n  Diagnostic scan complete. Repeating every 10 seconds...");
+    Serial.println("  (Useful for testing while probing hardware)\n");
+}
+
+// ======================== LOOP ========================
+static uint32_t loopCount = 0;
+
+void loop() {
+    delay(10000);
+    loopCount++;
+
+    Serial.printf("\n═══ Periodic Re-scan #%lu ═══\n", loopCount);
+
+    // Quick scan at 100kHz
+    Wire.end();
+    delay(50);
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+    Wire.setClock(100000);
+    Wire.setTimeOut(100);
+    delay(100);
+
+    int found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission(true) == 0) {
+            found++;
+            Serial.printf("  0x%02X ✅ %s\n", addr, lookupDevice(addr));
+        }
+        delay(2);
+    }
+    Serial.printf("  Total: %d device(s)\n", found);
+
+    // Quick INA226 check
+    for (uint8_t addr : {0x40, 0x41, 0x44}) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err == 0) {
+            Serial.printf(
+                "  🎉 INA226 @ 0x%02X FOUND! Reading bus voltage...\n", addr);
+            Wire.beginTransmission(addr);
+            Wire.write(0x02);
+            if (Wire.endTransmission(false) == 0 &&
+                Wire.requestFrom(addr, (uint8_t)2) == 2) {
+                uint16_t raw = ((uint16_t)Wire.read() << 8) | Wire.read();
+                Serial.printf("    Bus voltage: %.3f V\n", raw * 0.00125f);
+            }
+        }
+    }
+}
