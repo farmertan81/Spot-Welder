@@ -1092,7 +1092,7 @@ static void save_config_to_nvs(const ConfigState& cfg) {
     prefs.putUChar("bright", cfg.brightness);
     prefs.putBool("cwPedal", cfg.contact_with_pedal);
     prefs.putUChar("trigMode", trigger_mode);
-    prefs.putUChar("holdSteps", contact_hold_steps);
+    prefs.putUChar("holdSteps", cfg.contact_hold_steps);
     prefs.end();
     Serial.println("[Config] Saved to NVS");
 }
@@ -1108,7 +1108,8 @@ static ConfigState load_config_from_nvs() {
     cfg.contact_with_pedal = prefs.getBool("cwPedal", cfg.contact_with_pedal);
 
     trigger_mode = prefs.getUChar("trigMode", trigger_mode);
-    contact_hold_steps = prefs.getUChar("holdSteps", contact_hold_steps);
+    cfg.contact_hold_steps = prefs.getUChar("holdSteps", cfg.contact_hold_steps);
+    contact_hold_steps = cfg.contact_hold_steps;  // sync global
 
     prefs.end();
     Serial.println("[Config] Loaded from NVS");
@@ -1157,6 +1158,15 @@ static void onConfigChange(const ConfigState& cfg) {
     // and STM32 ACK/STATUS parsing.  Writing it here caused any unrelated
     // config change (brightness, hold-repeat, etc.) to silently overwrite the
     // authoritative CWP value with a potentially stale _cfg copy.
+
+    // Sync contact_hold_steps from ConfigState to main.cpp global and STM32
+    if (cfg.contact_hold_steps != contact_hold_steps) {
+        contact_hold_steps = cfg.contact_hold_steps;
+        char buf[40];
+        snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d", (int)contact_hold_steps);
+        processCommand(String(buf));
+    }
+
     save_config_to_nvs(cfg);
     // Note: recipe persistence happens in onRecipeApply, not here
 }

@@ -46,6 +46,7 @@ struct ConfigState {
     bool    load_last_on_boot;  // ON/OFF – restore last settings at startup
     uint8_t brightness;         // 0=LOW, 1=MED, 2=HIGH
     bool    contact_with_pedal; // ON/OFF – require contact detection when using pedal trigger
+    uint8_t contact_hold_steps; // 1-6 (0.5s per step) – probe/contact hold time
 };
 
 // Default config values
@@ -57,6 +58,7 @@ static inline ConfigState config_defaults() {
     c.load_last_on_boot = true;
     c.brightness        = 2;  // HIGH
     c.contact_with_pedal = false;
+    c.contact_hold_steps = 2;      // default 1.0s
     return c;
 }
 

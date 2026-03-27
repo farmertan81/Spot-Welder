@@ -1273,8 +1273,7 @@ static void update_cfg_brightness_label() {
         lv_label_set_text(lbl_cfg_brightness, brightness_text(_cfg.brightness));
 }
 
-// Contact/Probe Hold Time – stored as steps: 1=0.5s, 2=1.0s, ... 6=3.0s
-static uint8_t _contact_hold_steps = 2;  // default 1.0s
+// Contact/Probe Hold Time – now stored in _cfg.contact_hold_steps
 
 static const char* hold_time_text(uint8_t steps) {
     switch (steps) {
@@ -1290,7 +1289,7 @@ static const char* hold_time_text(uint8_t steps) {
 
 static void update_cfg_hold_time_label() {
     if (lbl_cfg_hold_time)
-        lv_label_set_text(lbl_cfg_hold_time, hold_time_text(_contact_hold_steps));
+        lv_label_set_text(lbl_cfg_hold_time, hold_time_text(_cfg.contact_hold_steps));
 }
 
 static void update_cfg_cwp_label() {
@@ -1373,7 +1372,7 @@ static void on_cfg_brightness(lv_event_t* e) {
 static void on_cfg_hold_time(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     // Cycle: 1(0.5s) -> 2(1.0s) -> ... -> 6(3.0s) -> 1(0.5s)
-    _contact_hold_steps = (_contact_hold_steps % 6) + 1;
+    _cfg.contact_hold_steps = (_cfg.contact_hold_steps % 6) + 1;
     update_cfg_hold_time_label();
     notify_config_changed();
 }
@@ -1475,7 +1474,7 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
     btn_cfg_hold_time = make_cfg_button(cont,
-        hold_time_text(_contact_hold_steps), &lbl_cfg_hold_time,
+        hold_time_text(_cfg.contact_hold_steps), &lbl_cfg_hold_time,
         BTN_X, y, BTN_W, BTN_H, C_ACCENT);
     lv_obj_add_event_cb(btn_cfg_hold_time, on_cfg_hold_time, LV_EVENT_CLICKED, nullptr);
     y += ROW_H;
@@ -1862,6 +1861,7 @@ void ui_load_config(const ConfigState& cfg) {
     update_cfg_load_last_label();
     update_cfg_brightness_label();
     update_cfg_cwp_label();
+    update_cfg_hold_time_label();
     // Apply step sizes to spinboxes
     apply_time_step_to_spinboxes();
 }
