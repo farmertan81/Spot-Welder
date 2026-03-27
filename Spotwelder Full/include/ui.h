@@ -36,6 +36,28 @@ struct WelderDisplayState {
     uint8_t contact_hold_steps;
 };
 
+// ============================================================
+// CONFIG STATE – 5 global settings (Config tab v1)
+// ============================================================
+struct ConfigState {
+    bool    hold_to_repeat;     // ON/OFF for +/- button hold-repeat
+    uint8_t time_step_ms;       // 1, 5, or 10 ms
+    uint8_t power_step_pct;     // 1, 5, or 10 %
+    bool    load_last_on_boot;  // ON/OFF – restore last settings at startup
+    uint8_t brightness;         // 0=LOW, 1=MED, 2=HIGH
+};
+
+// Default config values
+static inline ConfigState config_defaults() {
+    ConfigState c;
+    c.hold_to_repeat    = true;
+    c.time_step_ms      = 1;
+    c.power_step_pct    = 5;
+    c.load_last_on_boot = true;
+    c.brightness        = 2;  // HIGH
+    return c;
+}
+
 // Callback type for arm toggle from UI
 typedef void (*arm_toggle_cb_t)(bool arm);
 
@@ -46,8 +68,20 @@ typedef void (*recipe_apply_cb_t)(
     bool preheat_en, uint16_t preheat_ms, uint8_t preheat_pct, uint16_t preheat_gap_ms
 );
 
+// Callback type for config changes from Config tab
+typedef void (*config_change_cb_t)(const ConfigState& cfg);
+
 // Initialize the 5-screen tabview UI.  Call once after smartdisplay_init().
 void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply);
+
+// Set callback for config changes (call before or after ui_init)
+void ui_set_config_cb(config_change_cb_t cb);
+
+// Load config into UI (call after ui_init to set initial values from NVS)
+void ui_load_config(const ConfigState& cfg);
+
+// Get current config state from UI
+ConfigState ui_get_config();
 
 // Push latest data into the UI.  Call from loop() at ~20 Hz.
 void ui_update(const WelderDisplayState& st);

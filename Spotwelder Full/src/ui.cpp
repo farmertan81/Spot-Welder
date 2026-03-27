@@ -30,11 +30,18 @@
  *   WelderDisplayState (authoritative source in main.cpp).
  *   ARM is blocked when draft ≠ applied.
  *
+ * CONFIG TAB (v1):
+ *   5 global settings in 3 sections (Editing, Startup, Display).
+ *   Hold-to-repeat, Time Step, Power Step, Load Last Settings, Brightness.
+ *   Uses Widget A pattern for all controls (anti-shudder safe).
+ *   Step sizes drive Pulse tab +/- buttons globally.
+ *   Hold-to-repeat uses PRESSED/PRESSING events with millis() timing.
+ *
  * Provides:
  *   Tab 0  "Status"   – Pack V, Temp, Charger I, Cell voltages, Arm toggle
  *   Tab 1  "Pulse"    – Mode, Durations, Power (+/-), Preheat (toggle), Apply
  *   Tab 2  "Charger"  – placeholder
- *   Tab 3  "Config"   – placeholder
+ *   Tab 3  "Config"   – 5 global settings (Hold-to-repeat, Time/Power Step, Boot, Brightness)
  *   Tab 4  "Logs"     – placeholder
  */
 
@@ -62,6 +69,16 @@
 // ============================================================
 static arm_toggle_cb_t    _arm_cb    = nullptr;
 static recipe_apply_cb_t  _recipe_cb = nullptr;
+static config_change_cb_t _config_cb = nullptr;
+
+// ============================================================
+// GLOBAL CONFIG STATE (Config tab v1)
+// ============================================================
+static ConfigState _cfg;
+
+// Forward declarations for config-driven updates
+static void apply_time_step_to_spinboxes();
+static void notify_config_changed();
 
 // ============================================================
 // ANTI-SHUDDER: Touch state tracking
@@ -119,6 +136,95 @@ static void make_interaction_safe(lv_obj_t* obj) {
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
 }
+
+// ============================================================
+// HOLD-TO-REPEAT: Timer-based repeat for +/- buttons
+// ============================================================
+static const uint32_t HOLD_INITIAL_DELAY_MS = 400;
+static const uint32_t HOLD_REPEAT_RATE_MS   = 120;
+
+// Context for each repeatable button
+struct HoldRepeatCtx {
+    lv_obj_t* spinbox;       // target spinbox (nullptr for power buttons)
+    bool      is_increment;  // true = +, false = -
+    bool      is_power;      // true = power button (not spinbox)
+    uint32_t  press_start;
+    uint32_t  last_repeat;
+};
+
+#define MAX_REPEAT_BTNS 20
+static HoldRepeatCtx _repeat_pool[MAX_REPEAT_BTNS];
+static int _repeat_count = 0;
+
+static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc, bool is_power) {
+    if (_repeat_count >= MAX_REPEAT_BTNS) return nullptr;
+    HoldRepeatCtx* ctx = &_repeat_pool[_repeat_count++];
+    ctx->spinbox = spin;
+    ctx->is_increment = inc;
+    ctx->is_power = is_power;
+    ctx->press_start = 0;
+    ctx->last_repeat = 0;
+    return ctx;
+}
+
+// Forward declaration for power step action
+static void do_power_step(bool increment);
+
+static void on_repeat_pressed(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+    HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
+    if (!ctx) return;
+    uint32_t now = millis();
+    ctx->press_start = now;
+    ctx->last_repeat = now;
+
+    // Perform the action once on press
+    if (ctx->is_power) {
+        do_power_step(ctx->is_increment);
+    } else if (ctx->spinbox) {
+        if (ctx->is_increment) lv_spinbox_increment(ctx->spinbox);
+        else                   lv_spinbox_decrement(ctx->spinbox);
+        lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
+    }
+}
+
+static void on_repeat_pressing(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESSING) return;
+    if (!_cfg.hold_to_repeat) return;  // hold-to-repeat disabled
+
+    HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
+    if (!ctx) return;
+    uint32_t now = millis();
+
+    // Wait for initial delay
+    if (now - ctx->press_start < HOLD_INITIAL_DELAY_MS) return;
+
+    // Repeat at steady rate
+    if (now - ctx->last_repeat >= HOLD_REPEAT_RATE_MS) {
+        ctx->last_repeat = now;
+        if (ctx->is_power) {
+            do_power_step(ctx->is_increment);
+        } else if (ctx->spinbox) {
+            if (ctx->is_increment) lv_spinbox_increment(ctx->spinbox);
+            else                   lv_spinbox_decrement(ctx->spinbox);
+            lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
+        }
+    }
+}
+
+// ============================================================
+// CONFIG TAB: UI handles
+// ============================================================
+static lv_obj_t* lbl_cfg_hold_repeat = nullptr;
+static lv_obj_t* btn_cfg_hold_repeat = nullptr;
+static lv_obj_t* lbl_cfg_time_step   = nullptr;
+static lv_obj_t* btn_cfg_time_step   = nullptr;
+static lv_obj_t* lbl_cfg_power_step  = nullptr;
+static lv_obj_t* btn_cfg_power_step  = nullptr;
+static lv_obj_t* lbl_cfg_load_last   = nullptr;
+static lv_obj_t* btn_cfg_load_last   = nullptr;
+static lv_obj_t* lbl_cfg_brightness  = nullptr;
+static lv_obj_t* btn_cfg_brightness  = nullptr;
 
 // ============================================================
 // STATIC UI HANDLES  (Status tab)
@@ -469,14 +575,28 @@ static void on_spinbox_change(lv_event_t* e) {
     mark_dirty();
 }
 
-// Data-only callback: power +/- buttons
+// Power step action – uses global config step size
+static void do_power_step(bool increment) {
+    uint8_t step = _cfg.power_step_pct;
+    if (step == 0) step = 5;
+    if (increment) {
+        if (draft_power + step <= 100) draft_power += step;
+        else draft_power = 100;
+    } else {
+        if (draft_power >= 50 + step) draft_power -= step;
+        else draft_power = 50;
+    }
+    mark_dirty();
+}
+
+// Data-only callback: power +/- buttons (legacy CLICKED path, kept for safety)
 static void on_power_minus(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (draft_power > 50) { draft_power -= 5; mark_dirty(); }
+    do_power_step(false);
 }
 static void on_power_plus(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (draft_power < 100) { draft_power += 5; mark_dirty(); }
+    do_power_step(true);
 }
 
 // Data-only callback: preheat toggle (plain object click)
@@ -589,20 +709,18 @@ static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
     lv_obj_set_style_text_font(lbl_unit, &lv_font_montserrat_14, LV_PART_MAIN);
     lv_obj_set_pos(lbl_unit, X_INC + BTN_W + 6, 16);
 
-    // Wire +/- to spinbox
-    lv_obj_add_event_cb(btn_dec, [](lv_event_t* ev) {
-        if (lv_event_get_code(ev) != LV_EVENT_CLICKED) return;
-        lv_obj_t* s = (lv_obj_t*)lv_event_get_user_data(ev);
-        lv_spinbox_decrement(s);
-        lv_obj_send_event(s, LV_EVENT_VALUE_CHANGED, nullptr);
-    }, LV_EVENT_CLICKED, spin);
+    // Wire +/- to spinbox using hold-to-repeat handlers
+    HoldRepeatCtx* ctx_dec = alloc_repeat_ctx(spin, false, false);
+    HoldRepeatCtx* ctx_inc = alloc_repeat_ctx(spin, true,  false);
 
-    lv_obj_add_event_cb(btn_inc, [](lv_event_t* ev) {
-        if (lv_event_get_code(ev) != LV_EVENT_CLICKED) return;
-        lv_obj_t* s = (lv_obj_t*)lv_event_get_user_data(ev);
-        lv_spinbox_increment(s);
-        lv_obj_send_event(s, LV_EVENT_VALUE_CHANGED, nullptr);
-    }, LV_EVENT_CLICKED, spin);
+    if (ctx_dec) {
+        lv_obj_add_event_cb(btn_dec, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx_dec);
+        lv_obj_add_event_cb(btn_dec, on_repeat_pressing, LV_EVENT_PRESSING, ctx_dec);
+    }
+    if (ctx_inc) {
+        lv_obj_add_event_cb(btn_inc, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx_inc);
+        lv_obj_add_event_cb(btn_inc, on_repeat_pressing, LV_EVENT_PRESSING, ctx_inc);
+    }
 
     lv_obj_add_event_cb(spin, on_spinbox_change, LV_EVENT_VALUE_CHANGED, nullptr);
 
@@ -781,7 +899,13 @@ static void build_pulse_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
         lv_obj_center(lbl);
     }
-    lv_obj_add_event_cb(btn_power_minus, on_power_minus, LV_EVENT_CLICKED, nullptr);
+    {
+        HoldRepeatCtx* ctx = alloc_repeat_ctx(nullptr, false, true);
+        if (ctx) {
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx);
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressing, LV_EVENT_PRESSING, ctx);
+        }
+    }
     make_interaction_safe(btn_power_minus);
 
     // Fixed-width container for power value – centers text between [-] and [+]
@@ -818,7 +942,13 @@ static void build_pulse_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
         lv_obj_center(lbl);
     }
-    lv_obj_add_event_cb(btn_power_plus, on_power_plus, LV_EVENT_CLICKED, nullptr);
+    {
+        HoldRepeatCtx* ctx = alloc_repeat_ctx(nullptr, true, true);
+        if (ctx) {
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx);
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressing, LV_EVENT_PRESSING, ctx);
+        }
+    }
     make_interaction_safe(btn_power_plus);
 
     register_lockable(btn_power_minus);
@@ -913,11 +1043,274 @@ static void build_placeholder_tab(lv_obj_t* tab, const char* name) {
 }
 
 // ============================================================
+// CONFIG TAB: Helper – create a toggle/cycle button (Widget A)
+// Returns the button object. Sets *out_label to inner label.
+// ============================================================
+static lv_obj_t* make_cfg_button(lv_obj_t* parent, const char* text,
+                                 lv_obj_t** out_label,
+                                 int x, int y, int w, int h,
+                                 lv_color_t bg_color) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_remove_style_all(btn);
+    lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_style_bg_color(btn, bg_color, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_set_scrollbar_mode(btn, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_center(lbl);
+
+    make_interaction_safe(btn);
+    if (out_label) *out_label = lbl;
+    return btn;
+}
+
+// ============================================================
+// CONFIG TAB: Helpers – update label text for each setting
+// ============================================================
+static void update_cfg_hold_repeat_label() {
+    if (lbl_cfg_hold_repeat)
+        lv_label_set_text(lbl_cfg_hold_repeat, _cfg.hold_to_repeat ? "ON" : "OFF");
+    if (btn_cfg_hold_repeat)
+        lv_obj_set_style_bg_color(btn_cfg_hold_repeat,
+            _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY, 0);
+}
+
+static const char* time_step_text(uint8_t ms) {
+    switch (ms) {
+        case 1:  return "1 ms";
+        case 5:  return "5 ms";
+        case 10: return "10 ms";
+        default: return "1 ms";
+    }
+}
+
+static void update_cfg_time_step_label() {
+    if (lbl_cfg_time_step)
+        lv_label_set_text(lbl_cfg_time_step, time_step_text(_cfg.time_step_ms));
+}
+
+static const char* power_step_text(uint8_t pct) {
+    switch (pct) {
+        case 1:  return "1 %";
+        case 5:  return "5 %";
+        case 10: return "10 %";
+        default: return "5 %";
+    }
+}
+
+static void update_cfg_power_step_label() {
+    if (lbl_cfg_power_step)
+        lv_label_set_text(lbl_cfg_power_step, power_step_text(_cfg.power_step_pct));
+}
+
+static void update_cfg_load_last_label() {
+    if (lbl_cfg_load_last)
+        lv_label_set_text(lbl_cfg_load_last, _cfg.load_last_on_boot ? "ON" : "OFF");
+    if (btn_cfg_load_last)
+        lv_obj_set_style_bg_color(btn_cfg_load_last,
+            _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY, 0);
+}
+
+static const char* brightness_text(uint8_t b) {
+    switch (b) {
+        case 0:  return "LOW";
+        case 1:  return "MED";
+        case 2:  return "HIGH";
+        default: return "HIGH";
+    }
+}
+
+static void update_cfg_brightness_label() {
+    if (lbl_cfg_brightness)
+        lv_label_set_text(lbl_cfg_brightness, brightness_text(_cfg.brightness));
+}
+
+// ============================================================
+// CONFIG TAB: Notify main.cpp of config changes
+// ============================================================
+static void notify_config_changed() {
+    if (_config_cb) _config_cb(_cfg);
+}
+
+// ============================================================
+// CONFIG TAB: Apply time step to all timing spinboxes
+// ============================================================
+static void apply_time_step_to_spinboxes() {
+    int step = (int)_cfg.time_step_ms;
+    if (step <= 0) step = 1;
+    lv_obj_t* timing_spins[] = {spin_d1, spin_gap1, spin_d2, spin_gap2, spin_d3,
+                                 spin_ph_ms, spin_ph_gap};
+    for (int i = 0; i < 7; i++) {
+        if (timing_spins[i]) lv_spinbox_set_step(timing_spins[i], step);
+    }
+    // Preheat power spinbox uses power step
+    if (spin_ph_pct) lv_spinbox_set_step(spin_ph_pct, (int)_cfg.power_step_pct);
+}
+
+// ============================================================
+// CONFIG TAB: Event callbacks
+// ============================================================
+static void on_cfg_hold_repeat(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _cfg.hold_to_repeat = !_cfg.hold_to_repeat;
+    update_cfg_hold_repeat_label();
+    notify_config_changed();
+}
+
+static void on_cfg_time_step(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    // Cycle: 1 -> 5 -> 10 -> 1
+    if      (_cfg.time_step_ms == 1)  _cfg.time_step_ms = 5;
+    else if (_cfg.time_step_ms == 5)  _cfg.time_step_ms = 10;
+    else                              _cfg.time_step_ms = 1;
+    update_cfg_time_step_label();
+    apply_time_step_to_spinboxes();
+    notify_config_changed();
+}
+
+static void on_cfg_power_step(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    // Cycle: 1 -> 5 -> 10 -> 1
+    if      (_cfg.power_step_pct == 1)  _cfg.power_step_pct = 5;
+    else if (_cfg.power_step_pct == 5)  _cfg.power_step_pct = 10;
+    else                                _cfg.power_step_pct = 1;
+    update_cfg_power_step_label();
+    apply_time_step_to_spinboxes();  // also updates preheat power step
+    notify_config_changed();
+}
+
+static void on_cfg_load_last(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _cfg.load_last_on_boot = !_cfg.load_last_on_boot;
+    update_cfg_load_last_label();
+    notify_config_changed();
+}
+
+static void on_cfg_brightness(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    // Cycle: LOW(0) -> MED(1) -> HIGH(2) -> LOW(0)
+    _cfg.brightness = (_cfg.brightness + 1) % 3;
+    update_cfg_brightness_label();
+    notify_config_changed();
+}
+
+// ============================================================
+// CONFIG TAB BUILDER
+// ============================================================
+static void build_config_tab(lv_obj_t* tab) {
+    lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(tab, 10, LV_PART_MAIN);
+    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int LABEL_X = 30;
+    const int BTN_X   = 440;
+    const int BTN_W   = 140;
+    const int BTN_H   = 48;
+    const int ROW_H   = 60;
+    int y = 4;
+
+    // ---- Section: Editing ----
+    make_section_header(tab, "Editing", LABEL_X, y);
+    y += 32;
+
+    // Hold-to-repeat
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Hold-to-repeat (+/- buttons)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_hold_repeat = make_cfg_button(tab,
+        _cfg.hold_to_repeat ? "ON" : "OFF", &lbl_cfg_hold_repeat,
+        BTN_X, y, BTN_W, BTN_H,
+        _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat, LV_EVENT_CLICKED, nullptr);
+    y += ROW_H;
+
+    // Time Step
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Time Step (timing +/-)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_time_step = make_cfg_button(tab,
+        time_step_text(_cfg.time_step_ms), &lbl_cfg_time_step,
+        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_time_step, on_cfg_time_step, LV_EVENT_CLICKED, nullptr);
+    y += ROW_H;
+
+    // Power Step
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Power Step (power +/-)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_power_step = make_cfg_button(tab,
+        power_step_text(_cfg.power_step_pct), &lbl_cfg_power_step,
+        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_power_step, on_cfg_power_step, LV_EVENT_CLICKED, nullptr);
+    y += ROW_H + 12;
+
+    // ---- Section: Startup ----
+    make_section_header(tab, "Startup", LABEL_X, y);
+    y += 32;
+
+    // Load Last Settings on Boot
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Load last settings on boot");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_load_last = make_cfg_button(tab,
+        _cfg.load_last_on_boot ? "ON" : "OFF", &lbl_cfg_load_last,
+        BTN_X, y, BTN_W, BTN_H,
+        _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_load_last, on_cfg_load_last, LV_EVENT_CLICKED, nullptr);
+    y += ROW_H + 12;
+
+    // ---- Section: Display ----
+    make_section_header(tab, "Display", LABEL_X, y);
+    y += 32;
+
+    // Screen Brightness
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Screen Brightness");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_brightness = make_cfg_button(tab,
+        brightness_text(_cfg.brightness), &lbl_cfg_brightness,
+        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_brightness, on_cfg_brightness, LV_EVENT_CLICKED, nullptr);
+}
+
+// ============================================================
 // PUBLIC: ui_init
 // ============================================================
 void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     _arm_cb    = on_arm_toggle;
     _recipe_cb = on_recipe_apply;
+
+    // Initialize config to defaults (may be overridden by ui_load_config later)
+    _cfg = config_defaults();
 
     lv_obj_t* scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
@@ -958,8 +1351,11 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     build_status_tab(t0);
     build_pulse_tab(t1);
     build_placeholder_tab(t2, "Charger Settings");
-    build_placeholder_tab(t3, "Configuration");
+    build_config_tab(t3);
     build_placeholder_tab(t4, "Logs");
+
+    // Apply initial step sizes to spinboxes
+    apply_time_step_to_spinboxes();
 
     // Post-build: disable scrolling/gesture on tab containers
     lv_obj_clear_flag(t0, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
@@ -1192,4 +1588,27 @@ void ui_update(const WelderDisplayState& st) {
     }
 
     first_run = false;
+}
+
+// ============================================================
+// PUBLIC: Config API
+// ============================================================
+void ui_set_config_cb(config_change_cb_t cb) {
+    _config_cb = cb;
+}
+
+void ui_load_config(const ConfigState& cfg) {
+    _cfg = cfg;
+    // Update all Config tab labels
+    update_cfg_hold_repeat_label();
+    update_cfg_time_step_label();
+    update_cfg_power_step_label();
+    update_cfg_load_last_label();
+    update_cfg_brightness_label();
+    // Apply step sizes to spinboxes
+    apply_time_step_to_spinboxes();
+}
+
+ConfigState ui_get_config() {
+    return _cfg;
 }

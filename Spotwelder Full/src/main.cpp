@@ -23,6 +23,7 @@
 #include <Wire.h>
 #include <esp_wifi.h>
 #include <math.h>
+#include <Preferences.h>
 
 #include <esp32_smartdisplay.h>
 #include <lv_conf.h>
@@ -350,6 +351,8 @@ void handleButton();
 bool readCellsOnce(float& V1, float& V2, float& V3, float& C1, float& C2,
                    float& C3);
 String buildStatus();
+
+static void save_recipe_to_nvs();
 
 // =========================
 // Helpers
@@ -926,23 +929,24 @@ void setUiConnected(bool connected) {
     uiConnected = connected;
 
     if (uiConnected) {
-        Serial.println("[READY] UI connected -> READY,1");
-        forwardToStm32("READY,1");
-        lastReadySentMs = millis();
+        Serial.println("[READY] UI (TCP) connected");
         stm_synced = false;
         requestStm32Status();
     } else {
-        Serial.println("[READY] UI disconnected -> READY,0 + ARM,0");
-        forwardToStm32("READY,0");
+        // ── TEMP-FIX: Flask disconnect no longer sends READY,0.
+        //    READY,1 heartbeat now runs unconditionally so that STM32
+        //    keeps broadcasting STATUS (with temperature) at all times.
+        //    ARM,0 is still sent for safety when the TCP client drops.
+        Serial.println("[READY] UI (TCP) disconnected -> ARM,0");
         forwardToStm32("ARM,0");
-        lastReadySentMs = 0;
         stm_synced = false;
     }
 }
 
 void serviceReadyHeartbeat() {
-    if (!uiConnected) return;
-
+    // ── TEMP-FIX: Always send READY,1 heartbeat so STM32 continuously
+    //    broadcasts STATUS (temperature, armed state, etc.) regardless
+    //    of whether a Flask/TCP client is connected.
     uint32_t now = millis();
     if ((now - lastReadySentMs) >= READY_PERIOD_MS) {
         forwardToStm32("READY,1");
@@ -1020,6 +1024,92 @@ static void onRecipeApply(uint8_t mode, uint16_t d1, uint16_t gap1,
     processCommand(String(buf));
 
     Serial.println("[Recipe] Applied via touch UI");
+
+    // Persist recipe to NVS so it can be restored on boot
+    save_recipe_to_nvs();
+}
+
+// =========================
+// Config Persistence (NVS via Preferences)
+// =========================
+static Preferences prefs;
+
+static void apply_brightness(uint8_t level) {
+    float val;
+    switch (level) {
+        case 0:  val = 0.3f; break;  // LOW
+        case 1:  val = 0.6f; break;  // MED
+        case 2:  val = 1.0f; break;  // HIGH
+        default: val = 1.0f; break;
+    }
+    smartdisplay_lcd_set_backlight(val);
+    Serial.printf("[Config] Brightness set to %s (%.1f)\n",
+                  level == 0 ? "LOW" : level == 1 ? "MED" : "HIGH", (double)val);
+}
+
+static void save_config_to_nvs(const ConfigState& cfg) {
+    prefs.begin("weldcfg", false);
+    prefs.putBool("holdRepeat", cfg.hold_to_repeat);
+    prefs.putUChar("timeStep",  cfg.time_step_ms);
+    prefs.putUChar("powerStep", cfg.power_step_pct);
+    prefs.putBool("loadLast",   cfg.load_last_on_boot);
+    prefs.putUChar("bright",    cfg.brightness);
+    prefs.end();
+    Serial.println("[Config] Saved to NVS");
+}
+
+static ConfigState load_config_from_nvs() {
+    ConfigState cfg = config_defaults();
+    prefs.begin("weldcfg", true);  // read-only
+    cfg.hold_to_repeat    = prefs.getBool("holdRepeat", cfg.hold_to_repeat);
+    cfg.time_step_ms      = prefs.getUChar("timeStep",  cfg.time_step_ms);
+    cfg.power_step_pct    = prefs.getUChar("powerStep", cfg.power_step_pct);
+    cfg.load_last_on_boot = prefs.getBool("loadLast",   cfg.load_last_on_boot);
+    cfg.brightness        = prefs.getUChar("bright",    cfg.brightness);
+    prefs.end();
+    Serial.println("[Config] Loaded from NVS");
+    return cfg;
+}
+
+static void save_recipe_to_nvs() {
+    prefs.begin("weldrecipe", false);
+    prefs.putUChar("mode",      weld_mode);
+    prefs.putUShort("d1",       weld_d1);
+    prefs.putUShort("gap1",     weld_gap1);
+    prefs.putUShort("d2",       weld_d2);
+    prefs.putUShort("gap2",     weld_gap2);
+    prefs.putUShort("d3",       weld_d3);
+    prefs.putUChar("power",     weld_power_pct);
+    prefs.putBool("phEn",       preheat_enabled);
+    prefs.putUShort("phMs",     preheat_ms);
+    prefs.putUChar("phPct",     preheat_pct);
+    prefs.putUShort("phGap",    preheat_gap_ms);
+    prefs.end();
+    Serial.println("[Config] Recipe saved to NVS");
+}
+
+static void load_recipe_from_nvs() {
+    prefs.begin("weldrecipe", true);
+    weld_mode       = prefs.getUChar("mode",   weld_mode);
+    weld_d1         = prefs.getUShort("d1",    weld_d1);
+    weld_gap1       = prefs.getUShort("gap1",  weld_gap1);
+    weld_d2         = prefs.getUShort("d2",    weld_d2);
+    weld_gap2       = prefs.getUShort("gap2",  weld_gap2);
+    weld_d3         = prefs.getUShort("d3",    weld_d3);
+    weld_power_pct  = prefs.getUChar("power",  weld_power_pct);
+    preheat_enabled = prefs.getBool("phEn",    preheat_enabled);
+    preheat_ms      = prefs.getUShort("phMs",  preheat_ms);
+    preheat_pct     = prefs.getUChar("phPct",  preheat_pct);
+    preheat_gap_ms  = prefs.getUShort("phGap", preheat_gap_ms);
+    prefs.end();
+    Serial.println("[Config] Recipe loaded from NVS");
+}
+
+// Callback from UI when config changes
+static void onConfigChange(const ConfigState& cfg) {
+    apply_brightness(cfg.brightness);
+    save_config_to_nvs(cfg);
+    // Note: recipe persistence happens in onRecipeApply, not here
 }
 
 // =========================
@@ -1150,6 +1240,22 @@ void setup() {
     ui_init(onArmToggle, onRecipeApply);
     Serial.println("✅ UI created (5-tab shell + Pulse tab)");
 
+    // --- Config: Load settings from NVS and apply ---
+    {
+        ConfigState cfg = load_config_from_nvs();
+        // Apply brightness immediately
+        apply_brightness(cfg.brightness);
+        // Load recipe if "load last on boot" is enabled
+        if (cfg.load_last_on_boot) {
+            load_recipe_from_nvs();
+            Serial.println("[Config] Load-last-on-boot: restored recipe from NVS");
+        }
+        // Set config callback and push loaded config to UI
+        ui_set_config_cb(onConfigChange);
+        ui_load_config(cfg);
+        Serial.println("✅ Config loaded and applied");
+    }
+
     // ==========================================================
     // WiFi  (non-blocking – removed blocking wait)
     // ==========================================================
@@ -1161,6 +1267,14 @@ void setup() {
     WiFi.begin(ssid, password);
     // No blocking while-loop.  ensureWiFiAndServer() in loop() handles reconnect.
 
+    // ── TEMP-FIX: Kick-start STM32 status broadcasting at boot.
+    //    Send READY,1 so the STM32 begins its periodic STATUS reports
+    //    (which include temperature).  Previously this only happened when
+    //    a Flask/TCP client connected, leaving temp as ERR until then.
+    //    A small delay ensures the STM32 UART is ready after power-on.
+    delay(100);
+    forwardToStm32("READY,1");
+    lastReadySentMs = millis();
     requestStm32Status();
     Serial.println("=== Setup complete ===");
 }
@@ -1185,7 +1299,11 @@ void loop() {
     static uint32_t lastStatusReqMs = 0;
     uint32_t now = millis();
 
-    if (uiConnected && (now - lastStatusReqMs) >= 1000) {
+    // ── TEMP-FIX: Always poll STM32 for status (temperature, armed, etc.)
+    //    regardless of TCP/Flask client connection.  Previously this was gated
+    //    on uiConnected, which caused temperature to show ERR until Flask
+    //    connected and triggered the first READY,1 / STATUS cycle.
+    if ((now - lastStatusReqMs) >= 1000) {
         requestStm32Status();
         lastStatusReqMs = now;
     }
