@@ -86,6 +86,7 @@ static volatile uint16_t preheat_gap_ms = 3;
 /* ============ Trigger Settings ============ */
 static volatile uint8_t trigger_mode = 1;        // 1 = pedal, 2 = contact
 static volatile uint8_t contact_hold_steps = 2;  // each step = 500 ms
+static volatile uint8_t contact_with_pedal = 1;  // 1 = require contact in pedal mode (safe default)
 
 /* ============ State ============ */
 static volatile bool welding_now = false;
@@ -241,9 +242,19 @@ static void fireRecipe(void) {
         return;
     }
 
-    if (!contactDetected()) {
-        uartSend("DENY,NO_CONTACT");
-        return;
+    /* Contact check logic:
+     * - trigger_mode 2 (contact/probe): always require contact (existing behavior)
+     * - trigger_mode 1 (pedal): only require contact if contact_with_pedal == 1
+     */
+    {
+        bool need_contact = true;
+        if (trigger_mode == 1 && contact_with_pedal == 0) {
+            need_contact = false;  // pedal mode with contact check disabled
+        }
+        if (need_contact && !contactDetected()) {
+            uartSend("DENY,NO_CONTACT");
+            return;
+        }
     }
 
     if (welding_now) {
@@ -567,7 +578,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 }
 
 static void parseCommand(char* line) {
-    char response[192];
+    char response[256];
 
     if (strncmp(line, "READY,", 6) == 0) {
         int v = atoi(line + 6);
@@ -684,6 +695,16 @@ static void parseCommand(char* line) {
         return;
     }
 
+    const char* cwp_prefix = "SET_CONTACT_WITH_PEDAL,";
+    if (strncmp(line, cwp_prefix, strlen(cwp_prefix)) == 0) {
+        int v = atoi(line + strlen(cwp_prefix));
+        contact_with_pedal = (v == 0) ? 0 : 1;
+        snprintf(response, sizeof(response), "ACK,SET_CONTACT_WITH_PEDAL,%d",
+                 contact_with_pedal);
+        uartSend(response);
+        return;
+    }
+
     if (strncmp(line, "SET_CONTACT_HOLD,", 17) == 0) {
         int v = atoi(line + 17);
         if (v < 1) v = 1;
@@ -724,13 +745,15 @@ static void parseCommand(char* line) {
             response, sizeof(response),
             "STATUS,armed=%d,ready=%d,contact=%d,cooldown_ms=%ld,welding=%d,"
             "mode=%d,power_pct=%d,preheat_en=%d,temp=%.1f,vcap=%.2f,"
-            "trigger_mode=%d,contact_hold_steps=%d,contact_raw=%d,pa6=%d",
+            "trigger_mode=%d,contact_hold_steps=%d,contact_raw=%d,pa6=%d,"
+            "contact_with_pedal=%d",
             armed ? 1 : 0, system_ready ? 1 : 0, contactDetected() ? 1 : 0,
             (long)cd, welding_now ? 1 : 0, weld_mode, weld_power_pct,
             preheat_enabled ? 1 : 0, temp_filtered_c, vcap, trigger_mode,
             contact_hold_steps, contactDetected() ? 1 : 0,
             (HAL_GPIO_ReadPin(CONTACT_PORT, CONTACT_PIN) == GPIO_PIN_SET) ? 1
-                                                                          : 0);
+                                                                          : 0,
+            (int)contact_with_pedal);
         uartSend(response);
         return;
     }
