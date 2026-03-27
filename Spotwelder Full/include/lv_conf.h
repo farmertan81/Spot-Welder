@@ -12,6 +12,7 @@
  */
 
 /* clang-format off */
+#pragma message("USING THIS LV_CONF.H WITH MONTSERRAT 24 ENABLED")
 #if 1 /*Set it to "1" to enable content*/
 
 #ifndef LV_CONF_H
@@ -174,7 +175,7 @@
 #define LV_FONT_MONTSERRAT_18 1
 #define LV_FONT_MONTSERRAT_20 1
 #define LV_FONT_MONTSERRAT_22 0
-#define LV_FONT_MONTSERRAT_24 0
+#define LV_FONT_MONTSERRAT_24 1
 #define LV_FONT_MONTSERRAT_26 0
 #define LV_FONT_MONTSERRAT_28 0
 #define LV_FONT_MONTSERRAT_30 0

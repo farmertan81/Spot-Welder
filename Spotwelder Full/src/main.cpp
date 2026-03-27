@@ -110,6 +110,9 @@ uint16_t preheat_gap_ms = 3;
 
 uint8_t trigger_mode = 1;        // 1=pedal, 2=contact
 uint8_t contact_hold_steps = 2;  // each step = 0.5s
+bool contact_with_pedal = false; // require contact detection when pedal trigger
+
+uint32_t weld_count = 0;        // running weld counter (incremented on WELD_DONE)
 
 bool welding_now = false;
 unsigned long last_weld_time = 0;
@@ -466,6 +469,8 @@ String buildStatus() {
     status += ",d3=" + String(weld_d3);
     status += ",trigger_mode=" + String(trigger_mode);
     status += ",contact_hold_steps=" + String(contact_hold_steps);
+    status += ",contact_with_pedal=" + String(contact_with_pedal ? 1 : 0);
+    status += ",weld_count=" + String(weld_count);
 
     return status;
 }
@@ -685,6 +690,17 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
+                } else if (stmLine.startsWith("ACK,SET_CONTACT_WITH_PEDAL,")) {
+                    // BUG FIX: STM32 ACK format is "ACK,SET_CONTACT_WITH_PEDAL,<0|1>"
+                    // (bare integer, no field= prefix).  Previous code looked for
+                    // "enabled=", "value=", "contact_with_pedal=" which never matched,
+                    // so the ACK was silently ignored and ESP32 never synced from
+                    // the STM32's confirmed state.
+                    int v = stmLine.substring(strlen("ACK,SET_CONTACT_WITH_PEDAL,")).toInt();
+                    contact_with_pedal = (v == 1);
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
                 } else if (stmLine.startsWith("STATUS,")) {
                     int iv = 0;
                     float fv = NAN;
@@ -716,6 +732,10 @@ void pollStm32Uart() {
                         contact_hold_steps = (uint8_t)iv;
                     }
 
+                    if (extractIntField(stmLine, "contact_with_pedal=", iv)) {
+                        contact_with_pedal = (iv == 1);
+                    }
+
                     stm_last_status_ms = millis();
                     stm_synced = true;
 
@@ -735,6 +755,7 @@ void pollStm32Uart() {
                 } else if (stmLine.startsWith("EVENT,WELD_DONE")) {
                     welding_now = false;
                     last_weld_time = millis();
+                    weld_count++;
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -878,6 +899,21 @@ void processCommand(String cmd) {
         contact_hold_steps = (uint8_t)steps;
 
         forwardToStm32(cmd);
+        return;
+    }
+
+    if (cmd.startsWith("SET_CONTACT_WITH_PEDAL,")) {
+        int val = cmd.substring(strlen("SET_CONTACT_WITH_PEDAL,")).toInt();
+        contact_with_pedal = (val == 1);
+
+        forwardToStm32(cmd);
+        return;
+    }
+
+    if (cmd == "RESET_WELD_COUNT") {
+        weld_count = 0;
+        Serial.println("[Weld] Counter reset to 0");
+        sendToPi(buildStatus());
         return;
     }
 
@@ -1050,10 +1086,13 @@ static void apply_brightness(uint8_t level) {
 static void save_config_to_nvs(const ConfigState& cfg) {
     prefs.begin("weldcfg", false);
     prefs.putBool("holdRepeat", cfg.hold_to_repeat);
-    prefs.putUChar("timeStep",  cfg.time_step_ms);
+    prefs.putUChar("timeStep", cfg.time_step_ms);
     prefs.putUChar("powerStep", cfg.power_step_pct);
-    prefs.putBool("loadLast",   cfg.load_last_on_boot);
-    prefs.putUChar("bright",    cfg.brightness);
+    prefs.putBool("loadLast", cfg.load_last_on_boot);
+    prefs.putUChar("bright", cfg.brightness);
+    prefs.putBool("cwPedal", cfg.contact_with_pedal);
+    prefs.putUChar("trigMode", trigger_mode);
+    prefs.putUChar("holdSteps", contact_hold_steps);
     prefs.end();
     Serial.println("[Config] Saved to NVS");
 }
@@ -1061,11 +1100,16 @@ static void save_config_to_nvs(const ConfigState& cfg) {
 static ConfigState load_config_from_nvs() {
     ConfigState cfg = config_defaults();
     prefs.begin("weldcfg", true);  // read-only
-    cfg.hold_to_repeat    = prefs.getBool("holdRepeat", cfg.hold_to_repeat);
-    cfg.time_step_ms      = prefs.getUChar("timeStep",  cfg.time_step_ms);
-    cfg.power_step_pct    = prefs.getUChar("powerStep", cfg.power_step_pct);
-    cfg.load_last_on_boot = prefs.getBool("loadLast",   cfg.load_last_on_boot);
-    cfg.brightness        = prefs.getUChar("bright",    cfg.brightness);
+    cfg.hold_to_repeat = prefs.getBool("holdRepeat", cfg.hold_to_repeat);
+    cfg.time_step_ms = prefs.getUChar("timeStep", cfg.time_step_ms);
+    cfg.power_step_pct = prefs.getUChar("powerStep", cfg.power_step_pct);
+    cfg.load_last_on_boot = prefs.getBool("loadLast", cfg.load_last_on_boot);
+    cfg.brightness = prefs.getUChar("bright", cfg.brightness);
+    cfg.contact_with_pedal = prefs.getBool("cwPedal", cfg.contact_with_pedal);
+
+    trigger_mode = prefs.getUChar("trigMode", trigger_mode);
+    contact_hold_steps = prefs.getUChar("holdSteps", contact_hold_steps);
+
     prefs.end();
     Serial.println("[Config] Loaded from NVS");
     return cfg;
@@ -1108,8 +1152,47 @@ static void load_recipe_from_nvs() {
 // Callback from UI when config changes
 static void onConfigChange(const ConfigState& cfg) {
     apply_brightness(cfg.brightness);
+    // BUG FIX: Do NOT overwrite contact_with_pedal here.
+    // CWP is managed exclusively by its own callback (onContactWithPedalChange)
+    // and STM32 ACK/STATUS parsing.  Writing it here caused any unrelated
+    // config change (brightness, hold-repeat, etc.) to silently overwrite the
+    // authoritative CWP value with a potentially stale _cfg copy.
     save_config_to_nvs(cfg);
     // Note: recipe persistence happens in onRecipeApply, not here
+}
+
+// Callback from UI when trigger source changes (Status tab buttons)
+static void onTriggerSourceChange(uint8_t mode) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%d", (int)mode);
+    processCommand(String(buf));
+
+    ConfigState cfg = load_config_from_nvs();
+    save_config_to_nvs(cfg);
+
+    Serial.printf("[Trigger] Mode changed to %s via touch UI\n",
+                  mode == 1 ? "Pedal" : "Probe");
+}
+
+// Callback from UI when weld counter is tapped (reset)
+static void onWeldCountReset() {
+    processCommand("RESET_WELD_COUNT");
+    Serial.println("[Weld] Counter reset via touch UI");
+}
+
+// Callback from UI when contact-with-pedal toggle changes
+static void onContactWithPedalChange(bool enabled) {
+    char buf[40];
+    snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%d", enabled ? 1 : 0);
+
+    processCommand(String(buf));
+
+    ConfigState cfg = load_config_from_nvs();
+    cfg.contact_with_pedal = enabled;
+    save_config_to_nvs(cfg);
+
+    Serial.printf("[Config] Contact-with-pedal set to %s via touch UI\n",
+                  enabled ? "ON" : "OFF");
 }
 
 // =========================
@@ -1243,18 +1326,63 @@ void setup() {
     // --- Config: Load settings from NVS and apply ---
     {
         ConfigState cfg = load_config_from_nvs();
+
         // Apply brightness immediately
         apply_brightness(cfg.brightness);
-        // Load recipe if "load last on boot" is enabled
+
+        // Restore recipe from NVS if enabled, and push it to STM32
         if (cfg.load_last_on_boot) {
             load_recipe_from_nvs();
-            Serial.println("[Config] Load-last-on-boot: restored recipe from NVS");
+            Serial.println(
+                "[Config] Load-last-on-boot: restored recipe from NVS");
+
+            char buf[80];
+
+            snprintf(buf, sizeof(buf), "SET_PULSE,%d,%d,%d,%d,%d,%d", weld_mode,
+                     weld_d1, weld_gap1, weld_d2, weld_gap2, weld_d3);
+            processCommand(String(buf));
+
+            snprintf(buf, sizeof(buf), "SET_POWER,%d", weld_power_pct);
+            processCommand(String(buf));
+
+            snprintf(buf, sizeof(buf), "SET_PREHEAT,%d,%d,%d,%d",
+                     preheat_enabled ? 1 : 0, preheat_ms, preheat_pct,
+                     preheat_gap_ms);
+            processCommand(String(buf));
         }
-        // Set config callback and push loaded config to UI
+
+        // Sync global from loaded config
+        contact_with_pedal = cfg.contact_with_pedal;
+
+        // Push saved trigger/contact settings to STM32
+        {
+            char buf[40];
+
+            snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%d",
+                     (int)trigger_mode);
+            processCommand(String(buf));
+
+            snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d",
+                     (int)contact_hold_steps);
+            processCommand(String(buf));
+
+            snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%d",
+                     contact_with_pedal ? 1 : 0);
+            processCommand(String(buf));
+        }
+
+        // Push loaded config to UI
         ui_set_config_cb(onConfigChange);
         ui_load_config(cfg);
         Serial.println("✅ Config loaded and applied");
     }
+
+
+    // --- Register remaining UI callbacks ---
+    ui_set_trigger_source_cb(onTriggerSourceChange);
+    ui_set_weld_count_reset_cb(onWeldCountReset);
+    ui_set_contact_with_pedal_cb(onContactWithPedalChange);
+    Serial.println("✅ All UI callbacks registered");
 
     // ==========================================================
     // WiFi  (non-blocking – removed blocking wait)
@@ -1404,7 +1532,7 @@ void loop() {
         ds.armed = stm_armed;
         ds.welding = welding_now;
         ds.charging = (digitalRead(FET_CHARGE) == HIGH);
-        ds.weld_count = 0;
+        ds.weld_count = weld_count;
         ds.weld_mode     = weld_mode;
         ds.pulse_d1      = weld_d1;
         ds.pulse_gap1    = weld_gap1;

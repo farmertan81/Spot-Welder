@@ -37,7 +37,7 @@ struct WelderDisplayState {
 };
 
 // ============================================================
-// CONFIG STATE – 5 global settings (Config tab v1)
+// CONFIG STATE – 6 global settings (Config tab v1 + contact_with_pedal)
 // ============================================================
 struct ConfigState {
     bool    hold_to_repeat;     // ON/OFF for +/- button hold-repeat
@@ -45,6 +45,7 @@ struct ConfigState {
     uint8_t power_step_pct;     // 1, 5, or 10 %
     bool    load_last_on_boot;  // ON/OFF – restore last settings at startup
     uint8_t brightness;         // 0=LOW, 1=MED, 2=HIGH
+    bool    contact_with_pedal; // ON/OFF – require contact detection when using pedal trigger
 };
 
 // Default config values
@@ -55,6 +56,7 @@ static inline ConfigState config_defaults() {
     c.power_step_pct    = 5;
     c.load_last_on_boot = true;
     c.brightness        = 2;  // HIGH
+    c.contact_with_pedal = false;
     return c;
 }
 
@@ -71,6 +73,16 @@ typedef void (*recipe_apply_cb_t)(
 // Callback type for config changes from Config tab
 typedef void (*config_change_cb_t)(const ConfigState& cfg);
 
+// Callback type for trigger source changes from Status tab
+// trigger_mode: 1=Pedal, 2=Probe Contact
+typedef void (*trigger_source_cb_t)(uint8_t trigger_mode);
+
+// Callback type for weld counter reset (tap on weld counter display)
+typedef void (*weld_count_reset_cb_t)(void);
+
+// Callback type for contact-with-pedal toggle changes from Config tab
+typedef void (*contact_with_pedal_cb_t)(bool enabled);
+
 // Initialize the 5-screen tabview UI.  Call once after smartdisplay_init().
 void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply);
 
@@ -82,6 +94,15 @@ void ui_load_config(const ConfigState& cfg);
 
 // Get current config state from UI
 ConfigState ui_get_config();
+
+// Set callback for trigger source changes (call before or after ui_init)
+void ui_set_trigger_source_cb(trigger_source_cb_t cb);
+
+// Set callback for weld counter reset (call before or after ui_init)
+void ui_set_weld_count_reset_cb(weld_count_reset_cb_t cb);
+
+// Set callback for contact-with-pedal toggle (call before or after ui_init)
+void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb);
 
 // Push latest data into the UI.  Call from loop() at ~20 Hz.
 void ui_update(const WelderDisplayState& st);
