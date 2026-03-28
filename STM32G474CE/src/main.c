@@ -580,6 +580,14 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 static void parseCommand(char* line) {
     char response[256];
 
+    // Skip empty or whitespace-only lines silently (no ERR response).
+    // This prevents spurious ERR,UNKNOWN_CMD from flush bytes or line noise.
+    {
+        char* p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '\0') return;
+    }
+
     if (strncmp(line, "READY,", 6) == 0) {
         int v = atoi(line + 6);
         if (v == 1) {

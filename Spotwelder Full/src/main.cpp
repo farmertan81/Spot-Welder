@@ -130,6 +130,17 @@ static float temperature_c = NAN;
 static uint32_t last_temp_update_ms = 0;
 
 // =========================
+// Phase 1 – deferred boot config
+// =========================
+static bool stm32_booted = false;   // set true on "BOOT," line from STM32
+static bool config_sent  = false;   // set true after sendBootConfig() runs
+static uint32_t setup_done_ms = 0;  // millis() at end of setup()
+static const uint32_t BOOT_TIMEOUT_MS = 3000; // fallback if no BOOT msg
+
+// Forward declaration
+static void sendBootConfig();
+
+// =========================
 // READY heartbeat
 // =========================
 static bool uiConnected = false;
@@ -500,7 +511,10 @@ void forwardToStm32(const String& line) {
     }
 }
 
-void requestStm32Status() { forwardToStm32("STATUS"); }
+void requestStm32Status() {
+    if (!config_sent) return;   // gated until boot config sent
+    forwardToStm32("STATUS");
+}
 
 // =========================
 // INA battery / cells
@@ -591,6 +605,7 @@ void controlCharger() {
 // Front button
 // =========================
 void handleButton() {
+    if (!config_sent) return;   // gated until boot config sent
     static unsigned long press_start = 0;
     static unsigned long last_release = 0;
     static bool was_pressed = false;
@@ -644,9 +659,32 @@ void pollStm32Uart() {
         if (ch == '\r') continue;
 
         if (ch == '\n') {
-            stmLine.trim();
+            // Strip non-printable chars from UART line
+            {
+                String cleaned;
+                cleaned.reserve(stmLine.length());
+                for (unsigned int i = 0; i < stmLine.length(); i++) {
+                    char c = stmLine[i];
+                    if ((c >= 32 && c <= 126) || c == '\t') {
+                        cleaned += c;
+                    }
+                }
+                cleaned.trim();
+                stmLine = cleaned;
+            }
 
             if (stmLine.length() > 0) {
+                // BOOT message handler – trigger deferred config send
+                if (stmLine.startsWith("BOOT,")) {
+                    Serial.printf("[Boot] STM32 boot detected: %s\n", stmLine.c_str());
+                    stm32_booted = true;
+                    if (!config_sent) {
+                        sendBootConfig();
+                    }
+                    stmLine = "";
+                    continue;
+                }
+
                 if (!isNoisyKeepaliveLine(stmLine)) {
                     Serial.printf("[STM32->UART] %s\n", stmLine.c_str());
                 }
@@ -803,6 +841,7 @@ void processCommand(String cmd) {
     }
 
     if (cmd == "CELLS") {
+        // CELLS is local I2C read only – no STM32 send, always allowed
         float V1, V2, V3, C1, C2, C3;
         if (readCellsOnce(V1, V2, V3, C1, C2, C3)) {
             char buf[160];
@@ -818,6 +857,12 @@ void processCommand(String cmd) {
 
     if (cmd.startsWith("ACK,")) {
         Serial.printf("[TCP] Ignoring UI ACK: %s\n", cmd.c_str());
+        return;
+    }
+
+    // Block STM32-forwarding commands until boot config sent
+    if (!config_sent) {
+        Serial.printf("[CMD] Dropped (pre-boot): %s\n", cmd.c_str());
         return;
     }
 
@@ -967,19 +1012,20 @@ void setUiConnected(bool connected) {
     if (uiConnected) {
         Serial.println("[READY] UI (TCP) connected");
         stm_synced = false;
-        requestStm32Status();
+        requestStm32Status();   // gated by config_sent
     } else {
         // ── TEMP-FIX: Flask disconnect no longer sends READY,0.
         //    READY,1 heartbeat now runs unconditionally so that STM32
         //    keeps broadcasting STATUS (with temperature) at all times.
         //    ARM,0 is still sent for safety when the TCP client drops.
         Serial.println("[READY] UI (TCP) disconnected -> ARM,0");
-        forwardToStm32("ARM,0");
+        if (config_sent) forwardToStm32("ARM,0");  // gated until boot config
         stm_synced = false;
     }
 }
 
 void serviceReadyHeartbeat() {
+    if (!config_sent) return;   // gated until boot config sent
     // ── TEMP-FIX: Always send READY,1 heartbeat so STM32 continuously
     //    broadcasts STATUS (temperature, armed state, etc.) regardless
     //    of whether a Flask/TCP client is connected.
@@ -1071,6 +1117,11 @@ static void onRecipeApply(uint8_t mode, uint16_t d1, uint16_t gap1,
 static Preferences prefs;
 
 static void apply_brightness(uint8_t level) {
+    // Brightness delta guard – skip if unchanged
+    static int8_t last_brightness = -1;  // -1 = never set
+    if ((int8_t)level == last_brightness) return;
+    last_brightness = (int8_t)level;
+
     float val;
     switch (level) {
         case 0:  val = 0.3f; break;  // LOW
@@ -1148,6 +1199,74 @@ static void load_recipe_from_nvs() {
     preheat_gap_ms  = prefs.getUShort("phGap", preheat_gap_ms);
     prefs.end();
     Serial.println("[Config] Recipe loaded from NVS");
+}
+
+// =========================
+// Phase 1: Deferred boot config – sends all NVS-loaded settings to STM32
+// Called when BOOT message received OR after fallback timeout.
+// Pre-flushes STM32 rx_build[] then sends paced commands (20ms inter-gap).
+// =========================
+static void sendBootConfig() {
+    if (config_sent) return;  // idempotent guard
+    config_sent = true;
+
+    Serial.println("[Boot] Sending deferred boot config to STM32...");
+
+    // Flush stale bytes from both sides of the UART link.
+    // During ESP32 boot, stray bytes may accumulate in the STM32's rx_build[].
+    // A bare \r\n triggers the STM32 ISR to flush rx_build[] (reset rx_idx=0),
+    // ensuring the first real command arrives into a clean buffer.
+    while (STM32Serial.available()) STM32Serial.read();  // flush ESP32 RX
+    delay(50);
+    STM32Serial.print("\r\n");  // flush STM32 rx_build[]
+    STM32Serial.flush();
+    delay(50);
+    Serial.println("[Boot] Flushing STM32 RX buffer");
+
+    char buf[80];
+
+    // 1. Recipe / pulse settings
+    snprintf(buf, sizeof(buf), "SET_PULSE,%d,%d,%d,%d,%d,%d",
+             weld_mode, weld_d1, weld_gap1, weld_d2, weld_gap2, weld_d3);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 2. Power
+    snprintf(buf, sizeof(buf), "SET_POWER,%d", weld_power_pct);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 3. Preheat
+    snprintf(buf, sizeof(buf), "SET_PREHEAT,%d,%d,%d,%d",
+             preheat_enabled ? 1 : 0, preheat_ms, preheat_pct, preheat_gap_ms);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 4. Trigger mode
+    snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%d", (int)trigger_mode);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 5. Contact hold
+    snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d", (int)contact_hold_steps);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 6. Contact with pedal
+    snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%d",
+             contact_with_pedal ? 1 : 0);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    // 7. Kick-start STM32 status broadcasting
+    forwardToStm32("READY,1");
+    lastReadySentMs = millis();
+    delay(20);
+
+    // 8. Request current STM32 status
+    requestStm32Status();
+
+    Serial.println("[Boot] Config sent (8 commands, 20ms pacing, pre-flush)");
 }
 
 // Callback from UI when config changes
@@ -1333,58 +1452,27 @@ void setup() {
     ui_init(onArmToggle, onRecipeApply);
     Serial.println("✅ UI created (5-tab shell + Pulse tab)");
 
-    // --- Config: Load settings from NVS and apply ---
+    // --- Config: Load settings from NVS into memory (Phase 1: NO STM32 sends here) ---
     {
         ConfigState cfg = load_config_from_nvs();
 
-        // Apply brightness immediately
+        // Apply brightness immediately (local display only, not STM32)
         apply_brightness(cfg.brightness);
 
-        // Restore recipe from NVS if enabled, and push it to STM32
+        // Restore recipe from NVS if enabled – into globals only, NOT sent to STM32
         if (cfg.load_last_on_boot) {
             load_recipe_from_nvs();
             Serial.println(
-                "[Config] Load-last-on-boot: restored recipe from NVS");
-
-            char buf[80];
-
-            snprintf(buf, sizeof(buf), "SET_PULSE,%d,%d,%d,%d,%d,%d", weld_mode,
-                     weld_d1, weld_gap1, weld_d2, weld_gap2, weld_d3);
-            processCommand(String(buf));
-
-            snprintf(buf, sizeof(buf), "SET_POWER,%d", weld_power_pct);
-            processCommand(String(buf));
-
-            snprintf(buf, sizeof(buf), "SET_PREHEAT,%d,%d,%d,%d",
-                     preheat_enabled ? 1 : 0, preheat_ms, preheat_pct,
-                     preheat_gap_ms);
-            processCommand(String(buf));
+                "[Config] Load-last-on-boot: recipe loaded to memory (deferred send)");
         }
 
-        // Sync global from loaded config
+        // Sync globals from loaded config (no STM32 commands)
         contact_with_pedal = cfg.contact_with_pedal;
 
-        // Push saved trigger/contact settings to STM32
-        {
-            char buf[40];
-
-            snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%d",
-                     (int)trigger_mode);
-            processCommand(String(buf));
-
-            snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d",
-                     (int)contact_hold_steps);
-            processCommand(String(buf));
-
-            snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%d",
-                     contact_with_pedal ? 1 : 0);
-            processCommand(String(buf));
-        }
-
-        // Push loaded config to UI
+        // Push loaded config to UI widgets (display-side only)
         ui_set_config_cb(onConfigChange);
         ui_load_config(cfg);
-        Serial.println("✅ Config loaded and applied");
+        Serial.println("✅ Config loaded into memory (STM32 send deferred to boot/timeout)");
     }
 
 
@@ -1405,16 +1493,11 @@ void setup() {
     WiFi.begin(ssid, password);
     // No blocking while-loop.  ensureWiFiAndServer() in loop() handles reconnect.
 
-    // ── TEMP-FIX: Kick-start STM32 status broadcasting at boot.
-    //    Send READY,1 so the STM32 begins its periodic STATUS reports
-    //    (which include temperature).  Previously this only happened when
-    //    a Flask/TCP client connected, leaving temp as ERR until then.
-    //    A small delay ensures the STM32 UART is ready after power-on.
-    delay(100);
-    forwardToStm32("READY,1");
-    lastReadySentMs = millis();
-    requestStm32Status();
-    Serial.println("=== Setup complete ===");
+    // Phase 1: DO NOT send commands to STM32 here.
+    // sendBootConfig() will fire when BOOT message is received,
+    // or after BOOT_TIMEOUT_MS fallback in loop().
+    setup_done_ms = millis();
+    Serial.println("=== Setup complete (STM32 config deferred) ===");
 }
 
 // =========================
@@ -1428,6 +1511,13 @@ void loop() {
     lv_tick_inc(now_ms - lv_last_tick);
     lv_last_tick = now_ms;
     lv_timer_handler();
+
+    // --- Phase 1: fallback timeout – send config if no BOOT msg received ---
+    if (!config_sent && !stm32_booted && setup_done_ms > 0 &&
+        (now_ms - setup_done_ms) > BOOT_TIMEOUT_MS) {
+        Serial.println("[Boot] No BOOT message – sending config via fallback");
+        sendBootConfig();
+    }
 
     // --- Existing logic ---
     ensureWiFiAndServer();
