@@ -49,7 +49,7 @@ static bool contactDetected(void);
 #define THERM_BETA 3950.0f
 #define THERM_OFFSET_C 0.0f
 
-#define V_CAP_DIVIDER 8.26f
+#define V_CAP_DIVIDER 8.47f
 
 /* ============ Limits / Timing ============ */
 static const uint32_t WELD_COOLDOWN_MS = 500;
