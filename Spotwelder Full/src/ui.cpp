@@ -38,41 +38,42 @@
  *   Hold-to-repeat uses PRESSED/PRESSING events with millis() timing.
  *
  * Provides:
- *   Tab 0  "Status"   – Weld Counter, Trigger Source, Pack V, Temp, Charger I, Cell voltages, Arm toggle
- *   Tab 1  "Pulse"    – Mode, Durations, Power (+/-), Preheat (toggle), Apply
- *   Tab 2  "Presets"  – placeholder (renamed from Charger)
- *   Tab 3  "Config"   – Scrollable: Hold-to-repeat, Time/Power Step, Contact Hold Time, Boot, Brightness
- *   Tab 4  "Logs"     – placeholder
+ *   Tab 0  "Status"   – Weld Counter, Trigger Source, Pack V, Temp, Charger I,
+ * Cell voltages, Arm toggle Tab 1  "Pulse"    – Mode, Durations, Power (+/-),
+ * Preheat (toggle), Apply Tab 2  "Presets"  – placeholder (renamed from
+ * Charger) Tab 3  "Config"   – Scrollable: Hold-to-repeat, Time/Power Step,
+ * Contact Hold Time, Boot, Brightness Tab 4  "Logs"     – placeholder
  */
 
 #include "ui.h"
+
 #include <Arduino.h>
 #include <lvgl.h>
 #include <math.h>
-#include <stdio.h>   // for standard snprintf (supports %f)
+#include <stdio.h>  // for standard snprintf (supports %f)
 
 // ============================================================
 // COLORS  (dark-theme, matching web UI)
 // ============================================================
-#define C_BG        lv_color_hex(0x1A1A2E)
-#define C_CARD      lv_color_hex(0x222240)
-#define C_ACCENT    lv_color_hex(0xFF6600)
-#define C_GREEN     lv_color_hex(0x00CC66)
-#define C_RED       lv_color_hex(0xFF3333)
-#define C_YELLOW    lv_color_hex(0xFFDD44)
-#define C_WHITE     lv_color_hex(0xFFFFFF)
-#define C_GREY      lv_color_hex(0x888888)
+#define C_BG lv_color_hex(0x1A1A2E)
+#define C_CARD lv_color_hex(0x222240)
+#define C_ACCENT lv_color_hex(0xFF6600)
+#define C_GREEN lv_color_hex(0x00CC66)
+#define C_RED lv_color_hex(0xFF3333)
+#define C_YELLOW lv_color_hex(0xFFDD44)
+#define C_WHITE lv_color_hex(0xFFFFFF)
+#define C_GREY lv_color_hex(0x888888)
 #define C_DARK_GREY lv_color_hex(0x333355)
 
 // ============================================================
 // CALLBACKS
 // ============================================================
-static arm_toggle_cb_t          _arm_cb          = nullptr;
-static recipe_apply_cb_t        _recipe_cb       = nullptr;
-static config_change_cb_t       _config_cb       = nullptr;
-static trigger_source_cb_t      _trigger_cb      = nullptr;
-static weld_count_reset_cb_t    _weld_reset_cb   = nullptr;
-static contact_with_pedal_cb_t  _cwp_cb          = nullptr;
+static arm_toggle_cb_t _arm_cb = nullptr;
+static recipe_apply_cb_t _recipe_cb = nullptr;
+static config_change_cb_t _config_cb = nullptr;
+static trigger_source_cb_t _trigger_cb = nullptr;
+static weld_count_reset_cb_t _weld_reset_cb = nullptr;
+static contact_with_pedal_cb_t _cwp_cb = nullptr;
 
 // ============================================================
 // GLOBAL CONFIG STATE (Config tab v1)
@@ -88,11 +89,12 @@ static void notify_config_changed();
 // ============================================================
 /* _hw_touch_active is driven by the hardware touch driver in main.cpp via
  * ui_set_touch_active() — this catches ALL touches, not just widget hits.
- * _widget_touch_active is a secondary flag from widget events (belt-and-suspenders).
+ * _widget_touch_active is a secondary flag from widget events
+ * (belt-and-suspenders).
  */
 static volatile bool _hw_touch_active = false;
 static volatile bool _widget_touch_active = false;
-static uint32_t      _touch_release_ms = 0;
+static uint32_t _touch_release_ms = 0;
 
 void ui_set_touch_active(bool active) {
     _hw_touch_active = active;
@@ -108,9 +110,7 @@ void ui_set_touch_active(bool active) {
 /* Prevent ANY touch on interactive elements from propagating to tabview/scroll.
  * Stops gesture recognition and scroll events from reaching parent containers.
  */
-static void on_stop_bubble(lv_event_t* e) {
-    lv_event_stop_bubbling(e);
-}
+static void on_stop_bubble(lv_event_t* e) { lv_event_stop_bubbling(e); }
 
 static void on_touch_begin(lv_event_t* e) {
     _widget_touch_active = true;
@@ -144,22 +144,23 @@ static void make_interaction_safe(lv_obj_t* obj) {
 // HOLD-TO-REPEAT: Timer-based repeat for +/- buttons
 // ============================================================
 static const uint32_t HOLD_INITIAL_DELAY_MS = 400;
-static const uint32_t HOLD_REPEAT_RATE_MS   = 120;
+static const uint32_t HOLD_REPEAT_RATE_MS = 120;
 
 // Context for each repeatable button
 struct HoldRepeatCtx {
-    lv_obj_t* spinbox;       // target spinbox (nullptr for power buttons)
-    bool      is_increment;  // true = +, false = -
-    bool      is_power;      // true = power button (not spinbox)
-    uint32_t  press_start;
-    uint32_t  last_repeat;
+    lv_obj_t* spinbox;  // target spinbox (nullptr for power buttons)
+    bool is_increment;  // true = +, false = -
+    bool is_power;      // true = power button (not spinbox)
+    uint32_t press_start;
+    uint32_t last_repeat;
 };
 
 #define MAX_REPEAT_BTNS 20
 static HoldRepeatCtx _repeat_pool[MAX_REPEAT_BTNS];
 static int _repeat_count = 0;
 
-static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc, bool is_power) {
+static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc,
+                                       bool is_power) {
     if (_repeat_count >= MAX_REPEAT_BTNS) return nullptr;
     HoldRepeatCtx* ctx = &_repeat_pool[_repeat_count++];
     ctx->spinbox = spin;
@@ -185,8 +186,10 @@ static void on_repeat_pressed(lv_event_t* e) {
     if (ctx->is_power) {
         do_power_step(ctx->is_increment);
     } else if (ctx->spinbox) {
-        if (ctx->is_increment) lv_spinbox_increment(ctx->spinbox);
-        else                   lv_spinbox_decrement(ctx->spinbox);
+        if (ctx->is_increment)
+            lv_spinbox_increment(ctx->spinbox);
+        else
+            lv_spinbox_decrement(ctx->spinbox);
         lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
     }
 }
@@ -208,8 +211,10 @@ static void on_repeat_pressing(lv_event_t* e) {
         if (ctx->is_power) {
             do_power_step(ctx->is_increment);
         } else if (ctx->spinbox) {
-            if (ctx->is_increment) lv_spinbox_increment(ctx->spinbox);
-            else                   lv_spinbox_decrement(ctx->spinbox);
+            if (ctx->is_increment)
+                lv_spinbox_increment(ctx->spinbox);
+            else
+                lv_spinbox_decrement(ctx->spinbox);
             lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
         }
     }
@@ -220,80 +225,91 @@ static void on_repeat_pressing(lv_event_t* e) {
 // ============================================================
 static lv_obj_t* lbl_cfg_hold_repeat = nullptr;
 static lv_obj_t* btn_cfg_hold_repeat = nullptr;
-static lv_obj_t* lbl_cfg_time_step   = nullptr;
-static lv_obj_t* btn_cfg_time_step   = nullptr;
-static lv_obj_t* lbl_cfg_power_step  = nullptr;
-static lv_obj_t* btn_cfg_power_step  = nullptr;
-static lv_obj_t* lbl_cfg_load_last   = nullptr;
-static lv_obj_t* btn_cfg_load_last   = nullptr;
-static lv_obj_t* lbl_cfg_brightness  = nullptr;
-static lv_obj_t* btn_cfg_brightness  = nullptr;
-static lv_obj_t* lbl_cfg_hold_time   = nullptr;
-static lv_obj_t* btn_cfg_hold_time   = nullptr;
-static lv_obj_t* lbl_cfg_cwp         = nullptr;   // Contact With Pedal label
-static lv_obj_t* btn_cfg_cwp         = nullptr;   // Contact With Pedal button
+static lv_obj_t* lbl_cfg_time_step = nullptr;
+static lv_obj_t* btn_cfg_time_step = nullptr;
+static lv_obj_t* lbl_cfg_power_step = nullptr;
+static lv_obj_t* btn_cfg_power_step = nullptr;
+static lv_obj_t* lbl_cfg_load_last = nullptr;
+static lv_obj_t* btn_cfg_load_last = nullptr;
+static lv_obj_t* lbl_cfg_brightness = nullptr;
+static lv_obj_t* btn_cfg_brightness = nullptr;
+static lv_obj_t* lbl_cfg_hold_time = nullptr;
+static lv_obj_t* btn_cfg_hold_time = nullptr;
+static lv_obj_t* lbl_cfg_cwp = nullptr;  // Contact With Pedal label
+static lv_obj_t* btn_cfg_cwp = nullptr;  // Contact With Pedal button
 
 // ============================================================
 // STATIC UI HANDLES  (Status tab)
 // ============================================================
-static lv_obj_t* lbl_pack_v   = nullptr;
-static lv_obj_t* lbl_temp     = nullptr;
-static lv_obj_t* lbl_ichg     = nullptr;
-static lv_obj_t* lbl_cell1    = nullptr;
-static lv_obj_t* lbl_cell2    = nullptr;
-static lv_obj_t* lbl_cell3    = nullptr;
-static lv_obj_t* btn_arm      = nullptr;
-static lv_obj_t* lbl_arm      = nullptr;
-static lv_obj_t* lbl_state    = nullptr;
-static lv_obj_t* lbl_weld_cnt    = nullptr;   // Weld Counter value label
-static lv_obj_t* btn_weld_cnt   = nullptr;   // Weld Counter clickable area (for reset)
-static lv_obj_t* btn_trigger_pedal = nullptr; // Pedal trigger button
-static lv_obj_t* btn_trigger_probe = nullptr; // Probe trigger button
-static lv_obj_t* lbl_trigger_pedal = nullptr; // Pedal button label
-static lv_obj_t* lbl_trigger_probe = nullptr; // Probe button label
+static lv_obj_t* lbl_pack_v = nullptr;
+static lv_obj_t* lbl_temp = nullptr;
+static lv_obj_t* lbl_ichg = nullptr;
+static lv_obj_t* lbl_cell1 = nullptr;
+static lv_obj_t* lbl_cell2 = nullptr;
+static lv_obj_t* lbl_cell3 = nullptr;
+static lv_obj_t* btn_arm = nullptr;
+static lv_obj_t* lbl_arm = nullptr;
+static lv_obj_t* lbl_state = nullptr;
+static lv_obj_t* lbl_weld_cnt = nullptr;  // Weld Counter value label
+static lv_obj_t* btn_weld_cnt =
+    nullptr;  // Weld Counter clickable area (for reset)
+static lv_obj_t* btn_trigger_pedal = nullptr;  // Pedal trigger button
+static lv_obj_t* btn_trigger_probe = nullptr;  // Probe trigger button
+static lv_obj_t* lbl_trigger_pedal = nullptr;  // Pedal button label
+static lv_obj_t* lbl_trigger_probe = nullptr;  // Probe button label
 
-static bool    _last_armed        = false;
-static uint8_t _trigger_mode      = 1;     // 1=Pedal, 2=Probe Contact
+static bool _last_armed = false;
+static uint8_t _trigger_mode = 1;  // 1=Pedal, 2=Probe Contact
+
+// ============================================================
+// TAB OBJECT HANDLES  (file-scope so ui_init and ui_mark_settings_applied share
+// them)
+// ============================================================
+static lv_obj_t* tab_status = nullptr;
+static lv_obj_t* tab_pulse = nullptr;
+static lv_obj_t* tab_presets = nullptr;
+static lv_obj_t* tab_config = nullptr;
+static lv_obj_t* tab_logs = nullptr;
 
 // ============================================================
 // STATIC UI HANDLES  (Pulse tab – Production)
 // ============================================================
 // Mode selector: 3 big toggle buttons
-static lv_obj_t* btn_mode[3]     = {nullptr, nullptr, nullptr};
+static lv_obj_t* btn_mode[3] = {nullptr, nullptr, nullptr};
 
 // Timing rows: each row is a container holding label, -, spinbox, +, unit
-static lv_obj_t* row_d1       = nullptr;
-static lv_obj_t* row_gap1     = nullptr;
-static lv_obj_t* row_d2       = nullptr;
-static lv_obj_t* row_gap2     = nullptr;
-static lv_obj_t* row_d3       = nullptr;
+static lv_obj_t* row_d1 = nullptr;
+static lv_obj_t* row_gap1 = nullptr;
+static lv_obj_t* row_d2 = nullptr;
+static lv_obj_t* row_gap2 = nullptr;
+static lv_obj_t* row_d3 = nullptr;
 
 // Spinboxes inside the rows (for reading values)
-static lv_obj_t* spin_d1       = nullptr;
-static lv_obj_t* spin_gap1     = nullptr;
-static lv_obj_t* spin_d2       = nullptr;
-static lv_obj_t* spin_gap2     = nullptr;
-static lv_obj_t* spin_d3       = nullptr;
+static lv_obj_t* spin_d1 = nullptr;
+static lv_obj_t* spin_gap1 = nullptr;
+static lv_obj_t* spin_d2 = nullptr;
+static lv_obj_t* spin_gap2 = nullptr;
+static lv_obj_t* spin_d3 = nullptr;
 
 // Power controls (+/- buttons, no slider)
 static lv_obj_t* btn_power_minus = nullptr;
-static lv_obj_t* btn_power_plus  = nullptr;
-static lv_obj_t* lbl_power_val   = nullptr;
+static lv_obj_t* btn_power_plus = nullptr;
+static lv_obj_t* lbl_power_val = nullptr;
 
 // Preheat (plain toggle object, no lv_switch)
-static lv_obj_t* btn_preheat   = nullptr;
-static lv_obj_t* lbl_preheat   = nullptr;
-static lv_obj_t* row_ph_ms     = nullptr;
-static lv_obj_t* row_ph_pct    = nullptr;
-static lv_obj_t* row_ph_gap    = nullptr;
-static lv_obj_t* spin_ph_ms    = nullptr;
-static lv_obj_t* spin_ph_pct   = nullptr;
-static lv_obj_t* spin_ph_gap   = nullptr;
+static lv_obj_t* btn_preheat = nullptr;
+static lv_obj_t* lbl_preheat = nullptr;
+static lv_obj_t* row_ph_ms = nullptr;
+static lv_obj_t* row_ph_pct = nullptr;
+static lv_obj_t* row_ph_gap = nullptr;
+static lv_obj_t* spin_ph_ms = nullptr;
+static lv_obj_t* spin_ph_pct = nullptr;
+static lv_obj_t* spin_ph_gap = nullptr;
 
 // Action buttons (no Revert)
-static lv_obj_t* btn_apply     = nullptr;
-static lv_obj_t* lbl_apply     = nullptr;
-static lv_obj_t* lbl_pending   = nullptr;
+static lv_obj_t* btn_apply = nullptr;
+static lv_obj_t* lbl_apply = nullptr;
+static lv_obj_t* lbl_pending = nullptr;
 
 // All interactive elements for lock/unlock
 static const int MAX_LOCKABLE = 20;
@@ -309,28 +325,28 @@ static void register_lockable(lv_obj_t* obj) {
 // ============================================================
 // DRAFT / APPLIED STATE
 // ============================================================
-static uint8_t  draft_mode       = 1;
-static uint16_t draft_d1         = 5;
-static uint16_t draft_gap1       = 0;
-static uint16_t draft_d2         = 0;
-static uint16_t draft_gap2       = 0;
-static uint16_t draft_d3         = 0;
-static uint8_t  draft_power      = 100;
-static bool     draft_preheat_en = false;
+static uint8_t draft_mode = 1;
+static uint16_t draft_d1 = 5;
+static uint16_t draft_gap1 = 0;
+static uint16_t draft_d2 = 0;
+static uint16_t draft_gap2 = 0;
+static uint16_t draft_d3 = 0;
+static uint8_t draft_power = 100;
+static bool draft_preheat_en = false;
 static uint16_t draft_preheat_ms = 20;
-static uint8_t  draft_preheat_pct = 30;
+static uint8_t draft_preheat_pct = 30;
 static uint16_t draft_preheat_gap = 3;
 
-static uint8_t  applied_mode       = 1;
-static uint16_t applied_d1         = 5;
-static uint16_t applied_gap1       = 0;
-static uint16_t applied_d2         = 0;
-static uint16_t applied_gap2       = 0;
-static uint16_t applied_d3         = 0;
-static uint8_t  applied_power      = 100;
-static bool     applied_preheat_en = false;
+static uint8_t applied_mode = 1;
+static uint16_t applied_d1 = 5;
+static uint16_t applied_gap1 = 0;
+static uint16_t applied_d2 = 0;
+static uint16_t applied_gap2 = 0;
+static uint16_t applied_d3 = 0;
+static uint8_t applied_power = 100;
+static bool applied_preheat_en = false;
 static uint16_t applied_preheat_ms = 20;
-static uint8_t  applied_preheat_pct = 30;
+static uint8_t applied_preheat_pct = 30;
 static uint16_t applied_preheat_gap = 3;
 
 static bool draft_dirty = false;
@@ -341,47 +357,101 @@ static bool applied_initialized = false;
 // ============================================================
 
 static void update_draft_dirty() {
-    draft_dirty = (draft_mode != applied_mode ||
-                   draft_d1   != applied_d1   ||
-                   draft_gap1 != applied_gap1 ||
-                   draft_d2   != applied_d2   ||
-                   draft_gap2 != applied_gap2 ||
-                   draft_d3   != applied_d3   ||
+    draft_dirty = (draft_mode != applied_mode || draft_d1 != applied_d1 ||
+                   draft_gap1 != applied_gap1 || draft_d2 != applied_d2 ||
+                   draft_gap2 != applied_gap2 || draft_d3 != applied_d3 ||
                    draft_power != applied_power ||
-                   draft_preheat_en  != applied_preheat_en ||
-                   draft_preheat_ms  != applied_preheat_ms ||
+                   draft_preheat_en != applied_preheat_en ||
+                   draft_preheat_ms != applied_preheat_ms ||
                    draft_preheat_pct != applied_preheat_pct ||
                    draft_preheat_gap != applied_preheat_gap);
 }
 
+// _ui_dirty flag: set by callbacks, cleared by ui_update after visual refresh
+static bool _ui_dirty = false;
+
 static void sync_applied_from_state(const WelderDisplayState& st) {
     bool changed = false;
 
-    if (applied_mode       != st.weld_mode)       { applied_mode       = st.weld_mode;       changed = true; }
-    if (applied_d1         != st.pulse_d1)         { applied_d1         = st.pulse_d1;         changed = true; }
-    if (applied_gap1       != st.pulse_gap1)       { applied_gap1       = st.pulse_gap1;       changed = true; }
-    if (applied_d2         != st.pulse_d2)         { applied_d2         = st.pulse_d2;         changed = true; }
-    if (applied_gap2       != st.pulse_gap2)       { applied_gap2       = st.pulse_gap2;       changed = true; }
-    if (applied_d3         != st.pulse_d3)         { applied_d3         = st.pulse_d3;         changed = true; }
-    if (applied_power      != st.power_pct)        { applied_power      = st.power_pct;        changed = true; }
-    if (applied_preheat_en != st.preheat_enabled)  { applied_preheat_en = st.preheat_enabled;  changed = true; }
-    if (applied_preheat_ms != st.preheat_ms)       { applied_preheat_ms = st.preheat_ms;       changed = true; }
-    if (applied_preheat_pct != st.preheat_pct)     { applied_preheat_pct = st.preheat_pct;     changed = true; }
-    if (applied_preheat_gap != st.preheat_gap_ms)  { applied_preheat_gap = st.preheat_gap_ms;  changed = true; }
+    if (applied_mode != st.weld_mode) {
+        applied_mode = st.weld_mode;
+        changed = true;
+    }
+    if (applied_d1 != st.pulse_d1) {
+        applied_d1 = st.pulse_d1;
+        changed = true;
+    }
+    if (applied_gap1 != st.pulse_gap1) {
+        applied_gap1 = st.pulse_gap1;
+        changed = true;
+    }
+    if (applied_d2 != st.pulse_d2) {
+        applied_d2 = st.pulse_d2;
+        changed = true;
+    }
+    if (applied_gap2 != st.pulse_gap2) {
+        applied_gap2 = st.pulse_gap2;
+        changed = true;
+    }
+    if (applied_d3 != st.pulse_d3) {
+        applied_d3 = st.pulse_d3;
+        changed = true;
+    }
+    if (applied_power != st.power_pct) {
+        applied_power = st.power_pct;
+        changed = true;
+    }
+    if (applied_preheat_en != st.preheat_enabled) {
+        applied_preheat_en = st.preheat_enabled;
+        changed = true;
+    }
+    if (applied_preheat_ms != st.preheat_ms) {
+        applied_preheat_ms = st.preheat_ms;
+        changed = true;
+    }
+    if (applied_preheat_pct != st.preheat_pct) {
+        applied_preheat_pct = st.preheat_pct;
+        changed = true;
+    }
+    if (applied_preheat_gap != st.preheat_gap_ms) {
+        applied_preheat_gap = st.preheat_gap_ms;
+        changed = true;
+    }
 
-    if (!applied_initialized) {
-        draft_mode       = applied_mode;
-        draft_d1         = applied_d1;
-        draft_gap1       = applied_gap1;
-        draft_d2         = applied_d2;
-        draft_gap2       = applied_gap2;
-        draft_d3         = applied_d3;
-        draft_power      = applied_power;
+    // Sync draft from applied when:
+    //   (a) First time ever (applied not initialized), OR
+    //   (b) User hasn't manually edited anything (draft_dirty == false)
+    // This ensures that after sendBootConfig(), once STM32 echoes back the
+    // settings via STATUS, the draft values track the applied values and
+    // the UI won't show a false "unsaved changes" indicator.
+    if (!applied_initialized || (!draft_dirty && changed)) {
+        draft_mode = applied_mode;
+        draft_d1 = applied_d1;
+        draft_gap1 = applied_gap1;
+        draft_d2 = applied_d2;
+        draft_gap2 = applied_gap2;
+        draft_d3 = applied_d3;
+        draft_power = applied_power;
         draft_preheat_en = applied_preheat_en;
         draft_preheat_ms = applied_preheat_ms;
         draft_preheat_pct = applied_preheat_pct;
         draft_preheat_gap = applied_preheat_gap;
         applied_initialized = true;
+
+        // Also update spinbox widgets to reflect new draft values
+        if (spin_d1) lv_spinbox_set_value(spin_d1, (int32_t)draft_d1);
+        if (spin_gap1) lv_spinbox_set_value(spin_gap1, (int32_t)draft_gap1);
+        if (spin_d2) lv_spinbox_set_value(spin_d2, (int32_t)draft_d2);
+        if (spin_gap2) lv_spinbox_set_value(spin_gap2, (int32_t)draft_gap2);
+        if (spin_d3) lv_spinbox_set_value(spin_d3, (int32_t)draft_d3);
+        if (spin_ph_ms)
+            lv_spinbox_set_value(spin_ph_ms, (int32_t)draft_preheat_ms);
+        if (spin_ph_pct)
+            lv_spinbox_set_value(spin_ph_pct, (int32_t)draft_preheat_pct);
+        if (spin_ph_gap)
+            lv_spinbox_set_value(spin_ph_gap, (int32_t)draft_preheat_gap);
+
+        _ui_dirty = true;  // trigger visual refresh
     }
 
     if (changed) {
@@ -394,17 +464,15 @@ static void sync_applied_from_state(const WelderDisplayState& st) {
 // ============================================================
 static void paint_arm_button(bool armed) {
     if (btn_arm) {
-        lv_obj_set_style_bg_color(btn_arm,
-                                  armed ? C_GREEN : C_RED, 0);
+        lv_obj_set_style_bg_color(btn_arm, armed ? C_GREEN : C_RED, 0);
     }
     if (lbl_arm) {
         if (draft_dirty && !armed) {
             lv_label_set_text(lbl_arm, "Apply settings first!");
             if (btn_arm) lv_obj_set_style_bg_color(btn_arm, C_YELLOW, 0);
         } else {
-            lv_label_set_text(lbl_arm,
-                              armed ? "ARMED  (tap to disarm)"
-                                    : "DISARMED  (tap to arm)");
+            lv_label_set_text(lbl_arm, armed ? "ARMED  (tap to disarm)"
+                                             : "DISARMED  (tap to arm)");
         }
     }
 }
@@ -423,11 +491,11 @@ static void on_weld_count_reset(lv_event_t* e) {
 static void paint_trigger_buttons(uint8_t mode) {
     if (btn_trigger_pedal) {
         lv_obj_set_style_bg_color(btn_trigger_pedal,
-            mode == 1 ? C_ACCENT : C_DARK_GREY, 0);
+                                  mode == 1 ? C_ACCENT : C_DARK_GREY, 0);
     }
     if (btn_trigger_probe) {
         lv_obj_set_style_bg_color(btn_trigger_probe,
-            mode == 2 ? C_GREEN : C_DARK_GREY, 0);
+                                  mode == 2 ? C_GREEN : C_DARK_GREY, 0);
     }
 }
 
@@ -469,8 +537,7 @@ static void arm_btn_event(lv_event_t* e) {
 // HELPER – create a value card inside a parent
 // ============================================================
 static lv_obj_t* make_card(lv_obj_t* parent, const char* title,
-                           lv_obj_t** out_value_label,
-                           int w, int h,
+                           lv_obj_t** out_value_label, int w, int h,
                            const lv_font_t* val_font = &lv_font_montserrat_14) {
     lv_obj_t* card = lv_obj_create(parent);
     lv_obj_set_size(card, w, h);
@@ -508,7 +575,7 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
     const int CONTENT_W = 780;
-    const int GAP       = 10;
+    const int GAP = 10;
 
     // --- Top row under tabs: Weld Counter (left), Trigger Source (right) ---
     const int TOP_ROW_Y = 0;
@@ -527,19 +594,22 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_set_style_border_color(btn_weld_cnt, C_DARK_GREY, 0);
         lv_obj_set_style_border_width(btn_weld_cnt, 1, 0);
         lv_obj_set_scrollbar_mode(btn_weld_cnt, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_add_event_cb(btn_weld_cnt, on_weld_count_reset, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(btn_weld_cnt, on_weld_count_reset, LV_EVENT_CLICKED,
+                            nullptr);
         make_interaction_safe(btn_weld_cnt);
 
         lv_obj_t* lbl_title = lv_label_create(btn_weld_cnt);
         lv_label_set_text(lbl_title, "Weld Count " LV_SYMBOL_REFRESH);
         lv_obj_set_style_text_color(lbl_title, C_GREY, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14,
+                                   LV_PART_MAIN);
         lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 2);
 
         lbl_weld_cnt = lv_label_create(btn_weld_cnt);
         lv_label_set_text(lbl_weld_cnt, "0");
         lv_obj_set_style_text_color(lbl_weld_cnt, C_GREEN, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_24, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_24,
+                                   LV_PART_MAIN);
         lv_obj_align(lbl_weld_cnt, LV_ALIGN_BOTTOM_MID, 0, -2);
     }
 
@@ -548,13 +618,14 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_t* lbl_title = lv_label_create(tab);
         lv_label_set_text(lbl_title, "Trigger:");
         lv_obj_set_style_text_color(lbl_title, C_GREY, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14,
+                                   LV_PART_MAIN);
         lv_obj_set_pos(lbl_title, CONTENT_W - 310, TOP_ROW_Y + 16);
 
         const int TRIG_BTN_W = 120;
         const int TRIG_BTN_H = 44;
-        const int TRIG_GAP   = 8;
-        const int TRIG_X     = CONTENT_W - 260;
+        const int TRIG_GAP = 8;
+        const int TRIG_X = CONTENT_W - 260;
 
         // Pedal button
         btn_trigger_pedal = lv_obj_create(tab);
@@ -563,17 +634,20 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_clear_flag(btn_trigger_pedal, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_size(btn_trigger_pedal, TRIG_BTN_W, TRIG_BTN_H);
         lv_obj_set_pos(btn_trigger_pedal, TRIG_X, TOP_ROW_Y + 4);
-        lv_obj_set_style_bg_color(btn_trigger_pedal, C_ACCENT, 0);  // default active
+        lv_obj_set_style_bg_color(btn_trigger_pedal, C_ACCENT,
+                                  0);  // default active
         lv_obj_set_style_bg_opa(btn_trigger_pedal, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn_trigger_pedal, 8, 0);
         lv_obj_set_scrollbar_mode(btn_trigger_pedal, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_add_event_cb(btn_trigger_pedal, on_trigger_pedal, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(btn_trigger_pedal, on_trigger_pedal,
+                            LV_EVENT_CLICKED, nullptr);
         make_interaction_safe(btn_trigger_pedal);
 
         lbl_trigger_pedal = lv_label_create(btn_trigger_pedal);
         lv_label_set_text(lbl_trigger_pedal, "Pedal");
         lv_obj_set_style_text_color(lbl_trigger_pedal, C_WHITE, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_trigger_pedal, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_trigger_pedal, &lv_font_montserrat_16,
+                                   LV_PART_MAIN);
         lv_obj_center(lbl_trigger_pedal);
 
         // Probe button
@@ -582,18 +656,22 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_add_flag(btn_trigger_probe, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(btn_trigger_probe, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_size(btn_trigger_probe, TRIG_BTN_W, TRIG_BTN_H);
-        lv_obj_set_pos(btn_trigger_probe, TRIG_X + TRIG_BTN_W + TRIG_GAP, TOP_ROW_Y + 4);
-        lv_obj_set_style_bg_color(btn_trigger_probe, C_DARK_GREY, 0);  // default inactive
+        lv_obj_set_pos(btn_trigger_probe, TRIG_X + TRIG_BTN_W + TRIG_GAP,
+                       TOP_ROW_Y + 4);
+        lv_obj_set_style_bg_color(btn_trigger_probe, C_DARK_GREY,
+                                  0);  // default inactive
         lv_obj_set_style_bg_opa(btn_trigger_probe, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn_trigger_probe, 8, 0);
         lv_obj_set_scrollbar_mode(btn_trigger_probe, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_add_event_cb(btn_trigger_probe, on_trigger_probe, LV_EVENT_CLICKED, nullptr);
+        lv_obj_add_event_cb(btn_trigger_probe, on_trigger_probe,
+                            LV_EVENT_CLICKED, nullptr);
         make_interaction_safe(btn_trigger_probe);
 
         lbl_trigger_probe = lv_label_create(btn_trigger_probe);
         lv_label_set_text(lbl_trigger_probe, "Probe");
         lv_obj_set_style_text_color(lbl_trigger_probe, C_WHITE, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_trigger_probe, &lv_font_montserrat_16, LV_PART_MAIN);
+        lv_obj_set_style_text_font(lbl_trigger_probe, &lv_font_montserrat_16,
+                                   LV_PART_MAIN);
         lv_obj_center(lbl_trigger_probe);
     }
 
@@ -606,7 +684,7 @@ static void build_status_tab(lv_obj_t* tab) {
     // --- Status cards – moved lower for better spacing ---
     const int card_w = (CONTENT_W - 2 * GAP) / 3;
     const int card_h = 90;
-    const int y_row1 = 58;   // pushed down to accommodate enlarged top row
+    const int y_row1 = 58;  // pushed down to accommodate enlarged top row
     int x = (CONTENT_W - (card_w * 3 + GAP * 2)) / 2;
 
     lv_obj_t* c1 = make_card(tab, "Pack Voltage", &lbl_pack_v, card_w, card_h);
@@ -616,20 +694,23 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_t* c3 = make_card(tab, "Charger Current", &lbl_ichg, card_w, card_h);
     lv_obj_set_pos(c3, x + 2 * (card_w + GAP), y_row1);
 
-    const int y_row2  = y_row1 + card_h + GAP;
-    const int cell_w  = (CONTENT_W - 2 * GAP) / 3;
-    const int cell_h  = 80;
+    const int y_row2 = y_row1 + card_h + GAP;
+    const int cell_w = (CONTENT_W - 2 * GAP) / 3;
+    const int cell_h = 80;
     int cx = (CONTENT_W - (cell_w * 3 + GAP * 2)) / 2;
 
-    lv_obj_t* cc1 = make_card(tab, "Cell 1", &lbl_cell1, cell_w, cell_h, &lv_font_montserrat_14);
+    lv_obj_t* cc1 = make_card(tab, "Cell 1", &lbl_cell1, cell_w, cell_h,
+                              &lv_font_montserrat_14);
     lv_obj_set_pos(cc1, cx, y_row2);
-    lv_obj_t* cc2 = make_card(tab, "Cell 2", &lbl_cell2, cell_w, cell_h, &lv_font_montserrat_14);
+    lv_obj_t* cc2 = make_card(tab, "Cell 2", &lbl_cell2, cell_w, cell_h,
+                              &lv_font_montserrat_14);
     lv_obj_set_pos(cc2, cx + cell_w + GAP, y_row2);
-    lv_obj_t* cc3 = make_card(tab, "Cell 3", &lbl_cell3, cell_w, cell_h, &lv_font_montserrat_14);
+    lv_obj_t* cc3 = make_card(tab, "Cell 3", &lbl_cell3, cell_w, cell_h,
+                              &lv_font_montserrat_14);
     lv_obj_set_pos(cc3, cx + 2 * (cell_w + GAP), y_row2);
 
     // ARM button – plain lv_obj (Widget A pattern – NO lv_button!)
-    const int y_arm = y_row2 + cell_h + GAP + 10;   // slightly lower
+    const int y_arm = y_row2 + cell_h + GAP + 10;  // slightly lower
     btn_arm = lv_obj_create(tab);
     lv_obj_remove_style_all(btn_arm);
     lv_obj_add_flag(btn_arm, LV_OBJ_FLAG_CLICKABLE);
@@ -655,31 +736,30 @@ static void build_status_tab(lv_obj_t* tab) {
 // ============================================================
 static void set_row_visible(lv_obj_t* row, bool show) {
     if (!row) return;
-    if (show) lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
-    else      lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
+    if (show)
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_HIDDEN);
+    else
+        lv_obj_add_flag(row, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void update_pulse_field_visibility() {
     bool show_gap1 = (draft_mode >= 2);
-    bool show_d2   = (draft_mode >= 2);
+    bool show_d2 = (draft_mode >= 2);
     bool show_gap2 = (draft_mode >= 3);
-    bool show_d3   = (draft_mode >= 3);
+    bool show_d3 = (draft_mode >= 3);
 
     set_row_visible(row_gap1, show_gap1);
-    set_row_visible(row_d2,   show_d2);
+    set_row_visible(row_d2, show_d2);
     set_row_visible(row_gap2, show_gap2);
-    set_row_visible(row_d3,   show_d3);
+    set_row_visible(row_d3, show_d3);
 }
 
 static void update_preheat_visibility() {
     bool show = draft_preheat_en;
-    set_row_visible(row_ph_ms,  show);
+    set_row_visible(row_ph_ms, show);
     set_row_visible(row_ph_pct, show);
     set_row_visible(row_ph_gap, show);
 }
-
-// _ui_dirty flag: set by callbacks, cleared by ui_update after visual refresh
-static bool _ui_dirty = false;
 
 static void mark_dirty() {
     update_draft_dirty();
@@ -703,14 +783,22 @@ static void on_spinbox_change(lv_event_t* e) {
     lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
     int32_t val = lv_spinbox_get_value(obj);
 
-    if      (obj == spin_d1)     draft_d1 = (uint16_t)val;
-    else if (obj == spin_gap1)   draft_gap1 = (uint16_t)val;
-    else if (obj == spin_d2)     draft_d2 = (uint16_t)val;
-    else if (obj == spin_gap2)   draft_gap2 = (uint16_t)val;
-    else if (obj == spin_d3)     draft_d3 = (uint16_t)val;
-    else if (obj == spin_ph_ms)  draft_preheat_ms = (uint16_t)val;
-    else if (obj == spin_ph_pct) draft_preheat_pct = (uint8_t)val;
-    else if (obj == spin_ph_gap) draft_preheat_gap = (uint16_t)val;
+    if (obj == spin_d1)
+        draft_d1 = (uint16_t)val;
+    else if (obj == spin_gap1)
+        draft_gap1 = (uint16_t)val;
+    else if (obj == spin_d2)
+        draft_d2 = (uint16_t)val;
+    else if (obj == spin_gap2)
+        draft_gap2 = (uint16_t)val;
+    else if (obj == spin_d3)
+        draft_d3 = (uint16_t)val;
+    else if (obj == spin_ph_ms)
+        draft_preheat_ms = (uint16_t)val;
+    else if (obj == spin_ph_pct)
+        draft_preheat_pct = (uint8_t)val;
+    else if (obj == spin_ph_gap)
+        draft_preheat_gap = (uint16_t)val;
 
     mark_dirty();
 }
@@ -720,11 +808,15 @@ static void do_power_step(bool increment) {
     uint8_t step = _cfg.power_step_pct;
     if (step == 0) step = 5;
     if (increment) {
-        if (draft_power + step <= 100) draft_power += step;
-        else draft_power = 100;
+        if (draft_power + step <= 100)
+            draft_power += step;
+        else
+            draft_power = 100;
     } else {
-        if (draft_power >= 50 + step) draft_power -= step;
-        else draft_power = 50;
+        if (draft_power >= 50 + step)
+            draft_power -= step;
+        else
+            draft_power = 50;
     }
     mark_dirty();
 }
@@ -751,9 +843,9 @@ static void on_apply_click(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (!draft_dirty) return;
     if (_recipe_cb) {
-        _recipe_cb(draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2, draft_d3,
-                   draft_power,
-                   draft_preheat_en, draft_preheat_ms, draft_preheat_pct, draft_preheat_gap);
+        _recipe_cb(draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2,
+                   draft_d3, draft_power, draft_preheat_en, draft_preheat_ms,
+                   draft_preheat_pct, draft_preheat_gap);
     }
 }
 
@@ -763,10 +855,9 @@ static void on_apply_click(lv_event_t* e) {
 // ALL +/- buttons use Widget A pattern (plain lv_obj, no theme)
 // ============================================================
 static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
-                                const char* unit,
-                                lv_obj_t** out_spinbox,
-                                int min_val, int max_val,
-                                int init_val, int digits, int step) {
+                                const char* unit, lv_obj_t** out_spinbox,
+                                int min_val, int max_val, int init_val,
+                                int digits, int step) {
     lv_obj_t* row = lv_obj_create(parent);
     lv_obj_remove_style_all(row);
     lv_obj_set_size(row, 370, 50);
@@ -821,7 +912,8 @@ static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
     lv_obj_set_style_border_width(spin, 0, LV_PART_CURSOR);
     if (out_spinbox) *out_spinbox = spin;
     // Prevent direct touch on spinbox from moving cursor and changing step.
-    // The +/- buttons are the sole input; API calls still work without CLICKABLE.
+    // The +/- buttons are the sole input; API calls still work without
+    // CLICKABLE.
     lv_obj_clear_flag(spin, LV_OBJ_FLAG_CLICKABLE);
     make_interaction_safe(spin);  // <-- ANTI-SHUDDER
 
@@ -851,18 +943,23 @@ static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
 
     // Wire +/- to spinbox using hold-to-repeat handlers
     HoldRepeatCtx* ctx_dec = alloc_repeat_ctx(spin, false, false);
-    HoldRepeatCtx* ctx_inc = alloc_repeat_ctx(spin, true,  false);
+    HoldRepeatCtx* ctx_inc = alloc_repeat_ctx(spin, true, false);
 
     if (ctx_dec) {
-        lv_obj_add_event_cb(btn_dec, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx_dec);
-        lv_obj_add_event_cb(btn_dec, on_repeat_pressing, LV_EVENT_PRESSING, ctx_dec);
+        lv_obj_add_event_cb(btn_dec, on_repeat_pressed, LV_EVENT_PRESSED,
+                            ctx_dec);
+        lv_obj_add_event_cb(btn_dec, on_repeat_pressing, LV_EVENT_PRESSING,
+                            ctx_dec);
     }
     if (ctx_inc) {
-        lv_obj_add_event_cb(btn_inc, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx_inc);
-        lv_obj_add_event_cb(btn_inc, on_repeat_pressing, LV_EVENT_PRESSING, ctx_inc);
+        lv_obj_add_event_cb(btn_inc, on_repeat_pressed, LV_EVENT_PRESSED,
+                            ctx_inc);
+        lv_obj_add_event_cb(btn_inc, on_repeat_pressing, LV_EVENT_PRESSING,
+                            ctx_inc);
     }
 
-    lv_obj_add_event_cb(spin, on_spinbox_change, LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(spin, on_spinbox_change, LV_EVENT_VALUE_CHANGED,
+                        nullptr);
 
     register_lockable(btn_dec);
     register_lockable(spin);
@@ -881,14 +978,18 @@ static void lock_pulse_tab(bool locked) {
 
     for (int i = 0; i < lockable_count; i++) {
         if (!lockable_objs[i]) continue;
-        if (locked) lv_obj_add_state(lockable_objs[i], LV_STATE_DISABLED);
-        else        lv_obj_remove_state(lockable_objs[i], LV_STATE_DISABLED);
+        if (locked)
+            lv_obj_add_state(lockable_objs[i], LV_STATE_DISABLED);
+        else
+            lv_obj_remove_state(lockable_objs[i], LV_STATE_DISABLED);
     }
 
     auto set_lock = [&](lv_obj_t* obj) {
         if (!obj) return;
-        if (locked) lv_obj_add_state(obj, LV_STATE_DISABLED);
-        else        lv_obj_remove_state(obj, LV_STATE_DISABLED);
+        if (locked)
+            lv_obj_add_state(obj, LV_STATE_DISABLED);
+        else
+            lv_obj_remove_state(obj, LV_STATE_DISABLED);
     };
     for (int i = 0; i < 3; i++) set_lock(btn_mode[i]);
     set_lock(btn_power_minus);
@@ -900,8 +1001,8 @@ static void lock_pulse_tab(bool locked) {
 // ============================================================
 // PULSE TAB: helper – create a section header
 // ============================================================
-static lv_obj_t* make_section_header(lv_obj_t* parent, const char* text,
-                                     int x, int y) {
+static lv_obj_t* make_section_header(lv_obj_t* parent, const char* text, int x,
+                                     int y) {
     lv_obj_t* lbl = lv_label_create(parent);
     lv_label_set_text(lbl, text);
     lv_obj_set_style_text_color(lbl, C_ACCENT, LV_PART_MAIN);
@@ -914,8 +1015,8 @@ static lv_obj_t* make_section_header(lv_obj_t* parent, const char* text,
 // PULSE TAB: helper – create a mode toggle button
 // Uses Widget A pattern (plain lv_obj, NO lv_button)
 // ============================================================
-static lv_obj_t* make_mode_button(lv_obj_t* parent, const char* text,
-                                  int x, int y, int w, int h, int mode_idx) {
+static lv_obj_t* make_mode_button(lv_obj_t* parent, const char* text, int x,
+                                  int y, int w, int h, int mode_idx) {
     lv_obj_t* btn = lv_obj_create(parent);
     lv_obj_remove_style_all(btn);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
@@ -977,23 +1078,28 @@ static void build_pulse_tab(lv_obj_t* tab) {
 
     const int ROW_H = 54;
 
-    row_d1 = make_touch_row(tab, "Pulse", "ms", &spin_d1, 1, 999, draft_d1, 3, 1);
+    row_d1 =
+        make_touch_row(tab, "Pulse", "ms", &spin_d1, 1, 999, draft_d1, 3, 1);
     lv_obj_set_pos(row_d1, L, ly);
     ly += ROW_H;
 
-    row_gap1 = make_touch_row(tab, "Gap", "ms", &spin_gap1, 1, 999, draft_gap1, 3, 1);
+    row_gap1 =
+        make_touch_row(tab, "Gap", "ms", &spin_gap1, 1, 999, draft_gap1, 3, 1);
     lv_obj_set_pos(row_gap1, L, ly);
     ly += ROW_H;
 
-    row_d2 = make_touch_row(tab, "Pulse 2", "ms", &spin_d2, 1, 999, draft_d2, 3, 1);
+    row_d2 =
+        make_touch_row(tab, "Pulse 2", "ms", &spin_d2, 1, 999, draft_d2, 3, 1);
     lv_obj_set_pos(row_d2, L, ly);
     ly += ROW_H;
 
-    row_gap2 = make_touch_row(tab, "Gap 2", "ms", &spin_gap2, 1, 999, draft_gap2, 3, 1);
+    row_gap2 = make_touch_row(tab, "Gap 2", "ms", &spin_gap2, 1, 999,
+                              draft_gap2, 3, 1);
     lv_obj_set_pos(row_gap2, L, ly);
     ly += ROW_H;
 
-    row_d3 = make_touch_row(tab, "Pulse 3", "ms", &spin_d3, 1, 999, draft_d3, 3, 1);
+    row_d3 =
+        make_touch_row(tab, "Pulse 3", "ms", &spin_d3, 1, 999, draft_d3, 3, 1);
     lv_obj_set_pos(row_d3, L, ly);
 
     update_pulse_field_visibility();
@@ -1006,16 +1112,17 @@ static void build_pulse_tab(lv_obj_t* tab) {
     const int PWR_BTN_W = 56;
     const int PWR_BTN_H = 46;
     const int PWR_VAL_W = 84;
-    const int PWR_GAP   = 8;   // symmetric gap between [-] [val] [+]
+    const int PWR_GAP = 8;  // symmetric gap between [-] [val] [+]
 
     // Derived positions for evenly-spaced  [-] [value] [+]  row
     const int X_PWR_MINUS = R;
-    const int X_PWR_VAL   = R + PWR_BTN_W + PWR_GAP;
-    const int X_PWR_PLUS  = X_PWR_VAL + PWR_VAL_W + PWR_GAP;
+    const int X_PWR_VAL = R + PWR_BTN_W + PWR_GAP;
+    const int X_PWR_PLUS = X_PWR_VAL + PWR_VAL_W + PWR_GAP;
 
     make_section_header(tab, "Weld Power", R, ry);
 
-    // "Preheat" label above the ON/OFF toggle, right of power + button with 20px gap
+    // "Preheat" label above the ON/OFF toggle, right of power + button with
+    // 20px gap
     const int PH_X = X_PWR_PLUS + PWR_BTN_W + 20;
     make_section_header(tab, "Preheat", PH_X, ry);
 
@@ -1042,8 +1149,10 @@ static void build_pulse_tab(lv_obj_t* tab) {
     {
         HoldRepeatCtx* ctx = alloc_repeat_ctx(nullptr, false, true);
         if (ctx) {
-            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx);
-            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressing, LV_EVENT_PRESSING, ctx);
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressed,
+                                LV_EVENT_PRESSED, ctx);
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_pressing,
+                                LV_EVENT_PRESSING, ctx);
         }
     }
     make_interaction_safe(btn_power_minus);
@@ -1063,7 +1172,8 @@ static void build_pulse_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_power_val, buf);
     }
     lv_obj_set_style_text_color(lbl_power_val, C_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_power_val, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_power_val, &lv_font_montserrat_20,
+                               LV_PART_MAIN);
     lv_obj_center(lbl_power_val);  // centered inside fixed-width container
 
     btn_power_plus = lv_obj_create(tab);
@@ -1085,8 +1195,10 @@ static void build_pulse_tab(lv_obj_t* tab) {
     {
         HoldRepeatCtx* ctx = alloc_repeat_ctx(nullptr, true, true);
         if (ctx) {
-            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressed,  LV_EVENT_PRESSED,  ctx);
-            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressing, LV_EVENT_PRESSING, ctx);
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressed,
+                                LV_EVENT_PRESSED, ctx);
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_pressing,
+                                LV_EVENT_PRESSING, ctx);
         }
     }
     make_interaction_safe(btn_power_plus);
@@ -1094,14 +1206,16 @@ static void build_pulse_tab(lv_obj_t* tab) {
     register_lockable(btn_power_minus);
     register_lockable(btn_power_plus);
 
-    // Preheat ON/OFF toggle – same horizontal level as Weld Power +/- (Widget A pattern)
+    // Preheat ON/OFF toggle – same horizontal level as Weld Power +/- (Widget A
+    // pattern)
     btn_preheat = lv_obj_create(tab);
     lv_obj_remove_style_all(btn_preheat);
     lv_obj_add_flag(btn_preheat, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(btn_preheat, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(btn_preheat, 80, PWR_BTN_H);
     lv_obj_set_pos(btn_preheat, PH_X, ry);  // same Y as power buttons
-    lv_obj_set_style_bg_color(btn_preheat, draft_preheat_en ? C_GREEN : C_DARK_GREY, 0);
+    lv_obj_set_style_bg_color(btn_preheat,
+                              draft_preheat_en ? C_GREEN : C_DARK_GREY, 0);
     lv_obj_set_style_bg_opa(btn_preheat, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_preheat, 16, 0);
     lbl_preheat = lv_label_create(btn_preheat);
@@ -1109,30 +1223,32 @@ static void build_pulse_tab(lv_obj_t* tab) {
     lv_obj_set_style_text_color(lbl_preheat, C_WHITE, 0);
     lv_obj_set_style_text_font(lbl_preheat, &lv_font_montserrat_16, 0);
     lv_obj_center(lbl_preheat);
-    lv_obj_add_event_cb(btn_preheat, on_preheat_toggle, LV_EVENT_CLICKED, nullptr);
+    lv_obj_add_event_cb(btn_preheat, on_preheat_toggle, LV_EVENT_CLICKED,
+                        nullptr);
     make_interaction_safe(btn_preheat);
     register_lockable(btn_preheat);
 
     ry += PWR_BTN_H + 16;
 
-    row_ph_ms = make_touch_row(tab, "Duration", "ms", &spin_ph_ms,
-                               1, 200, draft_preheat_ms, 3, 1);
+    row_ph_ms = make_touch_row(tab, "Duration", "ms", &spin_ph_ms, 1, 200,
+                               draft_preheat_ms, 3, 1);
     lv_obj_set_pos(row_ph_ms, R, ry);
     ry += ROW_H;
 
-    row_ph_pct = make_touch_row(tab, "Power", "%", &spin_ph_pct,
-                                10, 100, draft_preheat_pct, 3, 5);
+    row_ph_pct = make_touch_row(tab, "Power", "%", &spin_ph_pct, 10, 100,
+                                draft_preheat_pct, 3, 5);
     lv_obj_set_pos(row_ph_pct, R, ry);
     ry += ROW_H;
 
-    row_ph_gap = make_touch_row(tab, "Gap", "ms", &spin_ph_gap,
-                                1, 100, draft_preheat_gap, 3, 1);
+    row_ph_gap = make_touch_row(tab, "Gap", "ms", &spin_ph_gap, 1, 100,
+                                draft_preheat_gap, 3, 1);
     lv_obj_set_pos(row_ph_gap, R, ry);
     ry += ROW_H;
 
     update_preheat_visibility();
 
-    // --- APPLY Button (Widget A pattern – plain lv_obj, NO lv_button, NO Revert) ---
+    // --- APPLY Button (Widget A pattern – plain lv_obj, NO lv_button, NO
+    // Revert) ---
     const int BTN_W = 200;
     const int BTN_H = 50;
     ry += 18;
@@ -1143,7 +1259,8 @@ static void build_pulse_tab(lv_obj_t* tab) {
     lv_obj_clear_flag(btn_apply, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(btn_apply, BTN_W, BTN_H);
     lv_obj_set_pos(btn_apply, R, ry);
-    lv_obj_set_style_bg_color(btn_apply, C_GREEN, 0);  // green = synced (initial)
+    lv_obj_set_style_bg_color(btn_apply, C_GREEN,
+                              0);  // green = synced (initial)
     lv_obj_set_style_bg_opa(btn_apply, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_apply, 10, 0);
     lv_obj_add_event_cb(btn_apply, on_apply_click, LV_EVENT_CLICKED, nullptr);
@@ -1160,7 +1277,8 @@ static void build_pulse_tab(lv_obj_t* tab) {
     lbl_pending = lv_label_create(tab);
     lv_label_set_text(lbl_pending, LV_SYMBOL_WARNING " Changes pending");
     lv_obj_set_style_text_color(lbl_pending, C_YELLOW, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_pending, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_pending, &lv_font_montserrat_16,
+                               LV_PART_MAIN);
     lv_obj_set_pos(lbl_pending, R, ry);
     lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
 }
@@ -1187,9 +1305,8 @@ static void build_placeholder_tab(lv_obj_t* tab, const char* name) {
 // Returns the button object. Sets *out_label to inner label.
 // ============================================================
 static lv_obj_t* make_cfg_button(lv_obj_t* parent, const char* text,
-                                 lv_obj_t** out_label,
-                                 int x, int y, int w, int h,
-                                 lv_color_t bg_color) {
+                                 lv_obj_t** out_label, int x, int y, int w,
+                                 int h, lv_color_t bg_color) {
     lv_obj_t* btn = lv_obj_create(parent);
     lv_obj_remove_style_all(btn);
     lv_obj_add_flag(btn, LV_OBJ_FLAG_CLICKABLE);
@@ -1217,18 +1334,24 @@ static lv_obj_t* make_cfg_button(lv_obj_t* parent, const char* text,
 // ============================================================
 static void update_cfg_hold_repeat_label() {
     if (lbl_cfg_hold_repeat)
-        lv_label_set_text(lbl_cfg_hold_repeat, _cfg.hold_to_repeat ? "ON" : "OFF");
+        lv_label_set_text(lbl_cfg_hold_repeat,
+                          _cfg.hold_to_repeat ? "ON" : "OFF");
     if (btn_cfg_hold_repeat)
         lv_obj_set_style_bg_color(btn_cfg_hold_repeat,
-            _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY, 0);
+                                  _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY,
+                                  0);
 }
 
 static const char* time_step_text(uint8_t ms) {
     switch (ms) {
-        case 1:  return "1 ms";
-        case 5:  return "5 ms";
-        case 10: return "10 ms";
-        default: return "1 ms";
+        case 1:
+            return "1 ms";
+        case 5:
+            return "5 ms";
+        case 10:
+            return "10 ms";
+        default:
+            return "1 ms";
     }
 }
 
@@ -1239,32 +1362,43 @@ static void update_cfg_time_step_label() {
 
 static const char* power_step_text(uint8_t pct) {
     switch (pct) {
-        case 1:  return "1 %";
-        case 5:  return "5 %";
-        case 10: return "10 %";
-        default: return "5 %";
+        case 1:
+            return "1 %";
+        case 5:
+            return "5 %";
+        case 10:
+            return "10 %";
+        default:
+            return "5 %";
     }
 }
 
 static void update_cfg_power_step_label() {
     if (lbl_cfg_power_step)
-        lv_label_set_text(lbl_cfg_power_step, power_step_text(_cfg.power_step_pct));
+        lv_label_set_text(lbl_cfg_power_step,
+                          power_step_text(_cfg.power_step_pct));
 }
 
 static void update_cfg_load_last_label() {
     if (lbl_cfg_load_last)
-        lv_label_set_text(lbl_cfg_load_last, _cfg.load_last_on_boot ? "ON" : "OFF");
+        lv_label_set_text(lbl_cfg_load_last,
+                          _cfg.load_last_on_boot ? "ON" : "OFF");
     if (btn_cfg_load_last)
-        lv_obj_set_style_bg_color(btn_cfg_load_last,
-            _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY, 0);
+        lv_obj_set_style_bg_color(
+            btn_cfg_load_last, _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY,
+            0);
 }
 
 static const char* brightness_text(uint8_t b) {
     switch (b) {
-        case 0:  return "LOW";
-        case 1:  return "MED";
-        case 2:  return "HIGH";
-        default: return "HIGH";
+        case 0:
+            return "LOW";
+        case 1:
+            return "MED";
+        case 2:
+            return "HIGH";
+        default:
+            return "HIGH";
     }
 }
 
@@ -1277,27 +1411,35 @@ static void update_cfg_brightness_label() {
 
 static const char* hold_time_text(uint8_t steps) {
     switch (steps) {
-        case 1: return "0.5 s";
-        case 2: return "1.0 s";
-        case 3: return "1.5 s";
-        case 4: return "2.0 s";
-        case 5: return "2.5 s";
-        case 6: return "3.0 s";
-        default: return "1.0 s";
+        case 1:
+            return "0.5 s";
+        case 2:
+            return "1.0 s";
+        case 3:
+            return "1.5 s";
+        case 4:
+            return "2.0 s";
+        case 5:
+            return "2.5 s";
+        case 6:
+            return "3.0 s";
+        default:
+            return "1.0 s";
     }
 }
 
 static void update_cfg_hold_time_label() {
     if (lbl_cfg_hold_time)
-        lv_label_set_text(lbl_cfg_hold_time, hold_time_text(_cfg.contact_hold_steps));
+        lv_label_set_text(lbl_cfg_hold_time,
+                          hold_time_text(_cfg.contact_hold_steps));
 }
 
 static void update_cfg_cwp_label() {
     if (lbl_cfg_cwp)
         lv_label_set_text(lbl_cfg_cwp, _cfg.contact_with_pedal ? "ON" : "OFF");
     if (btn_cfg_cwp)
-        lv_obj_set_style_bg_color(btn_cfg_cwp,
-            _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY, 0);
+        lv_obj_set_style_bg_color(
+            btn_cfg_cwp, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY, 0);
 }
 
 // ============================================================
@@ -1313,8 +1455,8 @@ static void notify_config_changed() {
 static void apply_time_step_to_spinboxes() {
     int step = (int)_cfg.time_step_ms;
     if (step <= 0) step = 1;
-    lv_obj_t* timing_spins[] = {spin_d1, spin_gap1, spin_d2, spin_gap2, spin_d3,
-                                 spin_ph_ms, spin_ph_gap};
+    lv_obj_t* timing_spins[] = {spin_d1, spin_gap1,  spin_d2,    spin_gap2,
+                                spin_d3, spin_ph_ms, spin_ph_gap};
     for (int i = 0; i < 7; i++) {
         if (timing_spins[i]) lv_spinbox_set_step(timing_spins[i], step);
     }
@@ -1335,9 +1477,12 @@ static void on_cfg_hold_repeat(lv_event_t* e) {
 static void on_cfg_time_step(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     // Cycle: 1 -> 5 -> 10 -> 1
-    if      (_cfg.time_step_ms == 1)  _cfg.time_step_ms = 5;
-    else if (_cfg.time_step_ms == 5)  _cfg.time_step_ms = 10;
-    else                              _cfg.time_step_ms = 1;
+    if (_cfg.time_step_ms == 1)
+        _cfg.time_step_ms = 5;
+    else if (_cfg.time_step_ms == 5)
+        _cfg.time_step_ms = 10;
+    else
+        _cfg.time_step_ms = 1;
     update_cfg_time_step_label();
     apply_time_step_to_spinboxes();
     notify_config_changed();
@@ -1346,9 +1491,12 @@ static void on_cfg_time_step(lv_event_t* e) {
 static void on_cfg_power_step(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     // Cycle: 1 -> 5 -> 10 -> 1
-    if      (_cfg.power_step_pct == 1)  _cfg.power_step_pct = 5;
-    else if (_cfg.power_step_pct == 5)  _cfg.power_step_pct = 10;
-    else                                _cfg.power_step_pct = 1;
+    if (_cfg.power_step_pct == 1)
+        _cfg.power_step_pct = 5;
+    else if (_cfg.power_step_pct == 5)
+        _cfg.power_step_pct = 10;
+    else
+        _cfg.power_step_pct = 1;
     update_cfg_power_step_label();
     apply_time_step_to_spinboxes();  // also updates preheat power step
     notify_config_changed();
@@ -1408,10 +1556,10 @@ static void build_config_tab(lv_obj_t* tab) {
     // Height will be set after all items are added
 
     const int LABEL_X = 20;
-    const int BTN_X   = 430;
-    const int BTN_W   = 140;
-    const int BTN_H   = 48;
-    const int ROW_H   = 60;
+    const int BTN_X = 430;
+    const int BTN_W = 140;
+    const int BTN_H = 48;
+    const int ROW_H = 60;
     int y = 4;
 
     // ---- Section: Editing ----
@@ -1426,11 +1574,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_hold_repeat = make_cfg_button(cont,
-        _cfg.hold_to_repeat ? "ON" : "OFF", &lbl_cfg_hold_repeat,
-        BTN_X, y, BTN_W, BTN_H,
-        _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
-    lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_hold_repeat = make_cfg_button(
+        cont, _cfg.hold_to_repeat ? "ON" : "OFF", &lbl_cfg_hold_repeat, BTN_X,
+        y, BTN_W, BTN_H, _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat,
+                        LV_EVENT_CLICKED, nullptr);
     y += ROW_H;
 
     // Time Step
@@ -1441,10 +1589,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_time_step = make_cfg_button(cont,
-        time_step_text(_cfg.time_step_ms), &lbl_cfg_time_step,
-        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_time_step, on_cfg_time_step, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_time_step =
+        make_cfg_button(cont, time_step_text(_cfg.time_step_ms),
+                        &lbl_cfg_time_step, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_time_step, on_cfg_time_step, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H;
 
     // Power Step
@@ -1455,10 +1604,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_power_step = make_cfg_button(cont,
-        power_step_text(_cfg.power_step_pct), &lbl_cfg_power_step,
-        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_power_step, on_cfg_power_step, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_power_step =
+        make_cfg_button(cont, power_step_text(_cfg.power_step_pct),
+                        &lbl_cfg_power_step, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_power_step, on_cfg_power_step, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H + 12;
 
     // ---- Section: Trigger ----
@@ -1473,10 +1623,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_hold_time = make_cfg_button(cont,
-        hold_time_text(_cfg.contact_hold_steps), &lbl_cfg_hold_time,
-        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_hold_time, on_cfg_hold_time, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_hold_time =
+        make_cfg_button(cont, hold_time_text(_cfg.contact_hold_steps),
+                        &lbl_cfg_hold_time, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_hold_time, on_cfg_hold_time, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H;
 
     // Contact With Pedal ON/OFF
@@ -1487,11 +1638,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_cwp = make_cfg_button(cont,
-        _cfg.contact_with_pedal ? "ON" : "OFF", &lbl_cfg_cwp,
-        BTN_X, y, BTN_W, BTN_H,
-        _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY);
-    lv_obj_add_event_cb(btn_cfg_cwp, on_cfg_cwp_toggle, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_cwp = make_cfg_button(
+        cont, _cfg.contact_with_pedal ? "ON" : "OFF", &lbl_cfg_cwp, BTN_X, y,
+        BTN_W, BTN_H, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_cwp, on_cfg_cwp_toggle, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H + 12;
 
     // ---- Section: Startup ----
@@ -1506,11 +1657,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_load_last = make_cfg_button(cont,
-        _cfg.load_last_on_boot ? "ON" : "OFF", &lbl_cfg_load_last,
-        BTN_X, y, BTN_W, BTN_H,
-        _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY);
-    lv_obj_add_event_cb(btn_cfg_load_last, on_cfg_load_last, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_load_last = make_cfg_button(
+        cont, _cfg.load_last_on_boot ? "ON" : "OFF", &lbl_cfg_load_last, BTN_X,
+        y, BTN_W, BTN_H, _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_load_last, on_cfg_load_last, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H + 12;
 
     // ---- Section: Display ----
@@ -1525,10 +1676,11 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_brightness = make_cfg_button(cont,
-        brightness_text(_cfg.brightness), &lbl_cfg_brightness,
-        BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_brightness, on_cfg_brightness, LV_EVENT_CLICKED, nullptr);
+    btn_cfg_brightness =
+        make_cfg_button(cont, brightness_text(_cfg.brightness),
+                        &lbl_cfg_brightness, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_brightness, on_cfg_brightness, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H + 20;
 
     // Set container height to fit all content
@@ -1539,7 +1691,7 @@ static void build_config_tab(lv_obj_t* tab) {
 // PUBLIC: ui_init
 // ============================================================
 void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
-    _arm_cb    = on_arm_toggle;
+    _arm_cb = on_arm_toggle;
     _recipe_cb = on_recipe_apply;
 
     // Initialize config to defaults (may be overridden by ui_load_config later)
@@ -1548,7 +1700,8 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     lv_obj_t* scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, C_BG, LV_PART_MAIN);
 
-    // Tabview – 5 tabs, tab bar at top, 42 px tall (slightly larger for easier touch)
+    // Tabview – 5 tabs, tab bar at top, 42 px tall (slightly larger for easier
+    // touch)
     lv_obj_t* tv = lv_tabview_create(scr);
     lv_tabview_set_tab_bar_position(tv, LV_DIR_TOP);
     lv_tabview_set_tab_bar_size(tv, 42);
@@ -1576,45 +1729,81 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     lv_obj_set_style_text_color(tab_btns, C_WHITE, LV_PART_MAIN);
     lv_obj_set_style_text_font(tab_btns, &lv_font_montserrat_14, LV_PART_MAIN);
 
-    lv_obj_t* t0 = lv_tabview_add_tab(tv, LV_SYMBOL_HOME   " Status");
-    lv_obj_t* t1 = lv_tabview_add_tab(tv, LV_SYMBOL_CHARGE  " Pulse");
-    lv_obj_t* t2 = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Presets");
-    lv_obj_t* t3 = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Config");
-    lv_obj_t* t4 = lv_tabview_add_tab(tv, LV_SYMBOL_LIST     " Logs");
+    tab_status = lv_tabview_add_tab(tv, LV_SYMBOL_HOME " Status");
+    tab_pulse = lv_tabview_add_tab(tv, LV_SYMBOL_CHARGE " Pulse");
+    tab_presets = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Presets");
+    tab_config = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Config");
+    tab_logs = lv_tabview_add_tab(tv, LV_SYMBOL_BELL " Logs");
 
-    build_status_tab(t0);
-    build_pulse_tab(t1);
-    build_placeholder_tab(t2, "Presets");
-    build_config_tab(t3);
-    build_placeholder_tab(t4, "Logs");
+    // Build all tab contents now that tab objects exist
+    build_status_tab(tab_status);
+    build_pulse_tab(tab_pulse);
+    build_placeholder_tab(tab_presets, "Presets");
+    build_config_tab(tab_config);
+    build_placeholder_tab(tab_logs, "Logs");
 
     // Apply initial step sizes to spinboxes
     apply_time_step_to_spinboxes();
 
     // Post-build: disable scrolling/gesture on tab containers
-    lv_obj_clear_flag(t0, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-    lv_obj_clear_flag(t0, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_status, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_clear_flag(tab_status, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
-    // Pulse tab: no scrolling at all to prevent shudder
-    lv_obj_clear_flag(t1, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(t1, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
-    lv_obj_clear_flag(t1, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_set_scrollbar_mode(t1, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(tab_pulse, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_pulse, LV_OBJ_FLAG_SCROLL_CHAIN_HOR);
+    lv_obj_clear_flag(tab_pulse, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_set_scrollbar_mode(tab_pulse, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_clear_flag(t2, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(t2, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    // Config tab (t3) is scrollable – do NOT clear LV_OBJ_FLAG_SCROLLABLE
-    lv_obj_clear_flag(t3, LV_OBJ_FLAG_GESTURE_BUBBLE);
-    lv_obj_clear_flag(t4, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(t4, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_presets, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_presets, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_GESTURE_BUBBLE);
+
+    lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_GESTURE_BUBBLE);
+}
+
+// ====
+// PUBLIC: ui_mark_settings_applied – Force draft = applied, clear dirty
+// Called from main.cpp after boot config is sent and confirmed by STM32.
+// ====
+void ui_mark_settings_applied() {
+    // Copy applied -> draft
+    draft_mode = applied_mode;
+    draft_d1 = applied_d1;
+    draft_gap1 = applied_gap1;
+    draft_d2 = applied_d2;
+    draft_gap2 = applied_gap2;
+    draft_d3 = applied_d3;
+    draft_power = applied_power;
+    draft_preheat_en = applied_preheat_en;
+    draft_preheat_ms = applied_preheat_ms;
+    draft_preheat_pct = applied_preheat_pct;
+    draft_preheat_gap = applied_preheat_gap;
+
+    // Update spinbox widgets
+    if (spin_d1) lv_spinbox_set_value(spin_d1, (int32_t)draft_d1);
+    if (spin_gap1) lv_spinbox_set_value(spin_gap1, (int32_t)draft_gap1);
+    if (spin_d2) lv_spinbox_set_value(spin_d2, (int32_t)draft_d2);
+    if (spin_gap2) lv_spinbox_set_value(spin_gap2, (int32_t)draft_gap2);
+    if (spin_d3) lv_spinbox_set_value(spin_d3, (int32_t)draft_d3);
+    if (spin_ph_ms) lv_spinbox_set_value(spin_ph_ms, (int32_t)draft_preheat_ms);
+    if (spin_ph_pct)
+        lv_spinbox_set_value(spin_ph_pct, (int32_t)draft_preheat_pct);
+    if (spin_ph_gap)
+        lv_spinbox_set_value(spin_ph_gap, (int32_t)draft_preheat_gap);
+
+    // Clear dirty and trigger UI refresh
+    draft_dirty = false;
+    _ui_dirty = true;
+
+    Serial.println("[UI] Settings marked as applied (draft synced)");
 }
 
 // ============================================================
 // PUBLIC: ui_has_pending_changes
 // ============================================================
-bool ui_has_pending_changes() {
-    return draft_dirty;
-}
+bool ui_has_pending_changes() { return draft_dirty; }
 
 // ============================================================
 // PUBLIC: ui_update – Touch-aware with anti-shudder gating
@@ -1637,7 +1826,7 @@ void ui_update(const WelderDisplayState& st) {
     // Use a reduced refresh rate for 300ms to let it finish cleanly.
     uint32_t interval = 100;  // 10 Hz default
     if (now - _touch_release_ms < 300) {
-        interval = 250;       // 4 Hz briefly after release
+        interval = 250;  // 4 Hz briefly after release
     }
     if (now - last_ms < interval) return;
     last_ms = now;
@@ -1646,30 +1835,32 @@ void ui_update(const WelderDisplayState& st) {
     sync_applied_from_state(st);
 
     // ---- Lock/unlock Pulse tab based on armed state ----
-    // Removed: allow recipe editing while armed (draft/apply model still enforced)
-    // lock_pulse_tab(st.armed);
+    // Removed: allow recipe editing while armed (draft/apply model still
+    // enforced) lock_pulse_tab(st.armed);
 
     // ---- Change-detection state (static across calls) ----
-    static float    prev_pack_v   = -999.0f;
-    static float    prev_temp     = -999.0f;
-    static bool     prev_temp_fin = false;
-    static float    prev_ichg     = -999.0f;
-    static float    prev_cell1    = -999.0f;
-    static float    prev_cell2    = -999.0f;
-    static float    prev_cell3    = -999.0f;
-    static bool     prev_armed    = false;
-    static bool     prev_welding  = false;
-    static bool     prev_charging = false;
-    static bool     first_run     = true;
+    static float prev_pack_v = -999.0f;
+    static float prev_temp = -999.0f;
+    static bool prev_temp_fin = false;
+    static float prev_ichg = -999.0f;
+    static float prev_cell1 = -999.0f;
+    static float prev_cell2 = -999.0f;
+    static float prev_cell3 = -999.0f;
+    static bool prev_armed = false;
+    static bool prev_welding = false;
+    static bool prev_charging = false;
+    static bool first_run = true;
 
     char buf[32];
 
     // ---- Pack Voltage ----
-    if (lbl_pack_v && (first_run || fabsf(st.pack_voltage - prev_pack_v) >= 0.01f)) {
+    if (lbl_pack_v &&
+        (first_run || fabsf(st.pack_voltage - prev_pack_v) >= 0.01f)) {
         snprintf(buf, sizeof(buf), "%.2f V", (double)st.pack_voltage);
         lv_label_set_text(lbl_pack_v, buf);
-        lv_color_t c = (st.pack_voltage < 8.0f) ? C_RED :
-                       (st.pack_voltage > 9.0f) ? C_YELLOW : C_GREEN;
+        lv_color_t c = (st.pack_voltage < 8.0f)   ? C_RED
+                       : (st.pack_voltage > 9.0f) ? C_YELLOW
+                                                  : C_GREEN;
         lv_obj_set_style_text_color(lbl_pack_v, c, LV_PART_MAIN);
         prev_pack_v = st.pack_voltage;
     }
@@ -1680,7 +1871,10 @@ void ui_update(const WelderDisplayState& st) {
         if (lbl_temp && (first_run || fin != prev_temp_fin ||
                          (fin && fabsf(st.temperature - prev_temp) >= 0.05f))) {
             if (fin) {
-                snprintf(buf, sizeof(buf), "%.1f \xC2\xB0""C", (double)st.temperature);
+                snprintf(buf, sizeof(buf),
+                         "%.1f \xC2\xB0"
+                         "C",
+                         (double)st.temperature);
                 lv_label_set_text(lbl_temp, buf);
                 lv_color_t c = (st.temperature > 50.0f) ? C_RED : C_GREEN;
                 lv_obj_set_style_text_color(lbl_temp, c, LV_PART_MAIN);
@@ -1688,13 +1882,14 @@ void ui_update(const WelderDisplayState& st) {
                 lv_label_set_text(lbl_temp, "ERR");
                 lv_obj_set_style_text_color(lbl_temp, C_RED, LV_PART_MAIN);
             }
-            prev_temp     = st.temperature;
+            prev_temp = st.temperature;
             prev_temp_fin = fin;
         }
     }
 
     // ---- Charger Current ----
-    if (lbl_ichg && (first_run || fabsf(st.charger_current - prev_ichg) >= 0.01f)) {
+    if (lbl_ichg &&
+        (first_run || fabsf(st.charger_current - prev_ichg) >= 0.01f)) {
         snprintf(buf, sizeof(buf), "%.2f A", (double)st.charger_current);
         lv_label_set_text(lbl_ichg, buf);
         prev_ichg = st.charger_current;
@@ -1747,24 +1942,28 @@ void ui_update(const WelderDisplayState& st) {
     }
 
     // ---- State label (hidden but still tracked for internal state) ----
-    if (arm_changed ||
-        st.welding != prev_welding || st.charging != prev_charging) {
+    if (arm_changed || st.welding != prev_welding ||
+        st.charging != prev_charging) {
         if (lbl_state) {
             const char* txt;
             lv_color_t col;
             if (!st.armed) {
-                txt = "DISARMED"; col = C_RED;
+                txt = "DISARMED";
+                col = C_RED;
             } else if (st.welding) {
-                txt = "WELDING";  col = C_YELLOW;
+                txt = "WELDING";
+                col = C_YELLOW;
             } else if (st.charging) {
-                txt = "CHARGING"; col = C_ACCENT;
+                txt = "CHARGING";
+                col = C_ACCENT;
             } else {
-                txt = "IDLE";     col = C_GREEN;
+                txt = "IDLE";
+                col = C_GREEN;
             }
             lv_label_set_text(lbl_state, txt);
             lv_obj_set_style_text_color(lbl_state, col, LV_PART_MAIN);
         }
-        prev_welding  = st.welding;
+        prev_welding = st.welding;
         prev_charging = st.charging;
     }
 
@@ -1779,14 +1978,16 @@ void ui_update(const WelderDisplayState& st) {
 
         update_draft_dirty();
 
-        bool need_refresh = _ui_dirty || (draft_dirty != prev_dirty) || first_run;
+        bool need_refresh =
+            _ui_dirty || (draft_dirty != prev_dirty) || first_run;
 
         if (need_refresh) {
             // Mode buttons: repaint selection
             for (int i = 0; i < 3; i++) {
                 if (!btn_mode[i]) continue;
                 bool sel = ((int)draft_mode == i + 1);
-                lv_obj_set_style_bg_color(btn_mode[i], sel ? C_ACCENT : C_DARK_GREY, 0);
+                lv_obj_set_style_bg_color(btn_mode[i],
+                                          sel ? C_ACCENT : C_DARK_GREY, 0);
             }
 
             // Field visibility based on mode
@@ -1794,6 +1995,30 @@ void ui_update(const WelderDisplayState& st) {
                 update_pulse_field_visibility();
                 prev_pulse_mode = draft_mode;
             }
+
+            // Sync spinbox widgets to current draft values
+            // (guards prevent unnecessary redraws – anti-flicker safe)
+            if (spin_d1 && lv_spinbox_get_value(spin_d1) != (int32_t)draft_d1)
+                lv_spinbox_set_value(spin_d1, (int32_t)draft_d1);
+            if (spin_gap1 &&
+                lv_spinbox_get_value(spin_gap1) != (int32_t)draft_gap1)
+                lv_spinbox_set_value(spin_gap1, (int32_t)draft_gap1);
+            if (spin_d2 && lv_spinbox_get_value(spin_d2) != (int32_t)draft_d2)
+                lv_spinbox_set_value(spin_d2, (int32_t)draft_d2);
+            if (spin_gap2 &&
+                lv_spinbox_get_value(spin_gap2) != (int32_t)draft_gap2)
+                lv_spinbox_set_value(spin_gap2, (int32_t)draft_gap2);
+            if (spin_d3 && lv_spinbox_get_value(spin_d3) != (int32_t)draft_d3)
+                lv_spinbox_set_value(spin_d3, (int32_t)draft_d3);
+            if (spin_ph_ms &&
+                lv_spinbox_get_value(spin_ph_ms) != (int32_t)draft_preheat_ms)
+                lv_spinbox_set_value(spin_ph_ms, (int32_t)draft_preheat_ms);
+            if (spin_ph_pct &&
+                lv_spinbox_get_value(spin_ph_pct) != (int32_t)draft_preheat_pct)
+                lv_spinbox_set_value(spin_ph_pct, (int32_t)draft_preheat_pct);
+            if (spin_ph_gap &&
+                lv_spinbox_get_value(spin_ph_gap) != (int32_t)draft_preheat_gap)
+                lv_spinbox_set_value(spin_ph_gap, (int32_t)draft_preheat_gap);
 
             // Power value label
             if (lbl_power_val && draft_power != prev_pulse_power) {
@@ -1805,8 +2030,8 @@ void ui_update(const WelderDisplayState& st) {
 
             // Preheat toggle visual
             if (btn_preheat) {
-                lv_obj_set_style_bg_color(btn_preheat,
-                    draft_preheat_en ? C_GREEN : C_DARK_GREY, 0);
+                lv_obj_set_style_bg_color(
+                    btn_preheat, draft_preheat_en ? C_GREEN : C_DARK_GREY, 0);
             }
             if (lbl_preheat) {
                 lv_label_set_text(lbl_preheat, draft_preheat_en ? "ON" : "OFF");
@@ -1819,13 +2044,14 @@ void ui_update(const WelderDisplayState& st) {
             // APPLY button color: green=synced, red=pending
             if (btn_apply) {
                 lv_obj_set_style_bg_color(btn_apply,
-                    draft_dirty ? C_RED : C_GREEN, 0);
+                                          draft_dirty ? C_RED : C_GREEN, 0);
             }
 
             // Pending label
             if (lbl_pending) {
                 if (draft_dirty) {
-                    lv_label_set_text(lbl_pending, LV_SYMBOL_WARNING " Changes pending");
+                    lv_label_set_text(lbl_pending,
+                                      LV_SYMBOL_WARNING " Changes pending");
                     lv_obj_clear_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
                 } else {
                     lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
@@ -1843,6 +2069,7 @@ void ui_update(const WelderDisplayState& st) {
     }
 
     first_run = false;
+
 }
 
 // ============================================================

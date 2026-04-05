@@ -12,6 +12,8 @@ static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_I2C1_Init(void);
+static void i2c_bus_recovery(void);
 
 static void uartSend(const char* s);
 static inline void pwmOff(void);
@@ -31,6 +33,20 @@ static float readThermistor(void);
 static float readCapVoltage(void);
 static bool contactDetected(void);
 
+/* NEW: Shunt Sensing Forward Decl */
+static uint32_t adcReadFast(uint32_t channel);
+static float capturePulseAmps(uint16_t ms);
+
+/* NEW: INA226 Forward Decl */
+static bool ina226_write_reg(uint8_t addr, uint8_t reg, uint16_t val);
+static bool ina226_read_reg(uint8_t addr, uint8_t reg, uint16_t* val);
+static bool ina226_read_bus_voltage(uint8_t addr, float* voltage);
+static bool ina226_read_shunt_current(uint8_t addr, float* current);
+static bool ina226_health_check(void);
+static void ina226_read_all(void);
+static void chargerStateMachine(void);
+static void sendStatusPacket(void);
+
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
 #define WELD_TIM_CH TIM_CHANNEL_1
@@ -42,6 +58,13 @@ static bool contactDetected(void);
 #define CONTACT_PORT GPIOA
 #define CONTACT_PIN GPIO_PIN_6
 
+/* NEW: Charger enable pin */
+#define CHARGER_EN_PORT GPIOB
+#define CHARGER_EN_PIN GPIO_PIN_2
+
+/* ============ Billet Shunt Calibration (0.3885" @ 15mm) ============ */
+#define AMPS_PER_ADC_STEP 0.1093f  // Calibrated scaling factor for your billet
+
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
 #define THERM_NOMINAL_R 10000.0f
@@ -50,6 +73,31 @@ static bool contactDetected(void);
 #define THERM_OFFSET_C 0.0f
 
 #define V_CAP_DIVIDER 8.47f
+
+/* ============ INA226 Addresses ============ */
+#define INA226_ADDR_PACK 0x40
+#define INA226_ADDR_NODE1 0x41
+#define INA226_ADDR_NODE2 0x44
+
+/* ============ INA226 Registers ============ */
+#define INA226_REG_CONFIG 0x00
+#define INA226_REG_SHUNT_V 0x01
+#define INA226_REG_BUS_V 0x02
+#define INA226_REG_CALIBRATION 0x05
+
+/* ============ INA226 Shunt Resistor ============ */
+#define INA226_SHUNT_R 0.0002f /* 200 µΩ */
+/* Rev1 charge current correction factor (matches ESP32 value) */
+#define CHARGE_CURRENT_CORRECTION 1.0f
+
+/* ============ Charger Thresholds (INA226 ONLY) ============ */
+#define CHG_VPACK_ON 8.7f  /* Turn charger ON below this */
+#define CHG_VPACK_OFF 9.07f /* Turn charger OFF at/above this */
+
+/* ============ INA226 Scaling ============ */
+#define V_NODE1_SCALE 1.000f
+#define V_NODE2_SCALE 0.9860f
+#define VPACK_SCALE 1.000f
 
 /* ============ Limits / Timing ============ */
 static const uint32_t WELD_COOLDOWN_MS = 500;
@@ -68,6 +116,7 @@ static const uint32_t TIM1_ARR = 16999;
 UART_HandleTypeDef huart1;
 TIM_HandleTypeDef htim1;
 ADC_HandleTypeDef hadc1;
+I2C_HandleTypeDef hi2c1;
 
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;
@@ -86,7 +135,8 @@ static volatile uint16_t preheat_gap_ms = 3;
 /* ============ Trigger Settings ============ */
 static volatile uint8_t trigger_mode = 1;        // 1 = pedal, 2 = contact
 static volatile uint8_t contact_hold_steps = 2;  // each step = 500 ms
-static volatile uint8_t contact_with_pedal = 1;  // 1 = require contact in pedal mode (safe default)
+static volatile uint8_t contact_with_pedal =
+    1;  // 1 = require contact in pedal mode (safe default)
 
 /* ============ State ============ */
 static volatile bool welding_now = false;
@@ -104,11 +154,31 @@ static GPIO_PinState pedal_stable = GPIO_PIN_SET;
 static uint32_t pedal_last_change_ms = 0;
 
 static float temp_filtered_c = 25.0f;
+static float current_peak_amps = 0.0f;  // Track peak of recipe
+
+/* Added calibration capture values */
+static float cal_vcap_before = 0.0f;
+static float cal_vcap_after = 0.0f;
+static uint32_t cal_adc_peak_raw = 0;
+static float cal_current_avg = 0.0f;
 
 /* ============ Contact trigger state ============ */
 static bool contact_hold_active = false;
 static uint32_t contact_hold_start_ms = 0;
 static bool contact_fire_lock = false;
+
+/* ============ INA226 state (CONTROL SYSTEM) ============ */
+static volatile bool ina226_ok = false;
+static float ina_vpack = 0.0f;
+static float vlow = 0.0f;      /* TAP_LOW  (0x41) – bottom of stack */
+static float vmid = 0.0f;      /* TAP_MID  (0x44) – middle tap      */
+static float ina_cell1 = 0.0f; /* Bottom cell: vlow                  */
+static float ina_cell2 = 0.0f; /* Middle cell: vmid - vlow           */
+static float ina_cell3 = 0.0f; /* Top cell:    vpack - vmid          */
+static float ina_ichg = 0.0f;
+
+/* ============ Charger state ============ */
+static bool charger_enabled = false;
 
 /* ============ UART RX Buffer ============ */
 #define RX_LINE_MAX 128
@@ -123,6 +193,201 @@ static volatile bool rx_line_ready = false;
 static volatile uint32_t uart_rx_bytes = 0;
 static volatile uint32_t uart_rx_errors = 0;
 static volatile uint32_t uart_rx_overruns = 0;
+
+/* ============ INA226 Bare-Metal I2C Driver ============ */
+
+static bool ina226_write_reg(uint8_t addr, uint8_t reg, uint16_t val) {
+    uint8_t data[2];
+    data[0] = (val >> 8) & 0xFF;
+    data[1] = val & 0xFF;
+    HAL_StatusTypeDef st = HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(addr << 1), reg,
+                                             I2C_MEMADD_SIZE_8BIT, data, 2, 10);
+    return (st == HAL_OK);
+}
+
+static bool ina226_read_reg(uint8_t addr, uint8_t reg, uint16_t* val) {
+    uint8_t data[2];
+    HAL_StatusTypeDef st = HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(addr << 1), reg,
+                                            I2C_MEMADD_SIZE_8BIT, data, 2, 10);
+    if (st != HAL_OK) return false;
+    *val = ((uint16_t)data[0] << 8) | data[1];
+    return true;
+}
+
+static bool ina226_read_bus_voltage(uint8_t addr, float* voltage) {
+    uint16_t raw;
+    if (!ina226_read_reg(addr, INA226_REG_BUS_V, &raw)) return false;
+    *voltage = raw * 0.00125f; /* 1.25 mV/bit */
+    return true;
+}
+
+static bool ina226_read_shunt_current(uint8_t addr, float* current) {
+    uint16_t raw;
+    if (!ina226_read_reg(addr, INA226_REG_SHUNT_V, &raw)) return false;
+    int16_t signed_raw = (int16_t)raw;
+    float shunt_voltage_v = signed_raw * 0.0000025f; /* 2.5 µV/bit */
+    float calculated_current = shunt_voltage_v / INA226_SHUNT_R;
+    *current = (-calculated_current) * CHARGE_CURRENT_CORRECTION;
+    if (fabsf(*current) < 0.05f) *current = 0.0f;
+    if (fabsf(*current) > 50.0f) *current = 0.0f;
+    return true;
+}
+
+static bool ina226_health_check(void) {
+    /* Verify all three sensors respond using HAL_I2C_IsDeviceReady (3 trials,
+     * 10ms) */
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(INA226_ADDR_PACK << 1), 3,
+                              10) != HAL_OK)
+        return false;
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(INA226_ADDR_NODE1 << 1), 3,
+                              10) != HAL_OK)
+        return false;
+    if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(INA226_ADDR_NODE2 << 1), 3,
+                              10) != HAL_OK)
+        return false;
+    return true;
+}
+
+static void ina226_read_all(void) {
+    /* Step 1: Verify all three sensors are present on the bus */
+    if (!ina226_health_check()) {
+        ina226_ok = false;
+        /* Safety: disable charger if any sensor missing */
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+        return;
+    }
+
+    float vp = 0, vl = 0, vm = 0, ichg = 0;
+    bool ok = true;
+
+    if (!ina226_read_bus_voltage(INA226_ADDR_PACK, &vp)) ok = false;
+    if (!ina226_read_bus_voltage(INA226_ADDR_NODE1, &vl)) ok = false;
+    if (!ina226_read_bus_voltage(INA226_ADDR_NODE2, &vm)) ok = false;
+    if (!ina226_read_shunt_current(INA226_ADDR_PACK, &ichg)) ok = false;
+
+    ina226_ok = ok;
+
+    if (!ok) {
+        /* Safety: disable charger on read failure */
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+        return;
+    }
+
+    ina_vpack = vp * VPACK_SCALE;
+    vlow = vl * V_NODE1_SCALE;
+    vmid = vm * V_NODE2_SCALE;
+
+    /* Correct cell voltage math:
+     * [Pack-] ── Cell_Bot ── (vlow/0x41) ── Cell_Mid ── (vmid/0x44) ── Cell_Top
+     * ── [Pack+]
+     */
+    ina_cell1 = vlow;             /* Bottom cell */
+    ina_cell2 = vmid - vlow;      /* Middle cell */
+    ina_cell3 = ina_vpack - vmid; /* Top cell    */
+
+    ina_ichg = ichg;
+}
+
+/* ============ Charger State Machine (INA226 ONLY) ============ */
+
+static void chargerStateMachine(void) {
+    /* SAFETY: INA226 failure → charger OFF */
+    if (!ina226_ok) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+        return;
+    }
+
+    /* DISARMED → charger OFF */
+    if (!armed) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+        return;
+    }
+
+    /* WELDING → charger OFF */
+    if (welding_now) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+        return;
+    }
+
+    /* ARMED: hysteresis control using INA226 ina_vpack */
+    if (ina_vpack >= CHG_VPACK_OFF) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+        charger_enabled = false;
+    } else if (ina_vpack <= CHG_VPACK_ON) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_SET);
+        charger_enabled = true;
+    }
+    /* Between CHG_VPACK_ON and CHG_VPACK_OFF: maintain current state */
+}
+
+/* ============ UART Status Packets (split into two for ESP32 parsing)
+ * ============ */
+
+static void sendStatusPacket(void) {
+    char buf[192];
+
+    /* --- Packet 1: STATUS (system state, ADC-based diagnostics) --- */
+    float vcap = readCapVoltage();
+    float power_f = (float)weld_power_pct;
+    snprintf(buf, sizeof(buf),
+             "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
+             "temp=%.2f,mode=%d,power=%.2f",
+             armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
+             temp_filtered_c, (int)weld_mode, power_f);
+    uartSend(buf);
+
+    /* --- Packet 2: STATUS2 (INA226 telemetry) --- */
+    snprintf(buf, sizeof(buf),
+             "STATUS2,ina_ok=%d,chg_en=%d,vpack=%.2f,vlow=%.2f,"
+             "vmid=%.2f,cell1=%.2f,cell2=%.2f,cell3=%.2f,ichg=%.2f",
+             ina226_ok ? 1 : 0, charger_enabled ? 1 : 0, ina_vpack, vlow, vmid,
+             ina_cell1, ina_cell2, ina_cell3, ina_ichg);
+    uartSend(buf);
+}
+
+/* ============ Shunt Sensing Functions ============ */
+static uint32_t adcReadFast(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_6CYCLES_5;  // Speed for pulses
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return 0xFFFF;
+    HAL_ADC_Start(&hadc1);
+    if (HAL_ADC_PollForConversion(&hadc1, 1) != HAL_OK) {
+        HAL_ADC_Stop(&hadc1);
+        return 0xFFFF;
+    }
+    uint32_t val = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return val;
+}
+
+static float capturePulseAmps(uint16_t ms) {
+    uint32_t peak_raw = 0;
+    uint32_t start = HAL_GetTick();
+
+    while ((HAL_GetTick() - start) < ms) {
+        uint32_t p = adcReadFast(ADC_CHANNEL_2);  // Adjust channel to wiring
+        uint32_t n = adcReadFast(ADC_CHANNEL_3);  // Adjust channel to wiring
+        if (p != 0xFFFF && n != 0xFFFF) {
+            int32_t diff = (int32_t)p - (int32_t)n;
+            uint32_t abs_diff = (diff < 0) ? -diff : (uint32_t)diff;
+            if (abs_diff > peak_raw) peak_raw = abs_diff;
+        }
+    }
+
+    cal_adc_peak_raw = peak_raw;
+
+    float pulse_peak = (float)peak_raw * AMPS_PER_ADC_STEP;
+    if (pulse_peak > current_peak_amps) current_peak_amps = pulse_peak;
+    return pulse_peak;
+}
 
 /* ============ Helpers ============ */
 static void uartSend(const char* s) {
@@ -214,7 +479,7 @@ static void doPulseMsPwm(uint16_t ms, uint16_t duty) {
     if (ms > MAX_WELD_MS) ms = MAX_WELD_MS;
 
     pwmOnDuty(duty);
-    delayMsExact(ms);
+    capturePulseAmps(ms);  // Measure while FET is on
     pwmOff();
 }
 
@@ -242,10 +507,11 @@ static void fireRecipe(void) {
         return;
     }
 
-    /* Contact check logic:
-     * - trigger_mode 2 (contact/probe): always require contact (existing behavior)
-     * - trigger_mode 1 (pedal): only require contact if contact_with_pedal == 1
-     */
+    if (temp_filtered_c > 65.0f) {
+        uartSend("DENY,OVERHEAT");
+        return;
+    }
+
     {
         bool need_contact = true;
         if (trigger_mode == 1 && contact_with_pedal == 0) {
@@ -273,7 +539,21 @@ static void fireRecipe(void) {
 
     clampParams();
 
+    /* === WELD SEQUENCE (modified per refactor plan) === */
+
+    /* Step 1: Disable charger */
+    HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+    charger_enabled = false;
+
+    /* Step 2: Wait 50ms for charger to settle */
+    HAL_Delay(50);
+
     welding_now = true;
+    current_peak_amps = 0.0f;
+
+    /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
+    cal_vcap_before = readCapVoltage();
+
     uartSend("EVENT,WELD_START");
 
     pwmOff();
@@ -281,6 +561,7 @@ static void fireRecipe(void) {
 
     uint32_t t0 = HAL_GetTick();
 
+    /* === Execute weld pulse (HRTIM/PWM code UNTOUCHED) === */
     if (preheat_enabled && preheat_ms > 0) {
         doPulseMsPwm(preheat_ms, pctToDuty(preheat_pct));
         if (preheat_gap_ms > 0) {
@@ -309,15 +590,42 @@ static void fireRecipe(void) {
     welding_now = false;
     last_weld_ms = HAL_GetTick();
 
+    /* Step 5: Wait 50ms post-weld */
+    HAL_Delay(50);
+
+    /* Step 6: ADC diagnostic snapshot AFTER weld (diagnostic only) */
+    cal_vcap_after = readCapVoltage();
+
+    float cap_F = 666.0f;
+    float delta_v = cal_vcap_before - cal_vcap_after;
+    float time_s = total_ms / 1000.0f;
+
+    if (time_s > 0.0f && delta_v > 0.0f) {
+        cal_current_avg = cap_F * (delta_v / time_s);
+    } else {
+        cal_current_avg = 0.0f;
+    }
+
     char buf[256];
     snprintf(buf, sizeof(buf),
              "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
-             "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,preheat_pct=%d,"
-             "preheat_gap_ms=%d",
+             "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
+             "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
+             "calc_i=%.1f",
              (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
              weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
-             preheat_enabled ? 1 : 0, preheat_ms, preheat_pct, preheat_gap_ms);
+             preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
+             (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
+             delta_v, cal_current_avg);
     uartSend(buf);
+
+    /* Step 7: Re-enable charger if ARMED and INA226 says voltage is low */
+    /* Uses INA226 ina_vpack – read fresh value now */
+    ina226_read_all();
+    if (armed && ina226_ok && ina_vpack <= CHG_VPACK_OFF) {
+        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_SET);
+        charger_enabled = true;
+    }
 }
 
 static void SystemClock_Config(void) {
@@ -398,6 +706,18 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* NEW: PB2 = CHARGER_EN output, default LOW (charger disabled) */
+    GPIO_InitStruct.Pin = CHARGER_EN_PIN;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(CHARGER_EN_PORT, &GPIO_InitStruct);
+    HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+
+    /* I2C1 pins: PA15 = SCL, PB7 = SDA (configured in MX_I2C1_Init)
+     * Changed from PB8/PB9 which interfered with DFU boot.
+     * PA14 (SWCLK) avoided – SWD pull-down conflicts with I2C SDA. */
 }
 
 static void MX_USART1_UART_Init(void) {
@@ -477,6 +797,114 @@ static void MX_ADC1_Init(void) {
     }
 
     HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+}
+
+/**
+ * @brief I2C bus recovery – unstick hung I2C devices.
+ * Toggles SCL 9 times with SDA released to complete any partial transaction.
+ * Must be called BEFORE MX_I2C1_Init() to clear stuck bus conditions.
+ *
+ * Pins: PA15 = I2C1_SCL, PB7 = I2C1_SDA
+ */
+static void i2c_bus_recovery(void) {
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    /* Configure PA15 (SCL) as open-drain output */
+    GPIO_InitStruct.Pin = GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* Configure PB7 (SDA) as open-drain output */
+    GPIO_InitStruct.Pin = GPIO_PIN_7;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    /* Release SDA high */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);
+
+    /* Toggle SCL 9 times to unstick any hung device */
+    for (int i = 0; i < 9; i++) {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET); /* SCL low  */
+        HAL_Delay(1);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);   /* SCL high */
+        HAL_Delay(1);
+    }
+
+    /* Generate STOP condition: SDA low → SCL high → SDA high */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);  /* SDA low  */
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);    /* SCL high */
+    HAL_Delay(1);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);     /* SDA high */
+    HAL_Delay(1);
+
+    /* Reconfigure PA15 as I2C1_SCL alternate function (AF4) */
+    GPIO_InitStruct.Pin = GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* Reconfigure PB7 as I2C1_SDA alternate function (AF4) */
+    GPIO_InitStruct.Pin = GPIO_PIN_7;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+}
+
+/**
+ * @brief I2C1 initialization for INA226 sensors – graceful error handling.
+ *
+ * Pins: PA15 = I2C1_SCL (AF4), PB7 = I2C1_SDA (AF4)
+ * Changed from PB8/PB9 (DFU boot conflict) and PA14 (SWCLK conflict).
+ * On failure, sets ina226_ok = false and returns – does NOT hang.
+ */
+static void MX_I2C1_Init(void) {
+    __HAL_RCC_I2C1_CLK_ENABLE();
+
+    /* Configure PA15 = I2C1_SCL */
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_OD;
+    GPIO_InitStruct.Pull = GPIO_PULLUP;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /* Configure PB7 = I2C1_SDA */
+    GPIO_InitStruct.Pin = GPIO_PIN_7;
+    GPIO_InitStruct.Alternate = GPIO_AF4_I2C1;
+    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.Timing = 0x10909CEC; /* 100kHz @ 170MHz PCLK1 (validated) */
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.OwnAddress2Masks = I2C_OA2_NOMASK;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK) {
+        /* Graceful failure – set flag and return, do NOT hang */
+        ina226_ok = false;
+        return;
+    }
+
+    /* Configure analog filter */
+    if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) !=
+        HAL_OK) {
+        ina226_ok = false;
+        return;
+    }
+
+    /* Configure digital filter */
+    if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) {
+        ina226_ok = false;
+        return;
+    }
 }
 
 static uint32_t adcReadChannel(uint32_t channel) {
@@ -580,8 +1008,6 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 static void parseCommand(char* line) {
     char response[256];
 
-    // Skip empty or whitespace-only lines silently (no ERR response).
-    // This prevents spurious ERR,UNKNOWN_CMD from flush bytes or line noise.
     {
         char* p = line;
         while (*p == ' ' || *p == '\t') p++;
@@ -743,30 +1169,13 @@ static void parseCommand(char* line) {
     }
 
     if (strcmp(line, "STATUS") == 0 || strcmp(line, "CMD,STATUS") == 0) {
-        int32_t cd =
-            (int32_t)WELD_COOLDOWN_MS - (int32_t)(HAL_GetTick() - last_weld_ms);
-        if (cd < 0) cd = 0;
-
-        float vcap = readCapVoltage();
-
-        snprintf(
-            response, sizeof(response),
-            "STATUS,armed=%d,ready=%d,contact=%d,cooldown_ms=%ld,welding=%d,"
-            "mode=%d,power_pct=%d,preheat_en=%d,temp=%.1f,vcap=%.2f,"
-            "trigger_mode=%d,contact_hold_steps=%d,contact_raw=%d,pa6=%d,"
-            "contact_with_pedal=%d",
-            armed ? 1 : 0, system_ready ? 1 : 0, contactDetected() ? 1 : 0,
-            (long)cd, welding_now ? 1 : 0, weld_mode, weld_power_pct,
-            preheat_enabled ? 1 : 0, temp_filtered_c, vcap, trigger_mode,
-            contact_hold_steps, contactDetected() ? 1 : 0,
-            (HAL_GPIO_ReadPin(CONTACT_PORT, CONTACT_PIN) == GPIO_PIN_SET) ? 1
-                                                                          : 0,
-            (int)contact_with_pedal);
-        uartSend(response);
+        /* Send both STATUS and STATUS2 packets on demand */
+        sendStatusPacket();
         return;
     }
 
-    uartSend("ERR,UNKNOWN_CMD");
+    snprintf(response, sizeof(response), "ERR,UNKNOWN_CMD,rx=%s", line);
+    uartSend(response);
 }
 
 static void pollPedal(void) {
@@ -837,14 +1246,21 @@ int main(void) {
 
     MX_GPIO_Init();
 
+    /* 100ms delay for INA226 power rail stabilization */
+    HAL_Delay(100);
+
     for (int i = 0; i < 3; i++) {
         HAL_GPIO_TogglePin(LED_PORT, LED_PIN);
         HAL_Delay(80);
     }
 
+    /* I2C bus recovery before initialization – unstick any hung devices */
+    i2c_bus_recovery();
+
+    MX_I2C1_Init(); /* I2C1 for INA226 sensors – graceful, no hang */
     MX_USART1_UART_Init();
-    MX_TIM1_Init();
     MX_ADC1_Init();
+    MX_TIM1_Init();
 
     HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
     pwmOff();
@@ -855,6 +1271,35 @@ int main(void) {
     pedal_last_raw = r;
     pedal_stable = r;
     pedal_last_change_ms = boot_ms;
+
+    /* NEW: Initialize INA226 sensors */
+    {
+        /* INA226 0x40 (pack): reset + configure */
+        ina226_write_reg(INA226_ADDR_PACK, INA226_REG_CONFIG, 0x8000);
+        HAL_Delay(20);
+        /* CONFIG: AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, MODE=cont shunt+bus */
+        uint16_t ina_config = (0x02 << 9) | (0x04 << 6) | (0x04 << 3) | 0x07;
+        ina226_write_reg(INA226_ADDR_PACK, INA226_REG_CONFIG, ina_config);
+        HAL_Delay(10);
+        /* Calibration register (same as ESP32 used) */
+        ina226_write_reg(INA226_ADDR_PACK, INA226_REG_CALIBRATION, 41967);
+        HAL_Delay(10);
+
+        /* INA226 0x41 (node1): reset + configure (bus voltage only) */
+        ina226_write_reg(INA226_ADDR_NODE1, INA226_REG_CONFIG, 0x8000);
+        HAL_Delay(20);
+        ina226_write_reg(INA226_ADDR_NODE1, INA226_REG_CONFIG, ina_config);
+        HAL_Delay(10);
+
+        /* INA226 0x44 (node2): reset + configure (bus voltage only) */
+        ina226_write_reg(INA226_ADDR_NODE2, INA226_REG_CONFIG, 0x8000);
+        HAL_Delay(20);
+        ina226_write_reg(INA226_ADDR_NODE2, INA226_REG_CONFIG, ina_config);
+        HAL_Delay(10);
+
+        /* Initial read to populate values */
+        ina226_read_all();
+    }
 
     uartSend("BOOT,STM32G474_WELD_BRAIN_10KHZ_READY");
 
@@ -887,6 +1332,27 @@ int main(void) {
                 if (t > -50.0f && t < 200.0f) {
                     temp_filtered_c = (0.1f * t) + (0.9f * temp_filtered_c);
                 }
+            }
+        }
+
+        /* NEW: INA226 read + charger state machine @ ~100ms interval */
+        {
+            static uint32_t last_ina_ms = 0;
+            uint32_t now = HAL_GetTick();
+            if ((now - last_ina_ms) >= 100) {
+                last_ina_ms = now;
+                ina226_read_all();
+                chargerStateMachine();
+            }
+        }
+
+        /* Send STATUS + STATUS2 packets every 500ms */
+        {
+            static uint32_t last_chgstat_ms = 0;
+            uint32_t now = HAL_GetTick();
+            if ((now - last_chgstat_ms) >= 500) {
+                last_chgstat_ms = now;
+                sendStatusPacket();
             }
         }
 

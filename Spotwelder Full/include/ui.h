@@ -112,6 +112,12 @@ void ui_update(const WelderDisplayState& st);
 // Query whether Pulse tab has unsaved (draft ≠ applied) changes.
 bool ui_has_pending_changes();
 
+// Force-sync draft settings to match applied settings, clear dirty flag.
+// Call after boot config is echoed back from STM32 to prevent false
+// "unsaved changes" indicator.
+void ui_mark_settings_applied();
+
+
 // Notify the UI that a hardware-level touch is active.
 // Called from main.cpp based on the touch driver state machine.
 // When active, ui_update() will skip ALL label/widget updates to prevent
