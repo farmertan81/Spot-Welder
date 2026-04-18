@@ -12,6 +12,7 @@ static void MX_GPIO_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_TIM1_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
 static void i2c_bus_recovery(void);
 
@@ -29,8 +30,11 @@ static void parseCommand(char* line);
 static void pollPedal(void);
 static void pollContactTrigger(void);
 static uint32_t adcReadChannel(uint32_t channel);
+static uint32_t adcReadChannel2(uint32_t channel);
+static float measureVDDA(void);
 static float readThermistor(void);
 static float readCapVoltage(void);
+static bool contactDetectedRaw(float* out_vcap);
 static bool contactDetected(void);
 
 /* NEW: Shunt Sensing Forward Decl */
@@ -55,15 +59,17 @@ static void sendStatusPacket(void);
 #define LED_PORT GPIOC
 #define LED_PIN GPIO_PIN_6
 
-#define CONTACT_PORT GPIOA
-#define CONTACT_PIN GPIO_PIN_6
+/* Legacy PA6 contact input is intentionally not used anymore.
+ * Contact is now detected via AMC1311B capacitor voltage. */
 
 /* NEW: Charger enable pin */
 #define CHARGER_EN_PORT GPIOB
 #define CHARGER_EN_PIN GPIO_PIN_2
 
 /* ============ Billet Shunt Calibration (0.3885" @ 15mm) ============ */
-#define AMPS_PER_ADC_STEP 0.1093f  // Calibrated scaling factor for your billet
+/* Physical chain: Amps → µV across shunt → ×41 (AMC1302) → ADC counts */
+#define SHUNT_GAIN 8.2f          /* AMC1301 fixed gain                  */
+#define SHUNT_EFF_OHMS 0.000050f /* 50 µΩ effective shunt (calibrated) */
 
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
@@ -72,7 +78,7 @@ static void sendStatusPacket(void);
 #define THERM_BETA 3950.0f
 #define THERM_OFFSET_C 0.0f
 
-#define V_CAP_DIVIDER 8.47f
+#define V_CAP_DIVIDER 6.0f
 
 /* ============ INA226 Addresses ============ */
 #define INA226_ADDR_PACK 0x40
@@ -91,12 +97,12 @@ static void sendStatusPacket(void);
 #define CHARGE_CURRENT_CORRECTION 1.0f
 
 /* ============ Charger Thresholds (INA226 ONLY) ============ */
-#define CHG_VPACK_ON 8.7f  /* Turn charger ON below this */
+#define CHG_VPACK_ON 8.7f   /* Turn charger ON below this */
 #define CHG_VPACK_OFF 9.07f /* Turn charger OFF at/above this */
 
 /* ============ INA226 Scaling ============ */
-#define V_NODE1_SCALE 1.000f
-#define V_NODE2_SCALE 0.9860f
+#define V_NODE1_SCALE 0.9950f
+#define V_NODE2_SCALE 0.9835f
 #define VPACK_SCALE 1.000f
 
 /* ============ Limits / Timing ============ */
@@ -106,6 +112,9 @@ static const uint32_t PEDAL_DEBOUNCE_MS = 40;
 static const uint32_t BOOT_INHIBIT_MS = 5000;
 static const uint32_t ARM_TIMEOUT_MS = 0;
 static const uint32_t READY_TIMEOUT_MS = 1500;
+static const float CONTACT_THRESHOLD_V_DEFAULT = 1.5f;
+static const uint32_t CONTACT_SAMPLE_MS = 10;
+static const uint32_t CONTACT_DEBOUNCE_MS = 50;
 
 /* ============ PWM Settings ============ */
 static const uint16_t PWM_MAX = 1023;
@@ -116,7 +125,17 @@ static const uint32_t TIM1_ARR = 16999;
 UART_HandleTypeDef huart1;
 TIM_HandleTypeDef htim1;
 ADC_HandleTypeDef hadc1;
+ADC_HandleTypeDef hadc2;
 I2C_HandleTypeDef hi2c1;
+
+/* ==== VDDA Calibration ==== */
+/* STM32G474: Factory VREFINT cal was measured at VDDA = 3.0V (3000 mV).
+ * The HAL/LL headers may define VREFINT_CAL_VREF (in mV) and VREFINT_CAL_ADDR.
+ * We use our own names to avoid redefinition warnings/errors. */
+#define VREFINT_CAL_MV 3000UL /* Calibration VDDA in millivolts */
+#define VREFINT_CAL_PTR \
+    ((volatile uint16_t*)0x1FFF75AAUL) /* Factory cal value address    */
+static float measured_vdda = 3.3f; /* Updated periodically by measureVDDA() */
 
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;
@@ -167,6 +186,14 @@ static bool contact_hold_active = false;
 static uint32_t contact_hold_start_ms = 0;
 static bool contact_fire_lock = false;
 
+/* ==== Voltage-based contact detection state (AMC1311B vcap) ==== */
+static float g_contact_threshold_v = 1.5f;
+static bool g_contact_state = false;
+static bool g_contact_pending_high = false;
+static uint32_t g_contact_pending_since_ms = 0;
+static uint32_t g_contact_last_sample_ms = 0;
+static float g_contact_last_vcap = 0.0f;
+
 /* ============ INA226 state (CONTROL SYSTEM) ============ */
 static volatile bool ina226_ok = false;
 static float ina_vpack = 0.0f;
@@ -179,6 +206,10 @@ static float ina_ichg = 0.0f;
 
 /* ============ Charger state ============ */
 static bool charger_enabled = false;
+
+/* 🔴 Charger lockout (post-weld) */
+static bool charger_lockout = false;
+static uint32_t charger_lockout_until = 0;
 
 /* ============ UART RX Buffer ============ */
 #define RX_LINE_MAX 128
@@ -293,6 +324,19 @@ static void ina226_read_all(void) {
 /* ============ Charger State Machine (INA226 ONLY) ============ */
 
 static void chargerStateMachine(void) {
+    uint32_t now = HAL_GetTick();
+
+    /* 🔴 LOCKOUT: block charger after weld */
+    if (charger_lockout) {
+        if ((int32_t)(now - charger_lockout_until) >= 0) {
+            charger_lockout = false;  // release lock
+        } else {
+            HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+            charger_enabled = false;
+            return;
+        }
+    }
+
     /* SAFETY: INA226 failure → charger OFF */
     if (!ina226_ok) {
         HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
@@ -314,7 +358,7 @@ static void chargerStateMachine(void) {
         return;
     }
 
-    /* ARMED: hysteresis control using INA226 ina_vpack */
+    /* NORMAL HYSTERESIS CONTROL */
     if (ina_vpack >= CHG_VPACK_OFF) {
         HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
         charger_enabled = false;
@@ -322,7 +366,6 @@ static void chargerStateMachine(void) {
         HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_SET);
         charger_enabled = true;
     }
-    /* Between CHG_VPACK_ON and CHG_VPACK_OFF: maintain current state */
 }
 
 /* ============ UART Status Packets (split into two for ESP32 parsing)
@@ -336,9 +379,9 @@ static void sendStatusPacket(void) {
     float power_f = (float)weld_power_pct;
     snprintf(buf, sizeof(buf),
              "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
-             "temp=%.2f,mode=%d,power=%.2f",
+             "temp=%.2f,mode=%d,power=%.2f,vdda=%.3f",
              armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
-             temp_filtered_c, (int)weld_mode, power_f);
+             temp_filtered_c, (int)weld_mode, power_f, measured_vdda);
     uartSend(buf);
 
     /* --- Packet 2: STATUS2 (INA226 telemetry) --- */
@@ -370,23 +413,54 @@ static uint32_t adcReadFast(uint32_t channel) {
 
 static float capturePulseAmps(uint16_t ms) {
     uint32_t peak_raw = 0;
+    uint64_t sum_raw = 0;
+    uint32_t count = 0;
+
     uint32_t start = HAL_GetTick();
 
     while ((HAL_GetTick() - start) < ms) {
-        uint32_t p = adcReadFast(ADC_CHANNEL_2);  // Adjust channel to wiring
-        uint32_t n = adcReadFast(ADC_CHANNEL_3);  // Adjust channel to wiring
+        uint32_t p = adcReadFast(ADC_CHANNEL_2);
+        uint32_t n = adcReadFast(ADC_CHANNEL_3);
+
         if (p != 0xFFFF && n != 0xFFFF) {
             int32_t diff = (int32_t)p - (int32_t)n;
             uint32_t abs_diff = (diff < 0) ? -diff : (uint32_t)diff;
+
+            // ✅ peak (unchanged)
             if (abs_diff > peak_raw) peak_raw = abs_diff;
+
+            // ✅ NEW: accumulate
+            sum_raw += abs_diff;
+            count++;
         }
     }
 
     cal_adc_peak_raw = peak_raw;
 
-    float pulse_peak = (float)peak_raw * AMPS_PER_ADC_STEP;
-    if (pulse_peak > current_peak_amps) current_peak_amps = pulse_peak;
-    return pulse_peak;
+    float v_per_count = measured_vdda / 4095.0f;
+
+    float v_adc = (float)peak_raw * v_per_count;
+
+    float v_shunt = v_adc / SHUNT_GAIN;
+
+    float peak_current = v_shunt / SHUNT_EFF_OHMS;
+
+    float avg_current = 0.0f;
+
+    if (count > 0) {
+        float avg_raw = (float)sum_raw / (float)count;
+        float v_adc_avg = avg_raw * v_per_count;
+        float v_shunt_avg = v_adc_avg / SHUNT_GAIN;
+        avg_current = v_shunt_avg / SHUNT_EFF_OHMS;
+    }
+
+    // ✅ keep peak tracking
+    if (peak_current > current_peak_amps) current_peak_amps = peak_current;
+
+    // ✅ store average for later use
+    cal_current_avg = avg_current;
+
+    return peak_current;
 }
 
 /* ============ Helpers ============ */
@@ -409,8 +483,47 @@ static inline void pwmOnDuty(uint16_t duty) {
     __HAL_TIM_SET_COMPARE(&htim1, WELD_TIM_CH, ccr);
 }
 
+static bool contactDetectedRaw(float* out_vcap) {
+    float vcap = readCapVoltage();
+    if (out_vcap != NULL) {
+        *out_vcap = vcap;
+    }
+
+    return (vcap > g_contact_threshold_v);
+}
+
 static bool contactDetected(void) {
-    return HAL_GPIO_ReadPin(CONTACT_PORT, CONTACT_PIN) == GPIO_PIN_RESET;
+    uint32_t now = HAL_GetTick();
+
+    if ((now - g_contact_last_sample_ms) < CONTACT_SAMPLE_MS) {
+        return g_contact_state;
+    }
+    g_contact_last_sample_ms = now;
+
+    bool current_raw = contactDetectedRaw(&g_contact_last_vcap);
+
+    if (!current_raw) {
+        g_contact_state = false;
+        g_contact_pending_high = false;
+        g_contact_pending_since_ms = 0;
+        return g_contact_state;
+    }
+
+    if (g_contact_state) {
+        return true;
+    }
+
+    if (!g_contact_pending_high) {
+        g_contact_pending_high = true;
+        g_contact_pending_since_ms = now;
+        return false;
+    }
+
+    if ((now - g_contact_pending_since_ms) >= CONTACT_DEBOUNCE_MS) {
+        g_contact_state = true;
+    }
+
+    return g_contact_state;
 }
 
 static void clampParams(void) {
@@ -590,6 +703,10 @@ static void fireRecipe(void) {
     welding_now = false;
     last_weld_ms = HAL_GetTick();
 
+    /* 🔴 Engage post-weld lockout (MOVED HERE) */
+    charger_lockout = true;
+    charger_lockout_until = HAL_GetTick() + 500;
+
     /* Step 5: Wait 50ms post-weld */
     HAL_Delay(50);
 
@@ -600,32 +717,18 @@ static void fireRecipe(void) {
     float delta_v = cal_vcap_before - cal_vcap_after;
     float time_s = total_ms / 1000.0f;
 
-    if (time_s > 0.0f && delta_v > 0.0f) {
-        cal_current_avg = cap_F * (delta_v / time_s);
-    } else {
-        cal_current_avg = 0.0f;
-    }
-
     char buf[256];
     snprintf(buf, sizeof(buf),
              "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
              "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
              "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
-             "calc_i=%.1f",
+             "avg_a=%.1f",
              (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
              weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
              preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
              (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
              delta_v, cal_current_avg);
     uartSend(buf);
-
-    /* Step 7: Re-enable charger if ARMED and INA226 says voltage is low */
-    /* Uses INA226 ina_vpack – read fresh value now */
-    ina226_read_all();
-    if (armed && ina226_ok && ina_vpack <= CHG_VPACK_OFF) {
-        HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_SET);
-        charger_enabled = true;
-    }
 }
 
 static void SystemClock_Config(void) {
@@ -702,6 +805,8 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    /* Legacy PA6 input kept configured as a hardware fallback only.
+     * Runtime contact detection now uses AMC1311B vcap thresholding. */
     GPIO_InitStruct.Pin = GPIO_PIN_6;
     GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
     GPIO_InitStruct.Pull = GPIO_PULLUP;
@@ -769,6 +874,10 @@ static void MX_TIM1_Init(void) {
         while (1) {
         }
     }
+
+    /* Enable TIM1 Update Interrupt */
+    HAL_NVIC_SetPriority(TIM1_UP_TIM16_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(TIM1_UP_TIM16_IRQn);
 }
 
 static void MX_ADC1_Init(void) {
@@ -800,6 +909,120 @@ static void MX_ADC1_Init(void) {
 }
 
 /**
+ * @brief ADC2 initialization for PA4 (AMC1311B OUTN = ADC2_IN17).
+ *
+ * PA4 is NOT available on ADC1; it maps to ADC2 Channel 17 on STM32G474.
+ * Same settings as ADC1 for consistency.
+ */
+static void MX_ADC2_Init(void) {
+    /* ADC12 clock already enabled by MX_ADC1_Init */
+
+    hadc2.Instance = ADC2;
+    hadc2.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+    hadc2.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc2.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc2.Init.GainCompensation = 0;
+    hadc2.Init.ScanConvMode = ADC_SCAN_DISABLE;
+    hadc2.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    hadc2.Init.LowPowerAutoWait = DISABLE;
+    hadc2.Init.ContinuousConvMode = DISABLE;
+    hadc2.Init.NbrOfConversion = 1;
+    hadc2.Init.DiscontinuousConvMode = DISABLE;
+    hadc2.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc2.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc2.Init.DMAContinuousRequests = DISABLE;
+    hadc2.Init.Overrun = ADC_OVR_DATA_OVERWRITTEN;
+    hadc2.Init.OversamplingMode = DISABLE;
+
+    if (HAL_ADC_Init(&hadc2) != HAL_OK) {
+        while (1) {
+        }
+    }
+
+    HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+}
+
+/**
+ * @brief Read a single channel from ADC2 with long sampling time.
+ */
+static uint32_t adcReadChannel2(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+
+    if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
+        return 0xFFFF;
+    }
+
+    HAL_ADC_Start(&hadc2);
+    if (HAL_ADC_PollForConversion(&hadc2, 10) != HAL_OK) {
+        HAL_ADC_Stop(&hadc2);
+        return 0xFFFF;
+    }
+
+    uint32_t val = HAL_ADC_GetValue(&hadc2);
+    HAL_ADC_Stop(&hadc2);
+    return val;
+}
+
+/**
+ * @brief Measure actual VDDA using internal VREFINT channel.
+ *
+ * Uses factory calibration value stored in ROM at VREFINT_CAL_PTR.
+ * Formula: VDDA = (VREFINT_CAL_MV / 1000) × (*VREFINT_CAL_PTR) / ADC_reading
+ *
+ * Returns measured VDDA in volts (typically 3.2–3.4V).
+ * Falls back to 3.3V on error.
+ */
+static float measureVDDA(void) {
+    /* VREFINT is on ADC1 internal channel 18 for STM32G474 */
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ADC_CHANNEL_VREFINT;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        return 3.3f;
+    }
+
+    /* Average 16 readings for stability */
+    uint32_t sum = 0;
+    const int samples = 16;
+    for (int i = 0; i < samples; i++) {
+        HAL_ADC_Start(&hadc1);
+        if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK) {
+            HAL_ADC_Stop(&hadc1);
+            return 3.3f;
+        }
+        sum += HAL_ADC_GetValue(&hadc1);
+        HAL_ADC_Stop(&hadc1);
+    }
+
+    float avg_raw = (float)sum / (float)samples;
+    if (avg_raw < 100.0f) return 3.3f; /* Sanity check */
+
+    uint16_t vrefint_cal = *VREFINT_CAL_PTR;
+    if (vrefint_cal < 100) return 3.3f; /* Sanity check on factory cal */
+
+    /* VREFINT_CAL_MV is in millivolts (3000), convert to volts for result */
+    float vdda =
+        ((float)VREFINT_CAL_MV / 1000.0f) * (float)vrefint_cal / avg_raw;
+
+    /* Sanity clamp: VDDA should be 2.5V–3.6V for STM32G474 */
+    if (vdda < 2.5f) vdda = 3.3f;
+    if (vdda > 3.6f) vdda = 3.3f;
+
+    return vdda;
+}
+
+/**
  * @brief I2C bus recovery – unstick hung I2C devices.
  * Toggles SCL 9 times with SDA released to complete any partial transaction.
  * Must be called BEFORE MX_I2C1_Init() to clear stuck bus conditions.
@@ -827,16 +1050,16 @@ static void i2c_bus_recovery(void) {
     for (int i = 0; i < 9; i++) {
         HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET); /* SCL low  */
         HAL_Delay(1);
-        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);   /* SCL high */
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET); /* SCL high */
         HAL_Delay(1);
     }
 
     /* Generate STOP condition: SDA low → SCL high → SDA high */
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET);  /* SDA low  */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); /* SDA low  */
     HAL_Delay(1);
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET);    /* SCL high */
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_SET); /* SCL high */
     HAL_Delay(1);
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);     /* SDA high */
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET); /* SDA high */
     HAL_Delay(1);
 
     /* Reconfigure PA15 as I2C1_SCL alternate function (AF4) */
@@ -935,10 +1158,12 @@ static float readThermistor(void) {
     uint32_t raw = adcReadChannel(ADC_CHANNEL_1);
     if (raw == 0xFFFF || raw < 10 || raw > 4085) return -99.0f;
 
-    float v = (float)raw * (3.3f / 4095.0f);
-    if (v <= 0.01f || v >= 3.29f) return -99.0f;
+    float vdda =
+        measured_vdda; /* Use calibrated VDDA instead of hardcoded 3.3V */
+    float v = (float)raw * (vdda / 4095.0f);
+    if (v <= 0.01f || v >= (vdda - 0.01f)) return -99.0f;
 
-    float r_ntc = THERM_SERIES_R * ((3.3f / v) - 1.0f);
+    float r_ntc = THERM_SERIES_R * ((vdda / v) - 1.0f);
     if (r_ntc <= 0.0f) return -99.0f;
 
     float s = logf(r_ntc / THERM_NOMINAL_R) / THERM_BETA;
@@ -946,22 +1171,49 @@ static float readThermistor(void) {
     return (1.0f / s) - 273.15f + THERM_OFFSET_C;
 }
 
+/**
+ * @brief Read capacitor bank voltage via AMC1311B isolated amplifier.
+ *
+ * AMC1311B OUTP (Pin 7) → PA3 → ADC1_IN4  (VOLT_AIN0)
+ * AMC1311B OUTN (Pin 6) → PA4 → ADC2_IN17 (VOLT_AIN1)
+ *
+ * BUG FIX: PA4 is ADC2_IN17, NOT ADC1_IN5. The old code used
+ * adcReadChannel(ADC_CHANNEL_5) which reads PB14 on ADC1, not PA4.
+ * Now uses adcReadChannel2(ADC_CHANNEL_17) to correctly read PA4 via ADC2.
+ *
+ * VDDA calibration: Uses measured_vdda from VREFINT instead of hardcoded 3.3V.
+ *
+ * Verification notes:
+ * - With VIN ≈ 0V: expect OUTP ≈ OUTN ≈ 1.44V, so vP - vN ≈ 0V
+ * - At steady state: vcap should match INA226 vpack reading
+ */
 static float readCapVoltage(void) {
     uint32_t sumP = 0, sumN = 0;
     const int samples = 16;
 
     for (int i = 0; i < samples; i++) {
-        uint32_t p = adcReadChannel(ADC_CHANNEL_4);
-        uint32_t n = adcReadChannel(ADC_CHANNEL_5);
+        uint32_t p = adcReadChannel(ADC_CHANNEL_4);    // PA3
+        uint32_t n = adcReadChannel2(ADC_CHANNEL_17);  // PA4
+
         if (p == 0xFFFF || n == 0xFFFF) return 0.0f;
+
         sumP += p;
         sumN += n;
     }
 
-    float vP = ((float)sumP / samples) * (3.3f / 4095.0f);
-    float vN = ((float)sumN / samples) * (3.3f / 4095.0f);
+    float vdda = measured_vdda;
 
-    return (vP - vN) * V_CAP_DIVIDER;
+    float vP = ((float)sumP / samples) * (vdda / 4095.0f);
+    float vN = ((float)sumN / samples) * (vdda / 4095.0f);
+
+    float v = (vP - vN) * V_CAP_DIVIDER;
+
+    // ✅ clamp garbage spikes
+    if (v < 0.0f) v = 0.0f;
+    if (v > 9.5f) v = 9.5f;
+
+
+    return v;
 }
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef* huart) {
@@ -1139,6 +1391,34 @@ static void parseCommand(char* line) {
         return;
     }
 
+    if (strncmp(line, "CONTACT_THRESH=", 15) == 0) {
+        float v = strtof(line + 15, NULL);
+        if (v < 0.1f) v = 0.1f;
+        if (v > 9.0f) v = 9.0f;
+        g_contact_threshold_v = v;
+        g_contact_state = false;
+        g_contact_pending_high = false;
+        g_contact_pending_since_ms = 0;
+        snprintf(response, sizeof(response), "OK,CONTACT_THRESH=%.2f",
+                 g_contact_threshold_v);
+        uartSend(response);
+        return;
+    }
+
+    if (strncmp(line, "SET_CONTACT_THRESH,", 19) == 0) {
+        float v = strtof(line + 19, NULL);
+        if (v < 0.1f) v = 0.1f;
+        if (v > 9.0f) v = 9.0f;
+        g_contact_threshold_v = v;
+        g_contact_state = false;
+        g_contact_pending_high = false;
+        g_contact_pending_since_ms = 0;
+        snprintf(response, sizeof(response), "ACK,SET_CONTACT_THRESH,%.2f",
+                 g_contact_threshold_v);
+        uartSend(response);
+        return;
+    }
+
     if (strncmp(line, "SET_CONTACT_HOLD,", 17) == 0) {
         int v = atoi(line + 17);
         if (v < 1) v = 1;
@@ -1171,6 +1451,18 @@ static void parseCommand(char* line) {
     if (strcmp(line, "STATUS") == 0 || strcmp(line, "CMD,STATUS") == 0) {
         /* Send both STATUS and STATUS2 packets on demand */
         sendStatusPacket();
+        return;
+    }
+    if (strcmp(line, "DBG_SHUNT") == 0) {
+        uint32_t p = adcReadFast(ADC_CHANNEL_2);
+        uint32_t n = adcReadFast(ADC_CHANNEL_3);
+
+        char buf[128];
+        snprintf(buf, sizeof(buf), "DBG,SHUNT,p=%lu,n=%lu,diff=%ld,vdda=%.3f",
+                 (unsigned long)p, (unsigned long)n,
+                 (long)((int32_t)p - (int32_t)n), measured_vdda);
+
+        uartSend(buf);
         return;
     }
 
@@ -1260,13 +1552,29 @@ int main(void) {
     MX_I2C1_Init(); /* I2C1 for INA226 sensors – graceful, no hang */
     MX_USART1_UART_Init();
     MX_ADC1_Init();
+    OPAMP1->CSR &= ~OPAMP_CSR_OPAMPxEN;
+    MX_ADC2_Init(); /* ADC2 for PA4 (AMC1311B OUTN = ADC2_IN17) */
     MX_TIM1_Init();
 
-    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    /* Initial VDDA calibration using VREFINT */
+    measured_vdda = measureVDDA();
+
+    HAL_TIM_PWM_Start_IT(&htim1, TIM_CHANNEL_1);
     pwmOff();
 
     boot_ms = HAL_GetTick();
 
+    /* Always boot in PEDAL trigger mode (MODE=1). Runtime switching is allowed,
+     * but mode is intentionally non-persistent and resets to PEDAL after
+     * reboot. */
+    trigger_mode = 1;
+
+    g_contact_threshold_v = CONTACT_THRESHOLD_V_DEFAULT;
+    g_contact_state = false;
+    g_contact_pending_high = false;
+    g_contact_pending_since_ms = 0;
+    g_contact_last_sample_ms = 0;
+    g_contact_last_vcap = 0.0f;
     GPIO_PinState r = HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN);
     pedal_last_raw = r;
     pedal_stable = r;
@@ -1303,6 +1611,13 @@ int main(void) {
 
     uartSend("BOOT,STM32G474_WELD_BRAIN_10KHZ_READY");
 
+    {
+        char boot_mode_msg[32];
+        snprintf(boot_mode_msg, sizeof(boot_mode_msg), "BOOT,MODE=%d",
+                 (int)trigger_mode);
+        uartSend(boot_mode_msg);
+    }
+
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
     while (1) {
@@ -1316,10 +1631,10 @@ int main(void) {
             int c = contactDetected() ? 1 : 0;
             if (c != last_contact_dbg) {
                 last_contact_dbg = c;
-                if (c)
-                    uartSend("DBG,CONTACT=1");
-                else
-                    uartSend("DBG,CONTACT=0");
+                char cbuf[96];
+                snprintf(cbuf, sizeof(cbuf), "DBG,CONTACT=%d,vcap=%.2f,th=%.2f",
+                         c, g_contact_last_vcap, g_contact_threshold_v);
+                uartSend(cbuf);
             }
         }
 
@@ -1328,6 +1643,10 @@ int main(void) {
             uint32_t now = HAL_GetTick();
             if ((now - last_temp_ms) >= 1000) {
                 last_temp_ms = now;
+
+                /* Refresh VDDA calibration every 1s alongside temperature */
+                measured_vdda = measureVDDA();
+
                 float t = readThermistor();
                 if (t > -50.0f && t < 200.0f) {
                     temp_filtered_c = (0.1f * t) + (0.9f * temp_filtered_c);
@@ -1395,3 +1714,18 @@ void SysTick_Handler(void) {
 }
 
 void USART1_IRQHandler(void) { HAL_UART_IRQHandler(&huart1); }
+
+/**
+ * @brief Timer Period Elapsed Callback - Forces FETs off
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim) {
+    if (htim->Instance == TIM1) {
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 0);
+        HAL_TIM_PWM_Stop_IT(&htim1, TIM_CHANNEL_1);
+    }
+}
+
+/**
+ * @brief TIM1 Update Interrupt Handler
+ */
+void TIM1_UP_TIM16_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }

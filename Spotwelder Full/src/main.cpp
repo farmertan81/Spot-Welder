@@ -484,8 +484,6 @@ void requestStm32Status() {
 // STATUS2 parser (replaces old CHGSTAT parser)
 // =========================
 static void parseStatus2(const String& line) {
-    // Format:
-    // STATUS2,ina_ok=1,chg_en=1,vpack=8.95,vlow=2.98,vmid=5.97,cell1=2.98,cell2=2.99,cell3=2.98,ichg=1.23
     int iv;
     float fv;
 
@@ -495,8 +493,12 @@ static void parseStatus2(const String& line) {
     // Extract charger enable state
     if (extractIntField(line, "chg_en=", iv)) stm_charger_on = (iv == 1);
 
-    // Extract voltage measurements
-    if (extractFloatField(line, "vpack=", fv)) stm_vpack = fv;
+    // CHANGED: field name match for STM32 output
+    if (extractFloatField(line, "vpack=", fv) ||
+        extractFloatField(line, "vpack_ina=", fv)) {
+        stm_vpack = fv;
+    }
+
     if (extractFloatField(line, "vlow=", fv)) stm_vlow = fv;
     if (extractFloatField(line, "vmid=", fv)) stm_vmid = fv;
 
@@ -592,6 +594,12 @@ void pollStm32Uart() {
                     if (!config_sent) {
                         sendBootConfig();
                     }
+                    int iv = 0;
+                    if (extractIntField(stmLine, "MODE=", iv)) {
+                        if (iv >= 1 && iv <= 2) {
+                            trigger_mode = (uint8_t)iv;
+                        }
+                    }
                     stmLine = "";
                     continue;
                 }
@@ -658,12 +666,17 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("STATUS,")) {
+} else if (stmLine.startsWith("STATUS,")) {
                     int iv = 0;
                     float fv = NAN;
 
                     if (extractIntField(stmLine, "armed=", iv)) {
                         stm_armed = (iv == 1);
+                    }
+                    
+                    // ADD THIS: Fallback voltage source
+                    if (extractFloatField(stmLine, "vpack=", fv)) {
+                        stm_vpack = fv;
                     }
 
                     if (extractIntField(stmLine, "ready=", iv)) {
@@ -961,7 +974,10 @@ void processCommand(String cmd) {
         return;
     }
 
-    sendToPi("ERR:UNKNOWN_CMD");
+    // Unknown command – forward raw to STM32 (passthrough for debug commands
+    // like AMC_LIVE, DBG_SHUNT, etc.)
+    Serial.printf("[PASSTHROUGH->STM32] %s\n", cmd.c_str());
+    forwardToStm32(cmd);
 }
 
 // =========================
