@@ -73,6 +73,8 @@ static void send_waveform_data(void);
 #define CHARGER_EN_PORT GPIOB
 #define CHARGER_EN_PIN GPIO_PIN_2
 
+/* ============ Billet Shunt Calibration (0.3885" @ 15mm) ============ */
+/* Physical chain: Amps → µV across shunt → ×41 (AMC1302) → ADC counts */
 #define SHUNT_GAIN 8.2f          /* AMC1301 fixed gain                  */
 #define SHUNT_EFF_OHMS 0.000050f /* 50 µΩ effective shunt (calibrated) */
 
@@ -548,9 +550,20 @@ static uint32_t micros_now(void) {
 static void start_weld_pulse_capture(void) {
     waveform_index = 0;
     waveform_capture_start_us = micros_now();
+
+    /* Manual anchor sample: force waveform to start at 0A before first real
+     * captured sample (which may already be >0A due to fast pulse rise).
+     * Use a FRESH capacitor-voltage read here for best accuracy; this runs
+     * once before the pulse, so it has no impact on high-speed sampling.
+     */
+    waveform_buffer[0].current_amps = 0.0f;
+    waveform_buffer[0].voltage_volts = readCapVoltage();
+    waveform_buffer[0].timestamp_us = 0;
+    waveform_index = 1;
+
     waveform_last_sample_us = waveform_capture_start_us;
     waveform_capture_active = true;
-    uartSend("DBG,WAVEFORM_CAPTURE_START");
+    uartSend("DBG,WAVEFORM_CAPTURE_START,seed=0A");
 }
 
 static void end_weld_pulse_capture(void) {
@@ -785,6 +798,12 @@ static void fireRecipe(void) {
 
     /* === WELD SEQUENCE (modified per refactor plan) === */
 
+    /* Step 0: Start waveform capture BEFORE any weld sequence action.
+     * This ensures the waveform includes the earliest pre-pulse region
+     * instead of starting after current has already risen.
+     */
+    start_weld_pulse_capture();
+
     /* Step 1: Disable charger */
     HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
     charger_enabled = false;
@@ -794,10 +813,6 @@ static void fireRecipe(void) {
 
     welding_now = true;
     current_peak_amps = 0.0f;
-
-    /* Phase 3: reset and arm waveform capture for this weld cycle. */
-    start_weld_pulse_capture();
-
     /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
     cal_vcap_before = readCapVoltage();
 
