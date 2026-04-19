@@ -56,6 +56,10 @@ WiFiClient client;
 static uint32_t lastTcpRxMs = 0;
 static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;
 
+// STM32 UART line limits
+static const size_t MAX_LINE_LENGTH = 2048;
+static const size_t MAX_WAVEFORM_LINE_LENGTH = 4096;
+
 // =========================
 // STM32-sourced INA226 data (parsed from STATUS2 packets)
 // =========================
@@ -89,7 +93,10 @@ uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
-uint8_t trigger_mode = 1;        // 1=pedal, 2=contact
+static const uint8_t TRIGGER_MODE_PEDAL = 1;
+static const uint8_t TRIGGER_MODE_CONTACT = 2;
+
+uint8_t trigger_mode = TRIGGER_MODE_PEDAL;
 uint8_t contact_hold_steps = 2;  // each step = 0.5s
 bool contact_with_pedal =
     false;  // require contact detection when pedal trigger
@@ -118,13 +125,17 @@ static bool stm32_booted = false;   // set true on "BOOT," line from STM32
 static bool config_sent = false;    // set true after sendBootConfig() runs
 static uint32_t setup_done_ms = 0;  // millis() at end of setup()
 static const uint32_t BOOT_TIMEOUT_MS = 3000;  // fallback if no BOOT msg
-static uint32_t config_sent_ms = 0;        // millis() when sendBootConfig() completed
-static bool boot_ui_synced = false;        // one-shot: draft synced to applied after boot
-static const uint32_t BOOT_UI_SYNC_DELAY_MS = 2000;  // wait for STM32 STATUS echo
+static uint32_t config_sent_ms = 0;  // millis() when sendBootConfig() completed
+static bool boot_ui_synced =
+    false;  // one-shot: draft synced to applied after boot
+static const uint32_t BOOT_UI_SYNC_DELAY_MS =
+    2000;  // wait for STM32 STATUS echo
+static uint32_t last_stm32_boot_sync_ms = 0;
+static const uint32_t STM32_BOOT_RESYNC_DEBOUNCE_MS = 1500;
 
-
-// Forward declaration
+// Forward declarations
 static void sendBootConfig();
+static void syncSettingsAfterUiReconnect();
 
 // =========================
 // READY heartbeat
@@ -564,6 +575,8 @@ void handleButton() {
 // =========================
 void pollStm32Uart() {
     static String stmLine;
+    static bool stmLineOverflow = false;
+    static uint32_t droppedUartLines = 0;
 
     while (STM32Serial.available()) {
         char ch = (char)STM32Serial.read();
@@ -571,6 +584,16 @@ void pollStm32Uart() {
         if (ch == '\r') continue;
 
         if (ch == '\n') {
+            if (stmLineOverflow) {
+                droppedUartLines++;
+                Serial.printf("[UART] Dropped overlength STM32 line (%u chars buffered, drops=%lu)\n",
+                              (unsigned int)stmLine.length(),
+                              (unsigned long)droppedUartLines);
+                stmLine = "";
+                stmLineOverflow = false;
+                continue;
+            }
+
             // Strip non-printable chars from UART line
             {
                 String cleaned;
@@ -586,20 +609,32 @@ void pollStm32Uart() {
             }
 
             if (stmLine.length() > 0) {
-                // BOOT message handler – trigger deferred config send
-                if (stmLine.startsWith("BOOT,")) {
+                // BOOT message handler – trigger safety re-sync
+                if (stmLine.startsWith("BOOT,") || stmLine == "BOOT") {
                     Serial.printf("[Boot] STM32 boot detected: %s\n",
                                   stmLine.c_str());
                     stm32_booted = true;
-                    if (!config_sent) {
-                        sendBootConfig();
-                    }
-                    int iv = 0;
-                    if (extractIntField(stmLine, "MODE=", iv)) {
-                        if (iv >= 1 && iv <= 2) {
-                            trigger_mode = (uint8_t)iv;
+
+                    uint32_t now = millis();
+                    bool resync_allowed =
+                        (now - last_stm32_boot_sync_ms) >
+                        STM32_BOOT_RESYNC_DEBOUNCE_MS;
+
+                    if (resync_allowed) {
+                        if (!config_sent) {
+                            sendBootConfig();
+                        } else {
+                            Serial.println(
+                                "[Boot] STM32 reboot detected after initial sync -> "
+                                "applying safety defaults + auto-sync");
+                            syncSettingsAfterUiReconnect();
                         }
+                        last_stm32_boot_sync_ms = now;
+                    } else {
+                        Serial.println(
+                            "[Boot] Ignoring duplicate BOOT message (debounced)");
                     }
+
                     stmLine = "";
                     continue;
                 }
@@ -666,14 +701,14 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-} else if (stmLine.startsWith("STATUS,")) {
+                } else if (stmLine.startsWith("STATUS,")) {
                     int iv = 0;
                     float fv = NAN;
 
                     if (extractIntField(stmLine, "armed=", iv)) {
                         stm_armed = (iv == 1);
                     }
-                    
+
                     // ADD THIS: Fallback voltage source
                     if (extractFloatField(stmLine, "vpack=", fv)) {
                         stm_vpack = fv;
@@ -694,58 +729,64 @@ void pollStm32Uart() {
                     // ESP32 stays in sync with STM32 for runtime changes.
 
                     {
-                    // Grace period: don't let STATUS overwrite recipe
-                    // for BOOT_GRACE_MS after boot config was sent.
-                    // This prevents stale STM32 defaults from clobbering
-                    // the NVS-loaded recipe we just pushed.
-                    static const uint32_t BOOT_GRACE_MS = 2000;
-                    bool allow_recipe_sync = !config_sent ||
-                        (config_sent_ms > 0 && (millis() - config_sent_ms) > BOOT_GRACE_MS);
+                        // Grace period: don't let STATUS overwrite recipe
+                        // for BOOT_GRACE_MS after boot config was sent.
+                        // This prevents stale STM32 defaults from clobbering
+                        // the NVS-loaded recipe we just pushed.
+                        static const uint32_t BOOT_GRACE_MS = 2000;
+                        bool allow_recipe_sync =
+                            !config_sent ||
+                            (config_sent_ms > 0 &&
+                             (millis() - config_sent_ms) > BOOT_GRACE_MS);
 
-                    if (allow_recipe_sync) {
-                        // Pulse / timing
-                        if (extractIntField(stmLine, "d1=", iv))
-                            weld_d1 = (uint16_t)iv;
-                        if (extractIntField(stmLine, "gap1=", iv))
-                            weld_gap1 = (uint16_t)iv;
-                        if (extractIntField(stmLine, "d2=", iv))
-                            weld_d2 = (uint16_t)iv;
-                        if (extractIntField(stmLine, "gap2=", iv))
-                            weld_gap2 = (uint16_t)iv;
-                        if (extractIntField(stmLine, "d3=", iv))
-                            weld_d3 = (uint16_t)iv;
+                        if (allow_recipe_sync) {
+                            // Pulse / timing
+                            if (extractIntField(stmLine, "d1=", iv))
+                                weld_d1 = (uint16_t)iv;
+                            if (extractIntField(stmLine, "gap1=", iv))
+                                weld_gap1 = (uint16_t)iv;
+                            if (extractIntField(stmLine, "d2=", iv))
+                                weld_d2 = (uint16_t)iv;
+                            if (extractIntField(stmLine, "gap2=", iv))
+                                weld_gap2 = (uint16_t)iv;
+                            if (extractIntField(stmLine, "d3=", iv))
+                                weld_d3 = (uint16_t)iv;
 
-                        // Power
-                        if (extractFloatField(stmLine, "power=", fv)) {
-                            stm_power = fv;
-                            weld_power_pct = (uint8_t)fv;
+                            // Power
+                            if (extractFloatField(stmLine, "power=", fv)) {
+                                stm_power = fv;
+                                weld_power_pct = (uint8_t)fv;
+                            }
+
+                            // Preheat
+                            if (extractIntField(stmLine, "preheat_en=", iv))
+                                preheat_enabled = (iv == 1);
+                            if (extractIntField(stmLine, "preheat_ms=", iv))
+                                preheat_ms = (uint16_t)iv;
+                            if (extractIntField(stmLine, "preheat_pct=", iv))
+                                preheat_pct = (uint8_t)iv;
+                            if (extractIntField(stmLine, "preheat_gap_ms=", iv))
+                                preheat_gap_ms = (uint16_t)iv;
+
+                            // Trigger / behavior
+                            if (extractIntField(stmLine, "trigger_mode=", iv))
+                                trigger_mode = (uint8_t)iv;
+                            if (extractIntField(stmLine,
+                                                "contact_hold_steps=", iv))
+                                contact_hold_steps = (uint8_t)iv;
+                            if (extractIntField(stmLine,
+                                                "contact_with_pedal=", iv))
+                                contact_with_pedal = (iv == 1);
+                        } else {
+                            // During grace period, still parse power for
+                            // stm_power (read-only display) but don't
+                            // overwrite recipe globals
+                            if (extractFloatField(stmLine, "power=", fv))
+                                stm_power = fv;
+                            Serial.println(
+                                "[SYNC] Recipe sync suppressed (boot grace "
+                                "period)");
                         }
-
-                        // Preheat
-                        if (extractIntField(stmLine, "preheat_en=", iv))
-                            preheat_enabled = (iv == 1);
-                        if (extractIntField(stmLine, "preheat_ms=", iv))
-                            preheat_ms = (uint16_t)iv;
-                        if (extractIntField(stmLine, "preheat_pct=", iv))
-                            preheat_pct = (uint8_t)iv;
-                        if (extractIntField(stmLine, "preheat_gap_ms=", iv))
-                            preheat_gap_ms = (uint16_t)iv;
-
-                        // Trigger / behavior
-                        if (extractIntField(stmLine, "trigger_mode=", iv))
-                            trigger_mode = (uint8_t)iv;
-                        if (extractIntField(stmLine, "contact_hold_steps=", iv))
-                            contact_hold_steps = (uint8_t)iv;
-                        if (extractIntField(stmLine, "contact_with_pedal=", iv))
-                            contact_with_pedal = (iv == 1);
-                    } else {
-                        // During grace period, still parse power for
-                        // stm_power (read-only display) but don't
-                        // overwrite recipe globals
-                        if (extractFloatField(stmLine, "power=", fv))
-                            stm_power = fv;
-                        Serial.println("[SYNC] Recipe sync suppressed (boot grace period)");
-                    }
                     }
 
                     // ====
@@ -795,6 +836,15 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
+                } else if (stmLine.startsWith("WAVEFORM,")) {
+                    sendToPi(stmLine);
+                    delayMicroseconds(
+                        200);  // ← gives WiFi stack breathing room
+                } else if (stmLine.length() > 10 && isdigit(stmLine[0])) {
+                    // Bare CSV waveform line (no prefix)
+                    sendToPi(stmLine);
+                    delayMicroseconds(200);
+
                 } else if (stmLine.startsWith("EVENT,PEDAL_PRESS") ||
                            stmLine.startsWith("EVENT,ARM_TIMEOUT") ||
                            stmLine.startsWith("EVENT,READY_TIMEOUT") ||
@@ -817,10 +867,31 @@ void pollStm32Uart() {
 
             stmLine = "";
         } else {
-            if (stmLine.length() < 220) {
+            if (stmLineOverflow) {
+                continue;
+            }
+
+            size_t maxLineLength = MAX_LINE_LENGTH;
+            if (stmLine.startsWith("WAVEFORM,")) {
+                maxLineLength = MAX_WAVEFORM_LINE_LENGTH;
+            } else if (stmLine.length() < 9) {
+                const char* wfPrefix = "WAVEFORM,";
+                bool possibleWaveform = true;
+                for (size_t i = 0; i < stmLine.length(); ++i) {
+                    if (stmLine[i] != wfPrefix[i]) {
+                        possibleWaveform = false;
+                        break;
+                    }
+                }
+                if (possibleWaveform) {
+                    maxLineLength = MAX_WAVEFORM_LINE_LENGTH;
+                }
+            }
+
+            if (stmLine.length() < maxLineLength) {
                 stmLine += ch;
             } else {
-                stmLine = "";
+                stmLineOverflow = true;
             }
         }
     }
@@ -920,8 +991,8 @@ void processCommand(String cmd) {
 
     if (cmd.startsWith("SET_TRIGGER_MODE,")) {
         int mode = cmd.substring(strlen("SET_TRIGGER_MODE,")).toInt();
-        if (mode < 1) mode = 1;
-        if (mode > 2) mode = 2;
+        if (mode < TRIGGER_MODE_PEDAL) mode = TRIGGER_MODE_PEDAL;
+        if (mode > TRIGGER_MODE_CONTACT) mode = TRIGGER_MODE_CONTACT;
         trigger_mode = (uint8_t)mode;
 
         forwardToStm32(cmd);
@@ -1205,6 +1276,11 @@ static void sendBootConfig() {
 
     char buf[80];
 
+    // SAFETY DEFAULTS ON BOOT: always start disarmed + pedal mode.
+    stm_armed = false;
+    trigger_mode = TRIGGER_MODE_PEDAL;
+    contact_with_pedal = true;
+
     // 1. Recipe / pulse settings
     snprintf(buf, sizeof(buf), "SET_PULSE,%d,%d,%d,%d,%d,%d", weld_mode,
              weld_d1, weld_gap1, weld_d2, weld_gap2, weld_d3);
@@ -1222,33 +1298,112 @@ static void sendBootConfig() {
     forwardToStm32(String(buf));
     delay(20);
 
-    // 4. Trigger mode
-    snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%d", (int)trigger_mode);
-    forwardToStm32(String(buf));
+    // 4. Trigger mode (forced to pedal)
+    forwardToStm32("SET_TRIGGER_MODE,1");
     delay(20);
 
     // 5. Contact hold
     snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d", (int)contact_hold_steps);
     forwardToStm32(String(buf));
-    Serial.println("[Boot] Sent SET_CONTACT_HOLD");
     delay(20);
 
-    // 6. Contact with pedal
-    snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%d",
-             contact_with_pedal ? 1 : 0);
-    forwardToStm32(String(buf));
+    // 6. Contact with pedal (forced enabled)
+    forwardToStm32("SET_CONTACT_WITH_PEDAL,1");
     delay(20);
 
-    // 7. Kick-start STM32 status broadcasting
+    // 7. Force disarmed state for safety
+    forwardToStm32("ARM,0");
+    delay(20);
+
+    // 8. Kick-start STM32 status broadcasting
     forwardToStm32("READY,1");
     lastReadySentMs = millis();
     delay(20);
 
-    // 8. Request current STM32 status
+    // 9. Request current STM32 status
     requestStm32Status();
 
     config_sent_ms = millis();
-    Serial.println("[Boot] Config sent (8 commands, 20ms pacing, pre-flush)");
+    Serial.println("[Boot] Config sent with safety defaults (DISARMED + PEDAL)");
+}
+
+// =========================
+// Reconnect sync: re-send current recipe/settings so host UI can
+// immediately re-enable ARM without requiring manual Apply.
+// =========================
+static void syncSettingsAfterUiReconnect() {
+    if (!config_sent) {
+        Serial.println(
+            "[TCP] UI reconnect sync skipped (boot config not sent yet)");
+        return;
+    }
+
+    // SAFETY DEFAULTS: always disarmed + pedal mode on re-sync.
+    stm_armed = false;
+    trigger_mode = TRIGGER_MODE_PEDAL;
+    contact_with_pedal = true;
+
+    // Re-validate recipe before sending to STM32.
+    if (weld_mode < 1 || weld_mode > 3 || weld_d1 == 0) {
+        Serial.printf(
+            "[TCP] Invalid recipe for auto-sync (mode=%u d1=%u) - skipped\n",
+            (unsigned)weld_mode, (unsigned)weld_d1);
+        return;
+    }
+
+    Serial.println("[TCP] === Auto-syncing settings with safety defaults ===");
+    Serial.printf(
+        "[TCP] Sync values: mode=%u d1=%u gap1=%u d2=%u gap2=%u d3=%u power=%u "
+        "preheat_en=%u preheat_ms=%u preheat_pct=%u preheat_gap=%u trigger=%u "
+        "contact_hold=%u contact_pedal=%u armed=%u\n",
+        (unsigned)weld_mode, (unsigned)weld_d1, (unsigned)weld_gap1,
+        (unsigned)weld_d2, (unsigned)weld_gap2, (unsigned)weld_d3,
+        (unsigned)weld_power_pct, (unsigned)(preheat_enabled ? 1 : 0),
+        (unsigned)preheat_ms, (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
+        (unsigned)trigger_mode, (unsigned)contact_hold_steps,
+        (unsigned)(contact_with_pedal ? 1 : 0), (unsigned)(stm_armed ? 1 : 0));
+
+    char buf[96];
+
+    snprintf(buf, sizeof(buf), "SET_PULSE,%u,%u,%u,%u,%u,%u",
+             (unsigned)weld_mode, (unsigned)weld_d1, (unsigned)weld_gap1,
+             (unsigned)weld_d2, (unsigned)weld_gap2, (unsigned)weld_d3);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    snprintf(buf, sizeof(buf), "SET_POWER,%u", (unsigned)weld_power_pct);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    snprintf(buf, sizeof(buf), "SET_PREHEAT,%u,%u,%u,%u",
+             (unsigned)(preheat_enabled ? 1 : 0), (unsigned)preheat_ms,
+             (unsigned)preheat_pct, (unsigned)preheat_gap_ms);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    forwardToStm32("SET_TRIGGER_MODE,1");
+    delay(20);
+
+    snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%u",
+             (unsigned)contact_hold_steps);
+    forwardToStm32(String(buf));
+    delay(20);
+
+    forwardToStm32("SET_CONTACT_WITH_PEDAL,1");
+    delay(20);
+
+    forwardToStm32("ARM,0");
+    delay(20);
+
+    // Ask STM32 to immediately publish fresh status after re-sync.
+    requestStm32Status();
+
+    // Keep local UI in sync so ARM button doesn't show stale yellow warning.
+    ui_mark_settings_applied();
+
+    // Mark sync optimistic; definitive state is refreshed by incoming STATUS/ACK.
+    stm_synced = true;
+    Serial.println("[TCP] Auto-sync complete with safety defaults: DISARMED + PEDAL");
 }
 
 // Callback from UI when config changes
@@ -1309,12 +1464,16 @@ void setup() {
     delay(500);
 
     Serial.println();
-    Serial.println("=== Spot Welder Merged Firmware (Refactored) ===");
+    Serial.println("===========================================");
+    Serial.println("ESP32 Spot Welder Controller Boot Sequence");
+    Serial.println("===========================================");
+    Serial.println("[Boot] 1/4 Initializing firmware...");
 
     // --- UART to STM32 ---
-    STM32Serial.begin(115200, SERIAL_8N1, STM32_TO_ESP32_PIN,
+    STM32Serial.setRxBufferSize(4096);  // VERY important for waveform bursts
+    STM32Serial.begin(460800, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
-    Serial.println("✅ STM32 UART bridge ready (Serial2 @ 115200)");
+    Serial.println("✅ STM32 UART bridge ready (Serial2 @ 460800)");
 
     // --- Front button ---
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -1385,11 +1544,29 @@ void setup() {
             "boot/timeout)");
     }
 
+    // --- Safety defaults (always on ESP32 reboot) ---
+    Serial.println("[Boot] 2/4 Applying safety defaults...");
+    stm_armed = false;                    // always boot disarmed
+    stm_synced = false;
+    trigger_mode = TRIGGER_MODE_PEDAL;   // always boot in pedal mode
+    contact_with_pedal = true;           // pedal gating enabled
+
+    Serial.println("[Boot] Safety defaults applied:");
+    Serial.println("       - Armed: false");
+    Serial.println("       - Trigger mode: PEDAL");
+    Serial.println("       - Contact with pedal: enabled");
+    Serial.printf("[Boot] Persistent recipe retained: mode=%u d1=%u gap1=%u d2=%u gap2=%u d3=%u power=%u preheat_en=%u preheat_ms=%u preheat_pct=%u preheat_gap=%u\n",
+                  (unsigned)weld_mode, (unsigned)weld_d1, (unsigned)weld_gap1,
+                  (unsigned)weld_d2, (unsigned)weld_gap2, (unsigned)weld_d3,
+                  (unsigned)weld_power_pct, (unsigned)(preheat_enabled ? 1 : 0),
+                  (unsigned)preheat_ms, (unsigned)preheat_pct,
+                  (unsigned)preheat_gap_ms);
+
     // --- Register remaining UI callbacks ---
     ui_set_trigger_source_cb(onTriggerSourceChange);
     ui_set_weld_count_reset_cb(onWeldCountReset);
     ui_set_contact_with_pedal_cb(onContactWithPedalChange);
-    Serial.println("✅ All UI callbacks registered");
+    Serial.println("[Boot] 3/4 UI callbacks registered");
 
     // ==========================================================
     // WiFi  (non-blocking – removed blocking wait)
@@ -1397,12 +1574,14 @@ void setup() {
     WiFi.mode(WIFI_STA);
     esp_wifi_set_protocol(
         WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    Serial.println("[Boot] 4/4 Starting WiFi + TCP services...");
     Serial.print("Connecting to WiFi: ");
     Serial.println(ssid);
     WiFi.begin(ssid, password);
 
     setup_done_ms = millis();
-    Serial.println("=== Setup complete (STM32 config deferred) ===");
+    Serial.println("[Boot] Boot complete - waiting for STM32 BOOT/fallback sync");
+    Serial.println("===========================================");
 }
 
 // Loop
@@ -1434,7 +1613,6 @@ void loop() {
         Serial.println("[Boot] UI draft/applied sync complete");
     }
 
-
     // --- Existing logic ---
     ensureWiFiAndServer();
     pollStm32Uart();
@@ -1465,6 +1643,7 @@ void loop() {
             lastTcpRxMs = millis();
             setUiConnected(true);
             sendToPi(buildStatus());
+            syncSettingsAfterUiReconnect();
             requestStm32Status();
         }
 

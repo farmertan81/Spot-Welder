@@ -39,7 +39,8 @@ static bool contactDetected(void);
 
 /* NEW: Shunt Sensing Forward Decl */
 static uint32_t adcReadFast(uint32_t channel);
-static float capturePulseAmps(uint16_t ms);
+static uint32_t adcReadFast2(uint32_t channel);
+static void capturePulseAmps(uint16_t ms);
 
 /* NEW: INA226 Forward Decl */
 static bool ina226_write_reg(uint8_t addr, uint8_t reg, uint16_t val);
@@ -50,6 +51,12 @@ static bool ina226_health_check(void);
 static void ina226_read_all(void);
 static void chargerStateMachine(void);
 static void sendStatusPacket(void);
+
+/* Waveform capture helpers (Phase 3) */
+static uint32_t micros_now(void);
+static void start_weld_pulse_capture(void);
+static void end_weld_pulse_capture(void);
+static void send_waveform_data(void);
 
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
@@ -66,8 +73,6 @@ static void sendStatusPacket(void);
 #define CHARGER_EN_PORT GPIOB
 #define CHARGER_EN_PIN GPIO_PIN_2
 
-/* ============ Billet Shunt Calibration (0.3885" @ 15mm) ============ */
-/* Physical chain: Amps → µV across shunt → ×41 (AMC1302) → ADC counts */
 #define SHUNT_GAIN 8.2f          /* AMC1301 fixed gain                  */
 #define SHUNT_EFF_OHMS 0.000050f /* 50 µΩ effective shunt (calibrated) */
 
@@ -180,6 +185,32 @@ static float cal_vcap_before = 0.0f;
 static float cal_vcap_after = 0.0f;
 static uint32_t cal_adc_peak_raw = 0;
 static float cal_current_avg = 0.0f;
+
+/* ============ Waveform Capture (Phase 3) ============ */
+#define WAVEFORM_BUFFER_SIZE 50
+#define WAVEFORM_LINE_BUFFER_SIZE 1200
+#define WAVEFORM_SAMPLE_INTERVAL_US 50U
+
+/* Safety check: each sample adds ~14 chars (",AAAA.AA,VV.VV") to WAVEFORM line.
+ */
+_Static_assert(WAVEFORM_BUFFER_SIZE <= 80,
+               "WAVEFORM_BUFFER_SIZE too large for line buffer - increase "
+               "WAVEFORM_LINE_BUFFER_SIZE");
+
+typedef struct {
+    float current_amps;
+    float voltage_volts;
+    uint32_t timestamp_us;
+} WaveformSample;
+
+static WaveformSample waveform_buffer[WAVEFORM_BUFFER_SIZE];
+static volatile uint16_t waveform_index = 0;
+static volatile bool waveform_capture_active = false;
+static uint32_t waveform_capture_start_us = 0;
+static uint32_t waveform_last_sample_us = 0;
+/* Cached once before each pulse to avoid slow 16x averaged voltage reads during
+ * 200us sampling. */
+static float cached_vcap = 0.0f;
 
 /* ============ Contact trigger state ============ */
 static bool contact_hold_active = false;
@@ -411,56 +442,149 @@ static uint32_t adcReadFast(uint32_t channel) {
     return val;
 }
 
-static float capturePulseAmps(uint16_t ms) {
+static uint32_t adcReadFast2(uint32_t channel) {
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = channel;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_6CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) return 0xFFFF;
+    HAL_ADC_Start(&hadc2);
+    if (HAL_ADC_PollForConversion(&hadc2, 1) != HAL_OK) {
+        HAL_ADC_Stop(&hadc2);
+        return 0xFFFF;
+    }
+    uint32_t val = HAL_ADC_GetValue(&hadc2);
+    HAL_ADC_Stop(&hadc2);
+    return val;
+}
+
+static void capturePulseAmps(uint16_t ms) {
+    /* Reset waveform interval timer for this pulse (fixes multi-pulse sample
+     * skipping). */
+    waveform_last_sample_us = micros_now();
+
     uint32_t peak_raw = 0;
-    uint64_t sum_raw = 0;
-    uint32_t count = 0;
+    float peak_current = 0.0f;
+    float sum_current = 0.0f;
+    uint32_t sample_count = 0;
 
     uint32_t start = HAL_GetTick();
+    const float v_per_count = measured_vdda / 4095.0f;
 
     while ((HAL_GetTick() - start) < ms) {
+        /*
+         * Timing optimization:
+         * - Read shunt ADC channels ONCE per loop.
+         * - Convert to current ONCE.
+         * - Reuse that same current value for pulse stats + waveform sampling.
+         */
         uint32_t p = adcReadFast(ADC_CHANNEL_2);
         uint32_t n = adcReadFast(ADC_CHANNEL_3);
 
-        if (p != 0xFFFF && n != 0xFFFF) {
-            int32_t diff = (int32_t)p - (int32_t)n;
-            uint32_t abs_diff = (diff < 0) ? -diff : (uint32_t)diff;
+        if (p == 0xFFFF || n == 0xFFFF) {
+            continue;
+        }
 
-            // ✅ peak (unchanged)
-            if (abs_diff > peak_raw) peak_raw = abs_diff;
+        int32_t diff = (int32_t)p - (int32_t)n;
+        uint32_t abs_diff = (diff < 0) ? (uint32_t)(-diff) : (uint32_t)diff;
 
-            // ✅ NEW: accumulate
-            sum_raw += abs_diff;
-            count++;
+        float v_adc = (float)abs_diff * v_per_count * 0.5f;
+        float v_shunt = v_adc / SHUNT_GAIN;
+        float amps = v_shunt / SHUNT_EFF_OHMS;
+        if (amps < 0.0f) amps = 0.0f;
+
+        /* Peak/average tracking uses the same per-loop current sample. */
+        if (abs_diff > peak_raw) peak_raw = abs_diff;
+        if (amps > peak_current) peak_current = amps;
+        sum_current += amps;
+        sample_count++;
+
+        /*
+         * Inline waveform capture: live vcap read via fast single-sample
+         * on ADC1 (PA3/CH4) and ADC2 (PA4/CH17). Falls back to cached_vcap
+         * if either ADC read fails.
+         */
+        uint32_t now_us = micros_now();
+        if (waveform_capture_active && waveform_index < WAVEFORM_BUFFER_SIZE &&
+            (uint32_t)(now_us - waveform_last_sample_us) >=
+                WAVEFORM_SAMPLE_INTERVAL_US) {
+            float live_vcap = cached_vcap;
+            uint32_t vp_raw = adcReadFast(ADC_CHANNEL_4);
+            uint32_t vn_raw = adcReadFast2(ADC_CHANNEL_17);
+            if (vp_raw != 0xFFFF && vn_raw != 0xFFFF) {
+                int32_t vdiff = (int32_t)vp_raw - (int32_t)vn_raw;
+                float vv = (float)vdiff * v_per_count * V_CAP_DIVIDER;
+                if (vv < 0.0f) vv = 0.0f;
+                live_vcap = vv;
+            }
+            waveform_buffer[waveform_index].current_amps = amps;
+            waveform_buffer[waveform_index].voltage_volts = live_vcap;
+            waveform_buffer[waveform_index].timestamp_us =
+                (uint32_t)(now_us - waveform_capture_start_us);
+            waveform_index++;
+            waveform_last_sample_us = now_us;
         }
     }
 
     cal_adc_peak_raw = peak_raw;
 
-    float v_per_count = measured_vdda / 4095.0f;
-
-    float v_adc = (float)peak_raw * v_per_count;
-
-    float v_shunt = v_adc / SHUNT_GAIN;
-
-    float peak_current = v_shunt / SHUNT_EFF_OHMS;
-
-    float avg_current = 0.0f;
-
-    if (count > 0) {
-        float avg_raw = (float)sum_raw / (float)count;
-        float v_adc_avg = avg_raw * v_per_count;
-        float v_shunt_avg = v_adc_avg / SHUNT_GAIN;
-        avg_current = v_shunt_avg / SHUNT_EFF_OHMS;
-    }
-
-    // ✅ keep peak tracking
     if (peak_current > current_peak_amps) current_peak_amps = peak_current;
 
-    // ✅ store average for later use
-    cal_current_avg = avg_current;
+    cal_current_avg =
+        (sample_count > 0U) ? (sum_current / (float)sample_count) : 0.0f;
+}
 
-    return peak_current;
+/* ============ Waveform Capture Helpers (Phase 3) ============ */
+static uint32_t micros_now(void) {
+    /* Use DWT cycle counter for microsecond timing. Fallback to ms tick if
+     * unavailable. */
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U && SystemCoreClock != 0U) {
+        return (uint32_t)(DWT->CYCCNT / (SystemCoreClock / 1000000U));
+    }
+    return HAL_GetTick() * 1000U;
+}
+
+static void start_weld_pulse_capture(void) {
+    waveform_index = 0;
+    waveform_capture_start_us = micros_now();
+    waveform_last_sample_us = waveform_capture_start_us;
+    waveform_capture_active = true;
+    uartSend("DBG,WAVEFORM_CAPTURE_START");
+}
+
+static void end_weld_pulse_capture(void) {
+    waveform_capture_active = false;
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "DBG,WAVEFORM_CAPTURE_STOP,count=%u",
+             (unsigned int)waveform_index);
+    uartSend(dbg);
+}
+
+static void send_waveform_data(void) {
+    if (waveform_index == 0) {
+        uartSend("DBG,WAVEFORM_EMPTY");
+        return;
+    }
+
+    char line[WAVEFORM_LINE_BUFFER_SIZE];
+    int n = snprintf(line, sizeof(line), "WAVEFORM,%u",
+                     (unsigned int)waveform_index);
+
+    for (uint16_t i = 0; i < waveform_index; i++) {
+        if (n <= 0 || n >= (int)sizeof(line)) break;
+        n += snprintf(line + n, sizeof(line) - (size_t)n, ",%.2f,%.2f",
+                      waveform_buffer[i].current_amps,
+                      waveform_buffer[i].voltage_volts);
+        if (n >= (int)sizeof(line)) break;
+    }
+
+    uartSend(line);
+
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "DBG,WAVEFORM_TX,count=%u,format=WAVEFORM_CSV",
+             (unsigned int)waveform_index);
+    uartSend(dbg);
 }
 
 /* ============ Helpers ============ */
@@ -591,6 +715,13 @@ static void doPulseMsPwm(uint16_t ms, uint16_t duty) {
     if (ms == 0) return;
     if (ms > MAX_WELD_MS) ms = MAX_WELD_MS;
 
+    /*
+     * Timing optimization: cache cap voltage once before each pulse.
+     * readCapVoltage() is intentionally NOT called in the fast 200us sampling
+     * path.
+     */
+    cached_vcap = readCapVoltage();
+
     pwmOnDuty(duty);
     capturePulseAmps(ms);  // Measure while FET is on
     pwmOff();
@@ -664,6 +795,9 @@ static void fireRecipe(void) {
     welding_now = true;
     current_peak_amps = 0.0f;
 
+    /* Phase 3: reset and arm waveform capture for this weld cycle. */
+    start_weld_pulse_capture();
+
     /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
     cal_vcap_before = readCapVoltage();
 
@@ -700,6 +834,10 @@ static void fireRecipe(void) {
     uint32_t total_ms = HAL_GetTick() - t0;
 
     pwmOff();
+
+    /* Phase 3: stop waveform capture immediately when pulse sequence ends. */
+    end_weld_pulse_capture();
+
     welding_now = false;
     last_weld_ms = HAL_GetTick();
 
@@ -713,22 +851,38 @@ static void fireRecipe(void) {
     /* Step 6: ADC diagnostic snapshot AFTER weld (diagnostic only) */
     cal_vcap_after = readCapVoltage();
 
-    float cap_F = 666.0f;
+    /* Lead resistance calibration (measured: 1.87mΩ total loop) */
+    const float LEAD_RESISTANCE = 0.00187f;
+
     float delta_v = cal_vcap_before - cal_vcap_after;
     float time_s = total_ms / 1000.0f;
+
+    /* Voltage drop across leads at average current */
+    float v_drop_leads = cal_current_avg * LEAD_RESISTANCE;
+
+    /* Voltage actually delivered at the weld tips */
+    float v_at_tips = cal_vcap_before - v_drop_leads;
+    if (v_at_tips < 0.0f) v_at_tips = 0.0f;
+
+    /* True energy delivered to weld spot (not cap bank energy) */
+    float energy_joules = v_at_tips * cal_current_avg * time_s;
 
     char buf[256];
     snprintf(buf, sizeof(buf),
              "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
              "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
              "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
-             "avg_a=%.1f",
+             "avg_a=%.1f,v_tips=%.3f,energy_j=%.2f",
              (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
              weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
              preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
              (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
-             delta_v, cal_current_avg);
+             delta_v, cal_current_avg, v_at_tips, energy_joules);
     uartSend(buf);
+
+    /* Phase 3: transmit waveform CSV burst right after weld completion event.
+     */
+    send_waveform_data();
 }
 
 static void SystemClock_Config(void) {
@@ -829,7 +983,7 @@ static void MX_USART1_UART_Init(void) {
     __HAL_RCC_USART1_CLK_ENABLE();
 
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 115200;
+    huart1.Init.BaudRate = 460800;
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;
@@ -1208,10 +1362,11 @@ static float readCapVoltage(void) {
 
     float v = (vP - vN) * V_CAP_DIVIDER;
 
-    // ✅ clamp garbage spikes
+    /* Clamp negative noise to zero (AMC1311B outputs ~0 differential at idle
+     * with no return path – this is correct hardware behavior, not a bug).
+     * Upper clamp removed: allow readings above 9.5V for accurate delta_v
+     * capture during high-charge welds. */
     if (v < 0.0f) v = 0.0f;
-    if (v > 9.5f) v = 9.5f;
-
 
     return v;
 }
@@ -1535,6 +1690,12 @@ int main(void) {
     SystemClock_Config();
     SystemCoreClockUpdate();
     HAL_InitTick(TICK_INT_PRIORITY);
+
+    /* Enable DWT cycle counter for microsecond timestamps used by waveform
+     * capture. */
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     MX_GPIO_Init();
 
