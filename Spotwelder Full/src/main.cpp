@@ -126,10 +126,6 @@ static bool config_sent = false;    // set true after sendBootConfig() runs
 static uint32_t setup_done_ms = 0;  // millis() at end of setup()
 static const uint32_t BOOT_TIMEOUT_MS = 3000;  // fallback if no BOOT msg
 static uint32_t config_sent_ms = 0;  // millis() when sendBootConfig() completed
-static bool boot_ui_synced =
-    false;  // one-shot: draft synced to applied after boot
-static const uint32_t BOOT_UI_SYNC_DELAY_MS =
-    2000;  // wait for STM32 STATUS echo
 static uint32_t last_stm32_boot_sync_ms = 0;
 static const uint32_t STM32_BOOT_RESYNC_DEBOUNCE_MS = 1500;
 
@@ -586,9 +582,11 @@ void pollStm32Uart() {
         if (ch == '\n') {
             if (stmLineOverflow) {
                 droppedUartLines++;
-                Serial.printf("[UART] Dropped overlength STM32 line (%u chars buffered, drops=%lu)\n",
-                              (unsigned int)stmLine.length(),
-                              (unsigned long)droppedUartLines);
+                Serial.printf(
+                    "[UART] Dropped overlength STM32 line (%u chars buffered, "
+                    "drops=%lu)\n",
+                    (unsigned int)stmLine.length(),
+                    (unsigned long)droppedUartLines);
                 stmLine = "";
                 stmLineOverflow = false;
                 continue;
@@ -616,23 +614,24 @@ void pollStm32Uart() {
                     stm32_booted = true;
 
                     uint32_t now = millis();
-                    bool resync_allowed =
-                        (now - last_stm32_boot_sync_ms) >
-                        STM32_BOOT_RESYNC_DEBOUNCE_MS;
+                    bool resync_allowed = (now - last_stm32_boot_sync_ms) >
+                                          STM32_BOOT_RESYNC_DEBOUNCE_MS;
 
                     if (resync_allowed) {
                         if (!config_sent) {
                             sendBootConfig();
                         } else {
                             Serial.println(
-                                "[Boot] STM32 reboot detected after initial sync -> "
-                                "applying safety defaults + auto-sync");
+                                "[Boot] STM32 reboot detected after initial "
+                                "sync -> "
+                                "re-syncing current live settings/state");
                             syncSettingsAfterUiReconnect();
                         }
                         last_stm32_boot_sync_ms = now;
                     } else {
                         Serial.println(
-                            "[Boot] Ignoring duplicate BOOT message (debounced)");
+                            "[Boot] Ignoring duplicate BOOT message "
+                            "(debounced)");
                     }
 
                     stmLine = "";
@@ -1324,7 +1323,8 @@ static void sendBootConfig() {
     requestStm32Status();
 
     config_sent_ms = millis();
-    Serial.println("[Boot] Config sent with safety defaults (DISARMED + PEDAL)");
+    Serial.println(
+        "[Boot] Config sent with safety defaults (DISARMED + PEDAL)");
 }
 
 // =========================
@@ -1338,20 +1338,18 @@ static void syncSettingsAfterUiReconnect() {
         return;
     }
 
-    // SAFETY DEFAULTS: always disarmed + pedal mode on re-sync.
-    stm_armed = false;
-    trigger_mode = TRIGGER_MODE_PEDAL;
-    contact_with_pedal = true;
-
     // Re-validate recipe before sending to STM32.
     if (weld_mode < 1 || weld_mode > 3 || weld_d1 == 0) {
         Serial.printf(
-            "[TCP] Invalid recipe for auto-sync (mode=%u d1=%u) - skipped\n",
+            "[TCP] Invalid recipe for reconnect sync (mode=%u d1=%u) - "
+            "skipped\n",
             (unsigned)weld_mode, (unsigned)weld_d1);
         return;
     }
 
-    Serial.println("[TCP] === Auto-syncing settings with safety defaults ===");
+    Serial.println(
+        "[TCP] === Re-syncing current live settings/state (no forced defaults) "
+        "===");
     Serial.printf(
         "[TCP] Sync values: mode=%u d1=%u gap1=%u d2=%u gap2=%u d3=%u power=%u "
         "preheat_en=%u preheat_ms=%u preheat_pct=%u preheat_gap=%u trigger=%u "
@@ -1381,7 +1379,8 @@ static void syncSettingsAfterUiReconnect() {
     forwardToStm32(String(buf));
     delay(20);
 
-    forwardToStm32("SET_TRIGGER_MODE,1");
+    snprintf(buf, sizeof(buf), "SET_TRIGGER_MODE,%u", (unsigned)trigger_mode);
+    forwardToStm32(String(buf));
     delay(20);
 
     snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%u",
@@ -1389,21 +1388,22 @@ static void syncSettingsAfterUiReconnect() {
     forwardToStm32(String(buf));
     delay(20);
 
-    forwardToStm32("SET_CONTACT_WITH_PEDAL,1");
+    snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%u",
+             (unsigned)(contact_with_pedal ? 1 : 0));
+    forwardToStm32(String(buf));
     delay(20);
 
-    forwardToStm32("ARM,0");
+    snprintf(buf, sizeof(buf), "ARM,%u", (unsigned)(stm_armed ? 1 : 0));
+    forwardToStm32(String(buf));
     delay(20);
 
     // Ask STM32 to immediately publish fresh status after re-sync.
     requestStm32Status();
 
-    // Keep local UI in sync so ARM button doesn't show stale yellow warning.
-    ui_mark_settings_applied();
-
-    // Mark sync optimistic; definitive state is refreshed by incoming STATUS/ACK.
+    // Mark sync optimistic; definitive state is refreshed by incoming
+    // STATUS/ACK.
     stm_synced = true;
-    Serial.println("[TCP] Auto-sync complete with safety defaults: DISARMED + PEDAL");
+    Serial.println("[TCP] Re-sync complete (current state preserved)");
 }
 
 // Callback from UI when config changes
@@ -1546,21 +1546,23 @@ void setup() {
 
     // --- Safety defaults (always on ESP32 reboot) ---
     Serial.println("[Boot] 2/4 Applying safety defaults...");
-    stm_armed = false;                    // always boot disarmed
+    stm_armed = false;  // always boot disarmed
     stm_synced = false;
-    trigger_mode = TRIGGER_MODE_PEDAL;   // always boot in pedal mode
-    contact_with_pedal = true;           // pedal gating enabled
+    trigger_mode = TRIGGER_MODE_PEDAL;  // always boot in pedal mode
+    contact_with_pedal = true;          // pedal gating enabled
 
     Serial.println("[Boot] Safety defaults applied:");
     Serial.println("       - Armed: false");
     Serial.println("       - Trigger mode: PEDAL");
     Serial.println("       - Contact with pedal: enabled");
-    Serial.printf("[Boot] Persistent recipe retained: mode=%u d1=%u gap1=%u d2=%u gap2=%u d3=%u power=%u preheat_en=%u preheat_ms=%u preheat_pct=%u preheat_gap=%u\n",
-                  (unsigned)weld_mode, (unsigned)weld_d1, (unsigned)weld_gap1,
-                  (unsigned)weld_d2, (unsigned)weld_gap2, (unsigned)weld_d3,
-                  (unsigned)weld_power_pct, (unsigned)(preheat_enabled ? 1 : 0),
-                  (unsigned)preheat_ms, (unsigned)preheat_pct,
-                  (unsigned)preheat_gap_ms);
+    Serial.printf(
+        "[Boot] Persistent recipe retained: mode=%u d1=%u gap1=%u d2=%u "
+        "gap2=%u d3=%u power=%u preheat_en=%u preheat_ms=%u preheat_pct=%u "
+        "preheat_gap=%u\n",
+        (unsigned)weld_mode, (unsigned)weld_d1, (unsigned)weld_gap1,
+        (unsigned)weld_d2, (unsigned)weld_gap2, (unsigned)weld_d3,
+        (unsigned)weld_power_pct, (unsigned)(preheat_enabled ? 1 : 0),
+        (unsigned)preheat_ms, (unsigned)preheat_pct, (unsigned)preheat_gap_ms);
 
     // --- Register remaining UI callbacks ---
     ui_set_trigger_source_cb(onTriggerSourceChange);
@@ -1580,7 +1582,8 @@ void setup() {
     WiFi.begin(ssid, password);
 
     setup_done_ms = millis();
-    Serial.println("[Boot] Boot complete - waiting for STM32 BOOT/fallback sync");
+    Serial.println(
+        "[Boot] Boot complete - waiting for STM32 BOOT/fallback sync");
     Serial.println("===========================================");
 }
 
@@ -1600,17 +1603,6 @@ void loop() {
         (now_ms - setup_done_ms) > BOOT_TIMEOUT_MS) {
         Serial.println("[Boot] No BOOT message – sending config via fallback");
         sendBootConfig();
-    }
-
-    // --- Phase 1: One-shot UI sync after boot config + grace period ---
-    // After sendBootConfig() sends settings to STM32 and we wait for the
-    // STM32 to echo them back via STATUS, force-sync draft = applied in UI
-    // so the ARM button doesn't show yellow "Apply settings first!" on boot.
-    if (config_sent && !boot_ui_synced && config_sent_ms > 0 &&
-        (now_ms - config_sent_ms) > BOOT_UI_SYNC_DELAY_MS) {
-        ui_mark_settings_applied();
-        boot_ui_synced = true;
-        Serial.println("[Boot] UI draft/applied sync complete");
     }
 
     // --- Existing logic ---

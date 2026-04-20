@@ -28,7 +28,7 @@
  *   Draft/Apply model – user edits draft values on Pulse tab, clicks Apply
  *   to send recipe to STM32 via callback.  Applied state syncs FROM
  *   WelderDisplayState (authoritative source in main.cpp).
- *   ARM is blocked when draft ≠ applied.
+ *   ARM control remains available even when draft ≠ applied.
  *
  * CONFIG TAB (v1):
  *   5 global settings in 3 sections (Editing, Startup, Display).
@@ -467,13 +467,8 @@ static void paint_arm_button(bool armed) {
         lv_obj_set_style_bg_color(btn_arm, armed ? C_GREEN : C_RED, 0);
     }
     if (lbl_arm) {
-        if (draft_dirty && !armed) {
-            lv_label_set_text(lbl_arm, "Apply settings first!");
-            if (btn_arm) lv_obj_set_style_bg_color(btn_arm, C_YELLOW, 0);
-        } else {
-            lv_label_set_text(lbl_arm, armed ? "ARMED  (tap to disarm)"
-                                             : "DISARMED  (tap to arm)");
-        }
+        lv_label_set_text(lbl_arm, armed ? "ARMED  (tap to disarm)"
+                                         : "DISARMED  (tap to arm)");
     }
 }
 
@@ -520,12 +515,6 @@ static void on_trigger_probe(lv_event_t* e) {
 // ============================================================
 static void arm_btn_event(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
-    // Block arming when draft != applied
-    if (!_last_armed && draft_dirty) {
-        paint_arm_button(false);
-        return;
-    }
 
     bool requested = !_last_armed;
     if (_arm_cb) {
@@ -2069,15 +2058,12 @@ void ui_update(const WelderDisplayState& st) {
     }
 
     first_run = false;
-
 }
 
 // ============================================================
 // PUBLIC: Config API
 // ============================================================
-void ui_set_config_cb(config_change_cb_t cb) {
-    _config_cb = cb;
-}
+void ui_set_config_cb(config_change_cb_t cb) { _config_cb = cb; }
 
 void ui_load_config(const ConfigState& cfg) {
     _cfg = cfg;
@@ -2093,18 +2079,12 @@ void ui_load_config(const ConfigState& cfg) {
     apply_time_step_to_spinboxes();
 }
 
-ConfigState ui_get_config() {
-    return _cfg;
-}
+ConfigState ui_get_config() { return _cfg; }
 
-void ui_set_trigger_source_cb(trigger_source_cb_t cb) {
-    _trigger_cb = cb;
-}
+void ui_set_trigger_source_cb(trigger_source_cb_t cb) { _trigger_cb = cb; }
 
 void ui_set_weld_count_reset_cb(weld_count_reset_cb_t cb) {
     _weld_reset_cb = cb;
 }
 
-void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb) {
-    _cwp_cb = cb;
-}
+void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb) { _cwp_cb = cb; }

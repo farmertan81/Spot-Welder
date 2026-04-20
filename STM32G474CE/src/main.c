@@ -105,7 +105,7 @@ static void send_waveform_data(void);
 
 /* ============ Charger Thresholds (INA226 ONLY) ============ */
 #define CHG_VPACK_ON 8.7f   /* Turn charger ON below this */
-#define CHG_VPACK_OFF 9.07f /* Turn charger OFF at/above this */
+#define CHG_VPACK_OFF 9.11f /* Turn charger OFF at/above this */
 
 /* ============ INA226 Scaling ============ */
 #define V_NODE1_SCALE 0.9950f
@@ -292,8 +292,8 @@ static bool ina226_read_shunt_current(uint8_t addr, float* current) {
     float shunt_voltage_v = signed_raw * 0.0000025f; /* 2.5 µV/bit */
     float calculated_current = shunt_voltage_v / INA226_SHUNT_R;
     *current = (-calculated_current) * CHARGE_CURRENT_CORRECTION;
-    if (fabsf(*current) < 0.05f) *current = 0.0f;
-    if (fabsf(*current) > 50.0f) *current = 0.0f;
+    if (fabsf(*current) < 0.010f) *current = 0.0f;
+    if (*current > 50.0f) *current = 50.0f;
     return true;
 }
 
