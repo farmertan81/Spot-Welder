@@ -73,8 +73,10 @@ static float stm_ichg = 0.0f;
 
 // Voltage/energy naming migration (Phase 1B):
 // - Canonical names from STM32: weld_v/cap_v + *_b/*_a and energy_*_j.
-// - Backward compatibility: keep old vcap_b/vcap_a fields alive in bridge output.
-// - TODO(Phase 2): remove legacy vcap_* compatibility fields once Flask/UI are fully migrated.
+// - Backward compatibility: keep old vcap_b/vcap_a fields alive in bridge
+// output.
+// - TODO(Phase 2): remove legacy vcap_* compatibility fields once Flask/UI are
+// fully migrated.
 float weld_v = 0.0f;
 float cap_v = 0.0f;
 float weld_v_b = 0.0f;
@@ -109,6 +111,10 @@ bool preheat_enabled = false;
 uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
+
+static float lead_resistance_ohms = 0.00187f;  // configurable, persisted
+static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f;
+static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f;
 
 static const uint8_t TRIGGER_MODE_PEDAL = 1;
 static const uint8_t TRIGGER_MODE_CONTACT = 2;
@@ -368,6 +374,9 @@ void handleButton();
 String buildStatus();
 
 static void save_recipe_to_nvs();
+static void save_lead_resistance_to_nvs();
+static void load_lead_resistance_from_nvs();
+static void sendLeadResistanceToStm32(float ohms);
 
 // =========================
 // Helpers
@@ -455,8 +464,10 @@ String buildStatus() {
     status += ",weld_v=" + String(weld_v, 3);
     status += ",cap_v=" + String(cap_v, 3);
     status += ",vcap=" + String(stm_vcap, 3);  // legacy alias of weld_v
-    status += ",vcap_b=" + String(vcap_b, 3);   // legacy field for Flask compatibility
-    status += ",vcap_a=" + String(vcap_a, 3);   // legacy field for Flask compatibility
+    status +=
+        ",vcap_b=" + String(vcap_b, 3);  // legacy field for Flask compatibility
+    status +=
+        ",vcap_a=" + String(vcap_a, 3);  // legacy field for Flask compatibility
     status += ",weld_v_b=" + String(weld_v_b, 3);
     status += ",weld_v_a=" + String(weld_v_a, 3);
     status += ",cap_v_b=" + String(cap_v_b, 3);
@@ -476,6 +487,8 @@ String buildStatus() {
     status += ",preheat_ms=" + String(preheat_ms);
     status += ",preheat_pct=" + String(preheat_pct);
     status += ",preheat_gap_ms=" + String(preheat_gap_ms);
+    status += ",lead_r_ohm=" + String(lead_resistance_ohms, 6);
+    status += ",lead_r_mohm=" + String(lead_resistance_ohms * 1000.0f, 3);
     status += ",mode=" + String(weld_mode);
     status += ",d1=" + String(weld_d1);
     status += ",gap1=" + String(weld_gap1);
@@ -733,6 +746,16 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
+                } else if (stmLine.startsWith("ACK,LEAD_R,")) {
+                    float fv = NAN;
+                    if (extractFloatField(stmLine, "ohm=", fv) &&
+                        isfinite(fv)) {
+                        lead_resistance_ohms = fv;
+                        save_lead_resistance_to_nvs();
+                    }
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
                 } else if (stmLine.startsWith("STATUS,")) {
                     int iv = 0;
                     float fv = NAN;
@@ -751,14 +774,16 @@ void pollStm32Uart() {
 
                     // Voltage field migration parser:
                     // Prefer new canonical fields when present.
-                    // Legacy fields are still parsed as fallback for old STM32 FW.
+                    // Legacy fields are still parsed as fallback for old STM32
+                    // FW.
                     bool got_weld_v = false;
                     if (extractFloatField(stmLine, "weld_v=", fv)) {
                         weld_v = fv;
                         stm_vcap = fv;  // legacy STATUS vcap alias
                         got_weld_v = true;
                     }
-                    if (!got_weld_v && extractFloatField(stmLine, "vcap=", fv)) {
+                    if (!got_weld_v &&
+                        extractFloatField(stmLine, "vcap=", fv)) {
                         weld_v = fv;
                         stm_vcap = fv;
                     }
@@ -767,7 +792,8 @@ void pollStm32Uart() {
                         cap_v = fv;
                     }
 
-                    // STATUS may carry before/after points in some firmware variants.
+                    // STATUS may carry before/after points in some firmware
+                    // variants.
                     if (extractFloatField(stmLine, "weld_v_b=", fv)) {
                         weld_v_b = fv;
                         vcap_b = fv;
@@ -782,8 +808,10 @@ void pollStm32Uart() {
                         weld_v_a = fv;
                         vcap_a = fv;
                     }
-                    if (extractFloatField(stmLine, "cap_v_b=", fv)) cap_v_b = fv;
-                    if (extractFloatField(stmLine, "cap_v_a=", fv)) cap_v_a = fv;
+                    if (extractFloatField(stmLine, "cap_v_b=", fv))
+                        cap_v_b = fv;
+                    if (extractFloatField(stmLine, "cap_v_a=", fv))
+                        cap_v_a = fv;
 
                     if (extractFloatField(stmLine, "energy_cap_j=", fv))
                         energy_cap_j = fv;
@@ -832,6 +860,11 @@ void pollStm32Uart() {
                                 weld_power_pct = (uint8_t)fv;
                             }
 
+                            // Configurable lead resistance (runtime sync from
+                            // STM32)
+                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                                lead_resistance_ohms = fv;
+
                             // Preheat
                             if (extractIntField(stmLine, "preheat_en=", iv))
                                 preheat_enabled = (iv == 1);
@@ -857,6 +890,8 @@ void pollStm32Uart() {
                             // overwrite recipe globals
                             if (extractFloatField(stmLine, "power=", fv))
                                 stm_power = fv;
+                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                                lead_resistance_ohms = fv;
                             Serial.println(
                                 "[SYNC] Recipe sync suppressed (boot grace "
                                 "period)");
@@ -878,7 +913,8 @@ void pollStm32Uart() {
                         stm_weld_current = fv;
                     }
 
-                    // Keep legacy vcap= parser path active for old STM32 builds.
+                    // Keep legacy vcap= parser path active for old STM32
+                    // builds.
                     if (extractFloatField(stmLine, "vcap=", fv)) {
                         stm_vcap = fv;
                         if (!got_weld_v) {
@@ -940,12 +976,14 @@ void pollStm32Uart() {
                     if (extractFloatField(stmLine, "cap_v_a=", fv_done))
                         cap_v_a = fv_done;
 
-                    // Optional instantaneous fields may be included by some builds.
+                    // Optional instantaneous fields may be included by some
+                    // builds.
                     if (extractFloatField(stmLine, "weld_v=", fv_done)) {
                         weld_v = fv_done;
                         stm_vcap = fv_done;
                     }
-                    if (extractFloatField(stmLine, "cap_v=", fv_done)) cap_v = fv_done;
+                    if (extractFloatField(stmLine, "cap_v=", fv_done))
+                        cap_v = fv_done;
 
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
@@ -1100,6 +1138,23 @@ void processCommand(String cmd) {
         preheat_gap_ms = values[3];
 
         forwardToStm32(cmd);
+        return;
+    }
+
+    if (cmd.startsWith("SET_LEAD_R,")) {
+        float mohm = cmd.substring(strlen("SET_LEAD_R,")).toFloat();
+        float ohms = mohm / 1000.0f;
+
+        if (!isfinite(ohms) || ohms < LEAD_RESISTANCE_MIN_OHMS ||
+            ohms > LEAD_RESISTANCE_MAX_OHMS) {
+            sendToPi("ERR:LEAD_R_RANGE");
+            return;
+        }
+
+        lead_resistance_ohms = ohms;
+        save_lead_resistance_to_nvs();
+        sendLeadResistanceToStm32(lead_resistance_ohms);
+        sendToPi(buildStatus());
         return;
     }
 
@@ -1352,6 +1407,44 @@ static void save_recipe_to_nvs() {
     Serial.println("[Config] Recipe saved to NVS");
 }
 
+static void save_lead_resistance_to_nvs() {
+    prefs.begin("spotwelder", false);
+    prefs.putFloat("lead_r_mohm", lead_resistance_ohms * 1000.0f);
+    prefs.end();
+    Serial.printf("[Config] Lead resistance saved: %.3f mOhm\n",
+                  (double)(lead_resistance_ohms * 1000.0f));
+}
+
+static void load_lead_resistance_from_nvs() {
+    prefs.begin("spotwelder", true);
+    float lead_r_mohm = prefs.getFloat("lead_r_mohm", 1.87f);
+    prefs.end();
+
+    float ohms = lead_r_mohm / 1000.0f;
+    if (!isfinite(ohms) || ohms < LEAD_RESISTANCE_MIN_OHMS ||
+        ohms > LEAD_RESISTANCE_MAX_OHMS) {
+        lead_resistance_ohms = 0.00187f;
+        Serial.println(
+            "[Config] Invalid lead resistance in NVS, using default 1.87 mOhm");
+        return;
+    }
+
+    lead_resistance_ohms = ohms;
+    Serial.printf("[Config] Lead resistance loaded: %.3f mOhm\n",
+                  (double)(lead_resistance_ohms * 1000.0f));
+}
+
+static void sendLeadResistanceToStm32(float ohms) {
+    float clamped = ohms;
+    if (!isfinite(clamped) || clamped < LEAD_RESISTANCE_MIN_OHMS)
+        clamped = LEAD_RESISTANCE_MIN_OHMS;
+    if (clamped > LEAD_RESISTANCE_MAX_OHMS) clamped = LEAD_RESISTANCE_MAX_OHMS;
+
+    char buf[48];
+    snprintf(buf, sizeof(buf), "LEAD_R,%.6f", clamped);
+    forwardToStm32(String(buf));
+}
+
 static void load_recipe_from_nvs() {
     prefs.begin("weldrecipe", true);
     weld_mode = prefs.getUChar("mode", weld_mode);
@@ -1425,16 +1518,20 @@ static void sendBootConfig() {
     forwardToStm32("SET_CONTACT_WITH_PEDAL,1");
     delay(20);
 
-    // 7. Force disarmed state for safety
+    // 7. Lead resistance (persisted, in ohms)
+    sendLeadResistanceToStm32(lead_resistance_ohms);
+    delay(20);
+
+    // 8. Force disarmed state for safety
     forwardToStm32("ARM,0");
     delay(20);
 
-    // 8. Kick-start STM32 status broadcasting
+    // 9. Kick-start STM32 status broadcasting
     forwardToStm32("READY,1");
     lastReadySentMs = millis();
     delay(20);
 
-    // 9. Request current STM32 status
+    // 10. Request current STM32 status
     requestStm32Status();
 
     config_sent_ms = millis();
@@ -1506,6 +1603,9 @@ static void syncSettingsAfterUiReconnect() {
     snprintf(buf, sizeof(buf), "SET_CONTACT_WITH_PEDAL,%u",
              (unsigned)(contact_with_pedal ? 1 : 0));
     forwardToStm32(String(buf));
+    delay(20);
+
+    sendLeadResistanceToStm32(lead_resistance_ohms);
     delay(20);
 
     snprintf(buf, sizeof(buf), "ARM,%u", (unsigned)(stm_armed ? 1 : 0));
@@ -1650,6 +1750,7 @@ void setup() {
 
         // Sync globals from loaded config (no STM32 commands)
         contact_with_pedal = cfg.contact_with_pedal;
+        load_lead_resistance_from_nvs();
 
         // Push loaded config to UI widgets (display-side only)
         ui_set_config_cb(onConfigChange);

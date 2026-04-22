@@ -198,6 +198,13 @@ static float cal_vcap_after = 0.0f;
 static uint32_t cal_adc_peak_raw = 0;
 static float cal_current_avg = 0.0f;
 
+/* Configurable lead resistance (default 1.1 mΩ).
+ * Measured: 0.54 mΩ + 0.57 mΩ = 1.1 mΩ total (4-wire Kelvin test).
+ * 41% improvement over previous leads (1.87 mΩ → 1.1 mΩ). */
+static float lead_resistance_ohms = 0.0011f;           // 1.1 mΩ measured
+static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f; /* 0.1 mΩ */
+static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f; /* 10.0 mΩ */
+
 /* ============ Waveform Capture (Phase 3) ============ */
 #define WAVEFORM_BUFFER_SIZE 50
 #define WAVEFORM_LINE_BUFFER_SIZE 1200
@@ -422,9 +429,10 @@ static void sendStatusPacket(void) {
     float power_f = (float)weld_power_pct;
     snprintf(buf, sizeof(buf),
              "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
-             "temp=%.2f,mode=%d,power=%.2f,vdda=%.3f",
+             "temp=%.2f,mode=%d,power=%.2f,vdda=%.3f,lead_r_ohm=%.6f",
              armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
-             temp_filtered_c, (int)weld_mode, power_f, measured_vdda);
+             temp_filtered_c, (int)weld_mode, power_f, measured_vdda,
+             lead_resistance_ohms);
     uartSend(buf);
 
     /* --- Packet 2: STATUS2 (INA226 telemetry) --- */
@@ -859,14 +867,11 @@ static void fireRecipe(void) {
     /* Step 6: ADC diagnostic snapshot AFTER weld (diagnostic only) */
     cal_vcap_after = readCapVoltage();
 
-    /* Lead resistance calibration (measured: 1.87mΩ total loop) */
-    const float LEAD_RESISTANCE = 0.00187f;
-
     float delta_v = cal_vcap_before - cal_vcap_after;
     float time_s = total_ms / 1000.0f;
 
     /* Voltage drop across leads at average current */
-    float v_drop_leads = cal_current_avg * LEAD_RESISTANCE;
+    float v_drop_leads = cal_current_avg * lead_resistance_ohms;
 
     /* Voltage actually delivered at the weld tips */
     float v_at_tips = cal_vcap_before - v_drop_leads;
@@ -1590,6 +1595,40 @@ static void parseCommand(char* line) {
 
         snprintf(response, sizeof(response), "ACK,SET_CONTACT_HOLD,steps=%d",
                  contact_hold_steps);
+        uartSend(response);
+        return;
+    }
+
+    if (strncmp(line, "LEAD_R,", 7) == 0 ||
+        strncmp(line, "SET_LEAD_R,", 11) == 0) {
+        const char* value_str = (line[0] == 'L') ? (line + 7) : (line + 11);
+        char* endptr = NULL;
+        float v = strtof(value_str, &endptr);
+
+        if (endptr == value_str || (endptr && *endptr != '\0') ||
+            !isfinite(v)) {
+            uartSend("ERR,LEAD_R_PARSE");
+            return;
+        }
+
+        if (v < LEAD_RESISTANCE_MIN_OHMS || v > LEAD_RESISTANCE_MAX_OHMS) {
+            snprintf(response, sizeof(response),
+                     "ERR,LEAD_R_RANGE,min=%.6f,max=%.6f",
+                     LEAD_RESISTANCE_MIN_OHMS, LEAD_RESISTANCE_MAX_OHMS);
+            uartSend(response);
+            return;
+        }
+
+        lead_resistance_ohms = v;
+        snprintf(response, sizeof(response), "ACK,LEAD_R,ohm=%.6f,mohm=%.3f",
+                 lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
+        uartSend(response);
+        return;
+    }
+
+    if (strcmp(line, "GET_LEAD_R") == 0 || strcmp(line, "LEAD_R?") == 0) {
+        snprintf(response, sizeof(response), "LEAD_R,ohm=%.6f,mohm=%.3f",
+                 lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
         uartSend(response);
         return;
     }
