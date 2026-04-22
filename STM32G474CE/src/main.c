@@ -78,6 +78,16 @@ static void send_waveform_data(void);
 #define SHUNT_GAIN 8.2f          /* AMC1301 fixed gain                  */
 #define SHUNT_EFF_OHMS 0.000050f /* 50 µΩ effective shunt (calibrated) */
 
+/* ============ Current Calibration Factor ============ */
+/* Calibrated against 400F capacitance discharge test (2025-04-21):
+ *   Discharge test: 8.74V -> 7.70V @30s -> 6.81V @60s, R=0.6Ω
+ *   Result: C = 400F (confirmed via exponential decay)
+ *   Weld test: ΔV=0.103V over 10ms on 400F caps => I_real = 4,120A
+ *   Reported I = 2,339A => error = 1.76x too low
+ * Applied as multiplier on computed amps. Adjust if shunt/chain changes.
+ */
+#define CURRENT_CAL_FACTOR 1.76f
+
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
 #define THERM_NOMINAL_R 10000.0f
@@ -108,7 +118,7 @@ static void send_waveform_data(void);
 #define CHG_VPACK_OFF 9.11f /* Turn charger OFF at/above this */
 
 /* ============ INA226 Scaling ============ */
-#define V_NODE1_SCALE 0.9950f
+#define V_NODE1_SCALE 0.9965f
 #define V_NODE2_SCALE 0.9835f
 #define VPACK_SCALE 1.000f
 
@@ -191,7 +201,7 @@ static float cal_current_avg = 0.0f;
 /* ============ Waveform Capture (Phase 3) ============ */
 #define WAVEFORM_BUFFER_SIZE 50
 #define WAVEFORM_LINE_BUFFER_SIZE 1200
-#define WAVEFORM_SAMPLE_INTERVAL_US 50U
+#define WAVEFORM_SAMPLE_INTERVAL_US 100U
 
 /* Safety check: each sample adds ~14 chars (",AAAA.AA,VV.VV") to WAVEFORM line.
  */
@@ -462,10 +472,6 @@ static uint32_t adcReadFast2(uint32_t channel) {
 }
 
 static void capturePulseAmps(uint16_t ms) {
-    /* Reset waveform interval timer for this pulse (fixes multi-pulse sample
-     * skipping). */
-    waveform_last_sample_us = micros_now();
-
     uint32_t peak_raw = 0;
     float peak_current = 0.0f;
     float sum_current = 0.0f;
@@ -473,64 +479,53 @@ static void capturePulseAmps(uint16_t ms) {
 
     uint32_t start = HAL_GetTick();
     const float v_per_count = measured_vdda / 4095.0f;
+    uint32_t next_sample_us =
+        waveform_last_sample_us + WAVEFORM_SAMPLE_INTERVAL_US;
 
     while ((HAL_GetTick() - start) < ms) {
-        /*
-         * Timing optimization:
-         * - Read shunt ADC channels ONCE per loop.
-         * - Convert to current ONCE.
-         * - Reuse that same current value for pulse stats + waveform sampling.
-         */
+        uint32_t now_us = micros_now();
+        if ((int32_t)(now_us - next_sample_us) < 0) {
+            continue;
+        }
+
         uint32_t p = adcReadFast(ADC_CHANNEL_2);
         uint32_t n = adcReadFast(ADC_CHANNEL_3);
-
         if (p == 0xFFFF || n == 0xFFFF) {
             continue;
         }
 
         int32_t diff = (int32_t)p - (int32_t)n;
-        uint32_t abs_diff = (diff < 0) ? (uint32_t)(-diff) : (uint32_t)diff;
+        if (diff < 0) {
+            diff = 0;
+        }
 
-        float v_adc = (float)abs_diff * v_per_count * 0.5f;
+        float v_adc = (float)diff * v_per_count;
         float v_shunt = v_adc / SHUNT_GAIN;
-        float amps = v_shunt / SHUNT_EFF_OHMS;
-        if (amps < 0.0f) amps = 0.0f;
+        float amps = (v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
+        if (!isfinite(amps) || amps < 0.0f) amps = 0.0f;
 
-        /* Peak/average tracking uses the same per-loop current sample. */
-        if (abs_diff > peak_raw) peak_raw = abs_diff;
+        if ((uint32_t)diff > peak_raw) peak_raw = (uint32_t)diff;
         if (amps > peak_current) peak_current = amps;
         sum_current += amps;
         sample_count++;
 
-        /*
-         * Inline waveform capture: live vcap read via fast single-sample
-         * on ADC1 (PA3/CH4) and ADC2 (PA4/CH17). Falls back to cached_vcap
-         * if either ADC read fails.
-         */
-        uint32_t now_us = micros_now();
-        if (waveform_capture_active && waveform_index < WAVEFORM_BUFFER_SIZE &&
-            (uint32_t)(now_us - waveform_last_sample_us) >=
-                WAVEFORM_SAMPLE_INTERVAL_US) {
-            float live_vcap = cached_vcap;
-            uint32_t vp_raw = adcReadFast(ADC_CHANNEL_4);
-            uint32_t vn_raw = adcReadFast2(ADC_CHANNEL_17);
-            if (vp_raw != 0xFFFF && vn_raw != 0xFFFF) {
-                int32_t vdiff = (int32_t)vp_raw - (int32_t)vn_raw;
-                float vv = (float)vdiff * v_per_count * V_CAP_DIVIDER;
-                if (vv < 0.0f) vv = 0.0f;
-                live_vcap = vv;
-            }
+        if (waveform_capture_active && waveform_index < WAVEFORM_BUFFER_SIZE) {
             waveform_buffer[waveform_index].current_amps = amps;
-            waveform_buffer[waveform_index].voltage_volts = live_vcap;
+            waveform_buffer[waveform_index].voltage_volts = cached_vcap;
             waveform_buffer[waveform_index].timestamp_us =
-                (uint32_t)(now_us - waveform_capture_start_us);
+                (uint32_t)(next_sample_us - waveform_capture_start_us);
             waveform_index++;
-            waveform_last_sample_us = now_us;
+        }
+
+        waveform_last_sample_us = next_sample_us;
+        next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
+
+        while ((int32_t)(now_us - next_sample_us) >= 0) {
+            next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
         }
     }
 
     cal_adc_peak_raw = peak_raw;
-
     if (peak_current > current_peak_amps) current_peak_amps = peak_current;
 
     cal_current_avg =
@@ -798,12 +793,6 @@ static void fireRecipe(void) {
 
     /* === WELD SEQUENCE (modified per refactor plan) === */
 
-    /* Step 0: Start waveform capture BEFORE any weld sequence action.
-     * This ensures the waveform includes the earliest pre-pulse region
-     * instead of starting after current has already risen.
-     */
-    start_weld_pulse_capture();
-
     /* Step 1: Disable charger */
     HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
     charger_enabled = false;
@@ -815,6 +804,10 @@ static void fireRecipe(void) {
     current_peak_amps = 0.0f;
     /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
     cal_vcap_before = readCapVoltage();
+
+    /* Start waveform capture after pre-weld settling, right before pulse train.
+     */
+    start_weld_pulse_capture();
 
     uartSend("EVENT,WELD_START");
 

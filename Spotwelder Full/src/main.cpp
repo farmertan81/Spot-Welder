@@ -70,7 +70,24 @@ static float stm_cell1 = 0.0f;
 static float stm_cell2 = 0.0f;
 static float stm_cell3 = 0.0f;
 static float stm_ichg = 0.0f;
-static float stm_vcap = 0.0f;         // capacitor voltage from STATUS
+
+// Voltage/energy naming migration (Phase 1B):
+// - Canonical names from STM32: weld_v/cap_v + *_b/*_a and energy_*_j.
+// - Backward compatibility: keep old vcap_b/vcap_a fields alive in bridge output.
+// - TODO(Phase 2): remove legacy vcap_* compatibility fields once Flask/UI are fully migrated.
+float weld_v = 0.0f;
+float cap_v = 0.0f;
+float weld_v_b = 0.0f;
+float weld_v_a = 0.0f;
+float cap_v_b = 0.0f;
+float cap_v_a = 0.0f;
+float vcap_b = 0.0f;  // legacy alias for weld_v_b
+float vcap_a = 0.0f;  // legacy alias for weld_v_a
+float energy_cap_j = 0.0f;
+float energy_weld_j = 0.0f;
+float energy_loss_j = 0.0f;
+
+static float stm_vcap = 0.0f;         // legacy STATUS alias for weld_v
 static float stm_power = 0.0f;        // weld power setting from STATUS
 static bool stm_ina_ok = false;       // INA226 health flag from STATUS2
 static bool stm_charger_on = false;   // chg_en field from STATUS2
@@ -421,6 +438,9 @@ String buildStatus() {
 
     float iweld = (fabs(stm_weld_current) < 0.002f) ? 0.0f : stm_weld_current;
 
+    float weld_drop_v = weld_v_b - weld_v_a;
+    float cap_drop_v = cap_v_b - cap_v_a;
+
     String status = "STATUS";
     status += ",enabled=" + String(enabled ? 1 : 0);
     status += ",state=" + state;
@@ -432,7 +452,20 @@ String buildStatus() {
     status += ",cell3=" + String(stm_cell3, 3);
     status += ",ichg=" + String(ichg, 3);
     status += ",iweld=" + String(iweld, 3);
-    status += ",vcap=" + String(stm_vcap, 3);
+    status += ",weld_v=" + String(weld_v, 3);
+    status += ",cap_v=" + String(cap_v, 3);
+    status += ",vcap=" + String(stm_vcap, 3);  // legacy alias of weld_v
+    status += ",vcap_b=" + String(vcap_b, 3);   // legacy field for Flask compatibility
+    status += ",vcap_a=" + String(vcap_a, 3);   // legacy field for Flask compatibility
+    status += ",weld_v_b=" + String(weld_v_b, 3);
+    status += ",weld_v_a=" + String(weld_v_a, 3);
+    status += ",cap_v_b=" + String(cap_v_b, 3);
+    status += ",cap_v_a=" + String(cap_v_a, 3);
+    status += ",weld_v_drop=" + String(weld_drop_v, 3);
+    status += ",cap_v_drop=" + String(cap_drop_v, 3);
+    status += ",energy_cap_j=" + String(energy_cap_j, 3);
+    status += ",energy_weld_j=" + String(energy_weld_j, 3);
+    status += ",energy_loss_j=" + String(energy_loss_j, 3);
     status += ",temp=" + t_str;
     status += ",ina_ok=" + String(stm_ina_ok ? 1 : 0);
     status += ",charger_on=" + String(stm_charger_on ? 1 : 0);
@@ -708,7 +741,6 @@ void pollStm32Uart() {
                         stm_armed = (iv == 1);
                     }
 
-                    // ADD THIS: Fallback voltage source
                     if (extractFloatField(stmLine, "vpack=", fv)) {
                         stm_vpack = fv;
                     }
@@ -716,6 +748,49 @@ void pollStm32Uart() {
                     if (extractIntField(stmLine, "ready=", iv)) {
                         stm_ready = (iv == 1);
                     }
+
+                    // Voltage field migration parser:
+                    // Prefer new canonical fields when present.
+                    // Legacy fields are still parsed as fallback for old STM32 FW.
+                    bool got_weld_v = false;
+                    if (extractFloatField(stmLine, "weld_v=", fv)) {
+                        weld_v = fv;
+                        stm_vcap = fv;  // legacy STATUS vcap alias
+                        got_weld_v = true;
+                    }
+                    if (!got_weld_v && extractFloatField(stmLine, "vcap=", fv)) {
+                        weld_v = fv;
+                        stm_vcap = fv;
+                    }
+
+                    if (extractFloatField(stmLine, "cap_v=", fv)) {
+                        cap_v = fv;
+                    }
+
+                    // STATUS may carry before/after points in some firmware variants.
+                    if (extractFloatField(stmLine, "weld_v_b=", fv)) {
+                        weld_v_b = fv;
+                        vcap_b = fv;
+                    } else if (extractFloatField(stmLine, "vcap_b=", fv)) {
+                        weld_v_b = fv;
+                        vcap_b = fv;
+                    }
+                    if (extractFloatField(stmLine, "weld_v_a=", fv)) {
+                        weld_v_a = fv;
+                        vcap_a = fv;
+                    } else if (extractFloatField(stmLine, "vcap_a=", fv)) {
+                        weld_v_a = fv;
+                        vcap_a = fv;
+                    }
+                    if (extractFloatField(stmLine, "cap_v_b=", fv)) cap_v_b = fv;
+                    if (extractFloatField(stmLine, "cap_v_a=", fv)) cap_v_a = fv;
+
+                    if (extractFloatField(stmLine, "energy_cap_j=", fv))
+                        energy_cap_j = fv;
+                    if (extractFloatField(stmLine, "energy_weld_j=", fv))
+                        energy_weld_j = fv;
+                    if (extractFloatField(stmLine, "energy_loss_j=", fv))
+                        energy_loss_j = fv;
 
                     // ====
                     // RECIPE SYNC FROM STM32 STATUS
@@ -803,9 +878,12 @@ void pollStm32Uart() {
                         stm_weld_current = fv;
                     }
 
-                    // Extract capacitor voltage (ADC measurement)
+                    // Keep legacy vcap= parser path active for old STM32 builds.
                     if (extractFloatField(stmLine, "vcap=", fv)) {
                         stm_vcap = fv;
+                        if (!got_weld_v) {
+                            weld_v = stm_vcap;
+                        }
                     }
 
                     stm_last_status_ms = millis();
@@ -832,6 +910,43 @@ void pollStm32Uart() {
                     welding_now = false;
                     last_weld_time = millis();
                     weld_count++;
+
+                    float fv_done = NAN;
+                    // New energy fields (Phase 1A/1B)
+                    if (extractFloatField(stmLine, "energy_cap_j=", fv_done))
+                        energy_cap_j = fv_done;
+                    if (extractFloatField(stmLine, "energy_weld_j=", fv_done))
+                        energy_weld_j = fv_done;
+                    if (extractFloatField(stmLine, "energy_loss_j=", fv_done))
+                        energy_loss_j = fv_done;
+
+                    // Prefer new before/after voltage names when present.
+                    if (extractFloatField(stmLine, "weld_v_b=", fv_done)) {
+                        weld_v_b = fv_done;
+                        vcap_b = fv_done;
+                    } else if (extractFloatField(stmLine, "vcap_b=", fv_done)) {
+                        weld_v_b = fv_done;
+                        vcap_b = fv_done;
+                    }
+                    if (extractFloatField(stmLine, "weld_v_a=", fv_done)) {
+                        weld_v_a = fv_done;
+                        vcap_a = fv_done;
+                    } else if (extractFloatField(stmLine, "vcap_a=", fv_done)) {
+                        weld_v_a = fv_done;
+                        vcap_a = fv_done;
+                    }
+                    if (extractFloatField(stmLine, "cap_v_b=", fv_done))
+                        cap_v_b = fv_done;
+                    if (extractFloatField(stmLine, "cap_v_a=", fv_done))
+                        cap_v_a = fv_done;
+
+                    // Optional instantaneous fields may be included by some builds.
+                    if (extractFloatField(stmLine, "weld_v=", fv_done)) {
+                        weld_v = fv_done;
+                        stm_vcap = fv_done;
+                    }
+                    if (extractFloatField(stmLine, "cap_v=", fv_done)) cap_v = fv_done;
+
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -1683,6 +1798,17 @@ void loop() {
         ds.cell1_v = stm_cell1;
         ds.cell2_v = stm_cell2;
         ds.cell3_v = stm_cell3;
+        ds.weld_v = weld_v;
+        ds.cap_v = cap_v;
+        ds.weld_v_b = weld_v_b;
+        ds.weld_v_a = weld_v_a;
+        ds.cap_v_b = cap_v_b;
+        ds.cap_v_a = cap_v_a;
+        ds.weld_v_drop = weld_v_b - weld_v_a;
+        ds.cap_v_drop = cap_v_b - cap_v_a;
+        ds.energy_cap_j = energy_cap_j;
+        ds.energy_weld_j = energy_weld_j;
+        ds.energy_loss_j = energy_loss_j;
         ds.armed = stm_armed;
         ds.welding = welding_now;
         ds.charging = stm_charger_on;

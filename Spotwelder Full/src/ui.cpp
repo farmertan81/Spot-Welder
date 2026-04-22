@@ -38,11 +38,12 @@
  *   Hold-to-repeat uses PRESSED/PRESSING events with millis() timing.
  *
  * Provides:
- *   Tab 0  "Status"   – Weld Counter, Trigger Source, Pack V, Temp, Charger I,
- * Cell voltages, Arm toggle Tab 1  "Pulse"    – Mode, Durations, Power (+/-),
- * Preheat (toggle), Apply Tab 2  "Presets"  – placeholder (renamed from
- * Charger) Tab 3  "Config"   – Scrollable: Hold-to-repeat, Time/Power Step,
- * Contact Hold Time, Boot, Brightness Tab 4  "Logs"     – placeholder
+ *   Tab 0  "Status"     – Weld Counter, Trigger Source, Pack V, Temp, Charger
+ * I, Cell voltages, Arm/Disarm toggle Tab 1  "Pulse"      – Mode, Durations,
+ * Power (+/-), Preheat, Apply Tab 2  "Telemetry"  – Weld/cap voltage drop and
+ * energy diagnostics Tab 3  "Config"     – Scrollable: Hold-to-repeat,
+ * Time/Power Step, Contact Hold Time, Boot, Brightness Tab 4  "Logs"       –
+ * placeholder
  */
 
 #include "ui.h"
@@ -247,6 +248,12 @@ static lv_obj_t* lbl_ichg = nullptr;
 static lv_obj_t* lbl_cell1 = nullptr;
 static lv_obj_t* lbl_cell2 = nullptr;
 static lv_obj_t* lbl_cell3 = nullptr;
+static lv_obj_t* lbl_weld_v = nullptr;
+static lv_obj_t* lbl_weld_drop = nullptr;
+static lv_obj_t* lbl_cap_drop = nullptr;
+static lv_obj_t* lbl_energy_cap = nullptr;
+static lv_obj_t* lbl_energy_weld = nullptr;
+static lv_obj_t* lbl_energy_loss = nullptr;
 static lv_obj_t* btn_arm = nullptr;
 static lv_obj_t* lbl_arm = nullptr;
 static lv_obj_t* lbl_state = nullptr;
@@ -267,7 +274,7 @@ static uint8_t _trigger_mode = 1;  // 1=Pedal, 2=Probe Contact
 // ============================================================
 static lv_obj_t* tab_status = nullptr;
 static lv_obj_t* tab_pulse = nullptr;
-static lv_obj_t* tab_presets = nullptr;
+static lv_obj_t* tab_telemetry = nullptr;
 static lv_obj_t* tab_config = nullptr;
 static lv_obj_t* tab_logs = nullptr;
 
@@ -698,8 +705,11 @@ static void build_status_tab(lv_obj_t* tab) {
                               &lv_font_montserrat_14);
     lv_obj_set_pos(cc3, cx + 2 * (cell_w + GAP), y_row2);
 
+    // Telemetry diagnostics moved to dedicated Telemetry tab to keep
+    // the Arm/Disarm control fully visible on the safety-critical Status tab.
+
     // ARM button – plain lv_obj (Widget A pattern – NO lv_button!)
-    const int y_arm = y_row2 + cell_h + GAP + 10;  // slightly lower
+    const int y_arm = y_row2 + cell_h + GAP + 4;
     btn_arm = lv_obj_create(tab);
     lv_obj_remove_style_all(btn_arm);
     lv_obj_add_flag(btn_arm, LV_OBJ_FLAG_CLICKABLE);
@@ -1273,6 +1283,47 @@ static void build_pulse_tab(lv_obj_t* tab) {
 }
 
 // ============================================================
+// TELEMETRY TAB BUILDER (Phase 1B diagnostics moved off Status tab)
+// ============================================================
+static void build_telemetry_tab(lv_obj_t* tab) {
+    lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(tab, 10, LV_PART_MAIN);
+    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int CONTENT_W = 780;
+    const int GAP = 10;
+    const int card_w = (CONTENT_W - GAP) / 2;
+    const int card_h = 106;
+    const int x0 = (CONTENT_W - (2 * card_w + GAP)) / 2;
+    const int y0 = 6;
+
+    lv_obj_t* m1 = make_card(tab, "Weld Voltage", &lbl_weld_v, card_w, card_h,
+                             &lv_font_montserrat_14);
+    lv_obj_set_pos(m1, x0, y0);
+
+    lv_obj_t* m2 = make_card(tab, "Weld V Drop", &lbl_weld_drop, card_w, card_h,
+                             &lv_font_montserrat_14);
+    lv_obj_set_pos(m2, x0 + card_w + GAP, y0);
+
+    lv_obj_t* m3 = make_card(tab, "Cap V Drop", &lbl_cap_drop, card_w, card_h,
+                             &lv_font_montserrat_14);
+    lv_obj_set_pos(m3, x0, y0 + card_h + GAP);
+
+    lv_obj_t* e1 = make_card(tab, "E Cap (J)", &lbl_energy_cap, card_w, card_h,
+                             &lv_font_montserrat_14);
+    lv_obj_set_pos(e1, x0 + card_w + GAP, y0 + card_h + GAP);
+
+    lv_obj_t* e2 = make_card(tab, "E Weld (J)", &lbl_energy_weld, card_w,
+                             card_h, &lv_font_montserrat_14);
+    lv_obj_set_pos(e2, x0, y0 + 2 * (card_h + GAP));
+
+    lv_obj_t* e3 = make_card(tab, "E Loss (J)", &lbl_energy_loss, card_w,
+                             card_h, &lv_font_montserrat_14);
+    lv_obj_set_pos(e3, x0 + card_w + GAP, y0 + 2 * (card_h + GAP));
+}
+
+// ============================================================
 // PLACEHOLDER TAB BUILDER
 // ============================================================
 static void build_placeholder_tab(lv_obj_t* tab, const char* name) {
@@ -1720,14 +1771,14 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
 
     tab_status = lv_tabview_add_tab(tv, LV_SYMBOL_HOME " Status");
     tab_pulse = lv_tabview_add_tab(tv, LV_SYMBOL_CHARGE " Pulse");
-    tab_presets = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Presets");
+    tab_telemetry = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Telemetry");
     tab_config = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Config");
     tab_logs = lv_tabview_add_tab(tv, LV_SYMBOL_BELL " Logs");
 
     // Build all tab contents now that tab objects exist
     build_status_tab(tab_status);
     build_pulse_tab(tab_pulse);
-    build_placeholder_tab(tab_presets, "Presets");
+    build_telemetry_tab(tab_telemetry);
     build_config_tab(tab_config);
     build_placeholder_tab(tab_logs, "Logs");
 
@@ -1743,8 +1794,8 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     lv_obj_clear_flag(tab_pulse, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_set_scrollbar_mode(tab_pulse, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_clear_flag(tab_presets, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(tab_presets, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_telemetry, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_telemetry, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
     lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
@@ -1835,6 +1886,12 @@ void ui_update(const WelderDisplayState& st) {
     static float prev_cell1 = -999.0f;
     static float prev_cell2 = -999.0f;
     static float prev_cell3 = -999.0f;
+    static float prev_weld_v = -999.0f;
+    static float prev_weld_drop = -999.0f;
+    static float prev_cap_drop = -999.0f;
+    static float prev_energy_cap = -999.0f;
+    static float prev_energy_weld = -999.0f;
+    static float prev_energy_loss = -999.0f;
     static bool prev_armed = false;
     static bool prev_welding = false;
     static bool prev_charging = false;
@@ -1899,6 +1956,52 @@ void ui_update(const WelderDisplayState& st) {
         snprintf(buf, sizeof(buf), "%.3f V", (double)st.cell3_v);
         lv_label_set_text(lbl_cell3, buf);
         prev_cell3 = st.cell3_v;
+    }
+
+    // ---- Phase 1B voltage/energy cards ----
+    if (lbl_weld_v && (first_run || fabsf(st.weld_v - prev_weld_v) >= 0.01f)) {
+        snprintf(buf, sizeof(buf), "%.2f V", (double)st.weld_v);
+        lv_label_set_text(lbl_weld_v, buf);
+        prev_weld_v = st.weld_v;
+    }
+
+    if (lbl_weld_drop &&
+        (first_run || fabsf(st.weld_v_drop - prev_weld_drop) >= 0.005f)) {
+        snprintf(buf, sizeof(buf), "%.3f V", (double)st.weld_v_drop);
+        lv_label_set_text(lbl_weld_drop, buf);
+        lv_obj_set_style_text_color(lbl_weld_drop,
+                                    (st.weld_v_drop > 0.30f) ? C_RED : C_GREEN,
+                                    LV_PART_MAIN);
+        prev_weld_drop = st.weld_v_drop;
+    }
+
+    if (lbl_cap_drop &&
+        (first_run || fabsf(st.cap_v_drop - prev_cap_drop) >= 0.005f)) {
+        snprintf(buf, sizeof(buf), "%.3f V", (double)st.cap_v_drop);
+        lv_label_set_text(lbl_cap_drop, buf);
+        lv_obj_set_style_text_color(lbl_cap_drop,
+                                    (st.cap_v_drop > 0.40f) ? C_RED : C_GREEN,
+                                    LV_PART_MAIN);
+        prev_cap_drop = st.cap_v_drop;
+    }
+
+    if (lbl_energy_cap &&
+        (first_run || fabsf(st.energy_cap_j - prev_energy_cap) >= 0.05f)) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_cap_j);
+        lv_label_set_text(lbl_energy_cap, buf);
+        prev_energy_cap = st.energy_cap_j;
+    }
+    if (lbl_energy_weld &&
+        (first_run || fabsf(st.energy_weld_j - prev_energy_weld) >= 0.05f)) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_weld_j);
+        lv_label_set_text(lbl_energy_weld, buf);
+        prev_energy_weld = st.energy_weld_j;
+    }
+    if (lbl_energy_loss &&
+        (first_run || fabsf(st.energy_loss_j - prev_energy_loss) >= 0.05f)) {
+        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_loss_j);
+        lv_label_set_text(lbl_energy_loss, buf);
+        prev_energy_loss = st.energy_loss_j;
     }
 
     // ---- Weld Counter ----

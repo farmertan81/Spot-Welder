@@ -14,6 +14,18 @@ struct WelderDisplayState {
     float temperature;
     float charger_current;
     float cell1_v, cell2_v, cell3_v;
+
+    // Phase 1B voltage/energy telemetry (from STM32 UART parser in main.cpp)
+    float weld_v;
+    float cap_v;
+    float weld_v_b, weld_v_a;
+    float cap_v_b, cap_v_a;
+    float weld_v_drop;
+    float cap_v_drop;
+    float energy_cap_j;
+    float energy_weld_j;
+    float energy_loss_j;
+
     bool armed;
     bool welding;
     bool charging;
@@ -84,6 +96,20 @@ typedef void (*weld_count_reset_cb_t)(void);
 
 // Callback type for contact-with-pedal toggle changes from Config tab
 typedef void (*contact_with_pedal_cb_t)(bool enabled);
+
+// Phase 1B shared telemetry globals (defined in src/main.cpp)
+// Kept here so ui.cpp and other modules can read the live parser outputs.
+extern float weld_v;
+extern float cap_v;
+extern float weld_v_b;
+extern float weld_v_a;
+extern float cap_v_b;
+extern float cap_v_a;
+extern float vcap_b;  // legacy alias for weld_v_b
+extern float vcap_a;  // legacy alias for weld_v_a
+extern float energy_cap_j;
+extern float energy_weld_j;
+extern float energy_loss_j;
 
 // Initialize the 5-screen tabview UI.  Call once after smartdisplay_init().
 void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply);
