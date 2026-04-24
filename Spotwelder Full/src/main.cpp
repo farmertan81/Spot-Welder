@@ -988,10 +988,13 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("WAVEFORM,")) {
+                } else if (stmLine.startsWith("WAVEFORM,") ||
+                           stmLine.startsWith("WAVEFORM_")) {
+                    // Forward waveform packets transparently (legacy
+                    // single-line format and chunked WAVEFORM_START/DATA/END
+                    // format).
                     sendToPi(stmLine);
-                    delayMicroseconds(
-                        200);  // ← gives WiFi stack breathing room
+                    delayMicroseconds(200);  // gives WiFi stack breathing room
                 } else if (stmLine.length() > 10 && isdigit(stmLine[0])) {
                     // Bare CSV waveform line (no prefix)
                     sendToPi(stmLine);
@@ -1024,15 +1027,19 @@ void pollStm32Uart() {
             }
 
             size_t maxLineLength = MAX_LINE_LENGTH;
-            if (stmLine.startsWith("WAVEFORM,")) {
+            if (stmLine.startsWith("WAVEFORM,") ||
+                stmLine.startsWith("WAVEFORM_")) {
                 maxLineLength = MAX_WAVEFORM_LINE_LENGTH;
             } else if (stmLine.length() < 9) {
-                const char* wfPrefix = "WAVEFORM,";
-                bool possibleWaveform = true;
-                for (size_t i = 0; i < stmLine.length(); ++i) {
-                    if (stmLine[i] != wfPrefix[i]) {
-                        possibleWaveform = false;
-                        break;
+                const char* wfPrefixes[] = {"WAVEFORM,", "WAVEFORM_"};
+                bool possibleWaveform = false;
+                for (size_t p = 0; p < 2 && !possibleWaveform; ++p) {
+                    possibleWaveform = true;
+                    for (size_t i = 0; i < stmLine.length(); ++i) {
+                        if (stmLine[i] != wfPrefixes[p][i]) {
+                            possibleWaveform = false;
+                            break;
+                        }
                     }
                 }
                 if (possibleWaveform) {

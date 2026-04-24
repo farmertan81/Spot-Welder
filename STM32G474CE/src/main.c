@@ -40,7 +40,7 @@ static bool contactDetected(void);
 /* NEW: Shunt Sensing Forward Decl */
 static uint32_t adcReadFast(uint32_t channel);
 static uint32_t adcReadFast2(uint32_t channel);
-static void capturePulseAmps(uint16_t ms);
+static void capturePulseAmps(uint16_t ms, uint16_t duty);
 
 /* NEW: INA226 Forward Decl */
 static bool ina226_write_reg(uint8_t addr, uint8_t reg, uint16_t val);
@@ -55,8 +55,14 @@ static void sendStatusPacket(void);
 /* Waveform capture helpers (Phase 3) */
 static uint32_t micros_now(void);
 static void start_weld_pulse_capture(void);
+static void capture_waveform_samples(uint16_t sample_count);
 static void end_weld_pulse_capture(void);
+static void apply_waveform_voltage_interpolation(float vcap_start,
+                                                 float vcap_end,
+                                                 uint16_t pulse_start_index,
+                                                 uint16_t pulse_end_index);
 static void send_waveform_data(void);
+static uint16_t get_planned_active_pulse_ms(void);
 
 /* ============ Pins (fixed) ============ */
 #define WELD_TIM TIM1
@@ -133,6 +139,11 @@ static const float CONTACT_THRESHOLD_V_DEFAULT = 1.5f;
 static const uint32_t CONTACT_SAMPLE_MS = 10;
 static const uint32_t CONTACT_DEBOUNCE_MS = 50;
 
+/* UART TX pacing for long WAVEFORM lines.
+ * 256 bytes @115200 baud is ~22ms on wire, so 250ms timeout is generous. */
+static const uint32_t UART_TX_CHUNK_SIZE = 256U;
+static const uint32_t UART_TX_TIMEOUT_MS = 250U;
+
 /* ============ PWM Settings ============ */
 static const uint16_t PWM_MAX = 1023;
 static const uint16_t TIM1_PSC = 0;
@@ -206,15 +217,32 @@ static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f; /* 0.1 mΩ */
 static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f; /* 10.0 mΩ */
 
 /* ============ Waveform Capture (Phase 3) ============ */
-#define WAVEFORM_BUFFER_SIZE 50
-#define WAVEFORM_LINE_BUFFER_SIZE 1200
+#define WAVEFORM_BUFFER_SIZE 1024
+#define WAVEFORM_LINE_BUFFER_SIZE 25000
+#define WAVEFORM_CHUNK_SAMPLES 50U
 #define WAVEFORM_SAMPLE_INTERVAL_US 100U
+#define PWM_PERIOD_US 100U
+#define WAVEFORM_PWM_PHASE_SWEEP_STEP_US 12U
+#define WAVEFORM_PWM_PHASE_SWEEP_SAMPLES 6U
+#define WAVEFORM_PRE_SAMPLES 10U  /* 1ms pre-buffer */
+#define WAVEFORM_POST_SAMPLES 10U /* 1ms post-buffer */
+#define WAVEFORM_MAX_PULSE_MS 100U
+#define WAVEFORM_MAX_ACTIVE_SAMPLES \
+    ((WAVEFORM_MAX_PULSE_MS * 1000U) / WAVEFORM_SAMPLE_INTERVAL_US)
+
+/* Capture capacity supports up to 1ms pre + 100ms pulse + 1ms post = 1020
+ * samples. */
+_Static_assert(WAVEFORM_BUFFER_SIZE >=
+                   (WAVEFORM_PRE_SAMPLES + WAVEFORM_MAX_ACTIVE_SAMPLES +
+                    WAVEFORM_POST_SAMPLES),
+               "WAVEFORM_BUFFER_SIZE too small for 100ms capture window");
 
 /* Safety check: each sample adds ~14 chars (",AAAA.AA,VV.VV") to WAVEFORM line.
  */
-_Static_assert(WAVEFORM_BUFFER_SIZE <= 80,
-               "WAVEFORM_BUFFER_SIZE too large for line buffer - increase "
-               "WAVEFORM_LINE_BUFFER_SIZE");
+_Static_assert(WAVEFORM_BUFFER_SIZE <= 1024,
+               "Unexpected waveform buffer growth; re-check UART line budget");
+_Static_assert(WAVEFORM_LINE_BUFFER_SIZE >= (WAVEFORM_BUFFER_SIZE * 18),
+               "WAVEFORM_LINE_BUFFER_SIZE too small for waveform CSV payload");
 
 typedef struct {
     float current_amps;
@@ -227,6 +255,8 @@ static volatile uint16_t waveform_index = 0;
 static volatile bool waveform_capture_active = false;
 static uint32_t waveform_capture_start_us = 0;
 static uint32_t waveform_last_sample_us = 0;
+static uint16_t waveform_pulse_start_index = 0;
+static uint16_t waveform_pulse_end_index = 0;
 /* Cached once before each pulse to avoid slow 16x averaged voltage reads during
  * 200us sampling. */
 static float cached_vcap = 0.0f;
@@ -479,18 +509,186 @@ static uint32_t adcReadFast2(uint32_t channel) {
     return val;
 }
 
-static void capturePulseAmps(uint16_t ms) {
+static void capturePulseAmps(uint16_t ms, uint16_t duty) {
     uint32_t peak_raw = 0;
     float peak_current = 0.0f;
     float sum_current = 0.0f;
     uint32_t sample_count = 0;
 
-    uint32_t start = HAL_GetTick();
+    const float v_per_count = measured_vdda / 4095.0f;
+
+    /*
+     * IMPORTANT (preheat fix): when PWM duty < 100%, sampling exactly every
+     * 100us can phase-lock to TIM1's 100us period and repeatedly hit OFF time,
+     * producing false near-zero current during preheat. Sweep several ADC reads
+     * across each 100us sample slot and keep the max to reliably capture
+     * ON-time current.
+     */
+    const bool pulse_uses_pwm_window =
+        (duty > 0U) && (duty < PWM_MAX) &&
+        (WAVEFORM_SAMPLE_INTERVAL_US == PWM_PERIOD_US);
+
+    /* Time-based pulse window: keep MOSFET on until exact deadline.
+     * Sampling is anchored to pulse_start_us so waveform samples stay aligned
+     * with the real MOSFET on-window. */
+    uint32_t pulse_start_us = micros_now();
+    uint32_t pulse_deadline_us = pulse_start_us + ((uint32_t)ms * 1000U);
+    uint32_t next_sample_us = pulse_start_us;
+    uint32_t pulse_target_samples =
+        (((uint32_t)ms * 1000U) / WAVEFORM_SAMPLE_INTERVAL_US);
+
+    while ((int32_t)(micros_now() - pulse_deadline_us) < 0) {
+        uint32_t now_us = micros_now();
+        if ((int32_t)(now_us - next_sample_us) < 0) {
+            continue;
+        }
+
+        int32_t diff = 0;
+        float amps = 0.0f;
+
+        if (pulse_uses_pwm_window) {
+            int32_t best_diff = 0;
+            float best_amps = 0.0f;
+            uint32_t slot_anchor_us = next_sample_us;
+
+            for (uint16_t sweep_i = 0;
+                 sweep_i < WAVEFORM_PWM_PHASE_SWEEP_SAMPLES; sweep_i++) {
+                uint32_t target_us =
+                    slot_anchor_us +
+                    ((uint32_t)sweep_i * WAVEFORM_PWM_PHASE_SWEEP_STEP_US);
+                while ((int32_t)(micros_now() - target_us) < 0) {
+                    __NOP();
+                }
+
+                uint32_t p = adcReadFast(ADC_CHANNEL_2);
+                uint32_t n = adcReadFast(ADC_CHANNEL_3);
+                if (p == 0xFFFF || n == 0xFFFF) {
+                    continue;
+                }
+
+                int32_t sweep_diff = (int32_t)p - (int32_t)n;
+                if (sweep_diff < 0) {
+                    sweep_diff = 0;
+                }
+
+                float sweep_v_adc = (float)sweep_diff * v_per_count;
+                float sweep_v_shunt = sweep_v_adc / SHUNT_GAIN;
+                float sweep_amps =
+                    (sweep_v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
+                if (!isfinite(sweep_amps) || sweep_amps < 0.0f) {
+                    sweep_amps = 0.0f;
+                }
+
+                if (sweep_amps >= best_amps) {
+                    best_amps = sweep_amps;
+                    best_diff = sweep_diff;
+                }
+            }
+
+            diff = best_diff;
+            amps = best_amps;
+        } else {
+            uint32_t p = adcReadFast(ADC_CHANNEL_2);
+            uint32_t n = adcReadFast(ADC_CHANNEL_3);
+            if (p == 0xFFFF || n == 0xFFFF) {
+                continue;
+            }
+
+            diff = (int32_t)p - (int32_t)n;
+            if (diff < 0) {
+                diff = 0;
+            }
+
+            float v_adc = (float)diff * v_per_count;
+            float v_shunt = v_adc / SHUNT_GAIN;
+            amps = (v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
+            if (!isfinite(amps) || amps < 0.0f) amps = 0.0f;
+        }
+
+        if ((uint32_t)diff > peak_raw) peak_raw = (uint32_t)diff;
+        if (amps > peak_current) peak_current = amps;
+        sum_current += amps;
+        sample_count++;
+
+        if (waveform_capture_active && waveform_index < WAVEFORM_BUFFER_SIZE) {
+            waveform_buffer[waveform_index].current_amps = amps;
+            waveform_buffer[waveform_index].voltage_volts = cached_vcap;
+            waveform_buffer[waveform_index].timestamp_us =
+                (uint32_t)(next_sample_us - waveform_capture_start_us);
+            waveform_index++;
+        }
+
+        waveform_last_sample_us = next_sample_us;
+        next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
+
+        if (pulse_target_samples > 0U && sample_count >= pulse_target_samples) {
+            while ((int32_t)(micros_now() - pulse_deadline_us) < 0) {
+                __NOP();
+            }
+            break;
+        }
+
+        now_us = micros_now();
+        while ((int32_t)(now_us - next_sample_us) >= 0) {
+            next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
+        }
+    }
+
+    uint32_t pulse_end_us = micros_now();
+    uint32_t actual_duration_us = pulse_end_us - pulse_start_us;
+
+    char dbg[156];
+    snprintf(
+        dbg, sizeof(dbg),
+        "DBG,PULSE_TIMING,pulse_start_us=%lu,pulse_end_us=%lu,actual_duration_"
+        "us=%lu,target_duration_us=%lu,pwm_duty=%u,phase_sweep=%u",
+        (unsigned long)pulse_start_us, (unsigned long)pulse_end_us,
+        (unsigned long)actual_duration_us,
+        (unsigned long)((uint32_t)ms * 1000U), (unsigned int)duty,
+        pulse_uses_pwm_window ? 1U : 0U);
+    uartSend(dbg);
+
+    cal_adc_peak_raw = peak_raw;
+    if (peak_current > current_peak_amps) current_peak_amps = peak_current;
+
+    cal_current_avg =
+        (sample_count > 0U) ? (sum_current / (float)sample_count) : 0.0f;
+}
+
+/* ============ Waveform Capture Helpers (Phase 3) ============ */
+static uint32_t micros_now(void) {
+    /* Use DWT cycle counter for microsecond timing. Fallback to ms tick if
+     * unavailable. */
+    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U && SystemCoreClock != 0U) {
+        return (uint32_t)(DWT->CYCCNT / (SystemCoreClock / 1000000U));
+    }
+    return HAL_GetTick() * 1000U;
+}
+
+static void start_weld_pulse_capture(void) {
+    waveform_index = 0;
+    waveform_pulse_start_index = 0;
+    waveform_pulse_end_index = 0;
+    waveform_capture_start_us = micros_now();
+    waveform_last_sample_us = waveform_capture_start_us;
+    waveform_capture_active = true;
+    uartSend("DBG,WAVEFORM_CAPTURE_START");
+}
+
+static void capture_waveform_samples(uint16_t sample_count) {
+    if (!waveform_capture_active || sample_count == 0U) {
+        return;
+    }
+
     const float v_per_count = measured_vdda / 4095.0f;
     uint32_t next_sample_us =
         waveform_last_sample_us + WAVEFORM_SAMPLE_INTERVAL_US;
 
-    while ((HAL_GetTick() - start) < ms) {
+    for (uint16_t captured = 0; captured < sample_count;) {
+        if (waveform_index >= WAVEFORM_BUFFER_SIZE) {
+            break;
+        }
+
         uint32_t now_us = micros_now();
         if ((int32_t)(now_us - next_sample_us) < 0) {
             continue;
@@ -512,18 +710,12 @@ static void capturePulseAmps(uint16_t ms) {
         float amps = (v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
         if (!isfinite(amps) || amps < 0.0f) amps = 0.0f;
 
-        if ((uint32_t)diff > peak_raw) peak_raw = (uint32_t)diff;
-        if (amps > peak_current) peak_current = amps;
-        sum_current += amps;
-        sample_count++;
-
-        if (waveform_capture_active && waveform_index < WAVEFORM_BUFFER_SIZE) {
-            waveform_buffer[waveform_index].current_amps = amps;
-            waveform_buffer[waveform_index].voltage_volts = cached_vcap;
-            waveform_buffer[waveform_index].timestamp_us =
-                (uint32_t)(next_sample_us - waveform_capture_start_us);
-            waveform_index++;
-        }
+        waveform_buffer[waveform_index].current_amps = amps;
+        waveform_buffer[waveform_index].voltage_volts = cached_vcap;
+        waveform_buffer[waveform_index].timestamp_us =
+            (uint32_t)(next_sample_us - waveform_capture_start_us);
+        waveform_index++;
+        captured++;
 
         waveform_last_sample_us = next_sample_us;
         next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
@@ -532,49 +724,57 @@ static void capturePulseAmps(uint16_t ms) {
             next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
         }
     }
-
-    cal_adc_peak_raw = peak_raw;
-    if (peak_current > current_peak_amps) current_peak_amps = peak_current;
-
-    cal_current_avg =
-        (sample_count > 0U) ? (sum_current / (float)sample_count) : 0.0f;
-}
-
-/* ============ Waveform Capture Helpers (Phase 3) ============ */
-static uint32_t micros_now(void) {
-    /* Use DWT cycle counter for microsecond timing. Fallback to ms tick if
-     * unavailable. */
-    if ((DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk) != 0U && SystemCoreClock != 0U) {
-        return (uint32_t)(DWT->CYCCNT / (SystemCoreClock / 1000000U));
-    }
-    return HAL_GetTick() * 1000U;
-}
-
-static void start_weld_pulse_capture(void) {
-    waveform_index = 0;
-    waveform_capture_start_us = micros_now();
-
-    /* Manual anchor sample: force waveform to start at 0A before first real
-     * captured sample (which may already be >0A due to fast pulse rise).
-     * Use a FRESH capacitor-voltage read here for best accuracy; this runs
-     * once before the pulse, so it has no impact on high-speed sampling.
-     */
-    waveform_buffer[0].current_amps = 0.0f;
-    waveform_buffer[0].voltage_volts = readCapVoltage();
-    waveform_buffer[0].timestamp_us = 0;
-    waveform_index = 1;
-
-    waveform_last_sample_us = waveform_capture_start_us;
-    waveform_capture_active = true;
-    uartSend("DBG,WAVEFORM_CAPTURE_START,seed=0A");
 }
 
 static void end_weld_pulse_capture(void) {
     waveform_capture_active = false;
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "DBG,WAVEFORM_CAPTURE_STOP,count=%u",
-             (unsigned int)waveform_index);
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg),
+             "DBG,WAVEFORM_CAPTURE_STOP,count=%u,pulse_start_idx=%u,pulse_end_"
+             "idx=%u",
+             (unsigned int)waveform_index,
+             (unsigned int)waveform_pulse_start_index,
+             (unsigned int)waveform_pulse_end_index);
     uartSend(dbg);
+}
+
+static void apply_waveform_voltage_interpolation(float vcap_start,
+                                                 float vcap_end,
+                                                 uint16_t pulse_start_index,
+                                                 uint16_t pulse_end_index) {
+    if (waveform_index == 0U) {
+        return;
+    }
+
+    if (pulse_start_index > waveform_index) {
+        pulse_start_index = waveform_index;
+    }
+
+    if (pulse_end_index < pulse_start_index) {
+        pulse_end_index = pulse_start_index;
+    }
+
+    if (pulse_end_index > waveform_index) {
+        pulse_end_index = waveform_index;
+    }
+
+    for (uint16_t i = 0; i < pulse_start_index; i++) {
+        waveform_buffer[i].voltage_volts = vcap_start;
+    }
+
+    if (pulse_end_index > pulse_start_index) {
+        const float dv = vcap_start - vcap_end;
+        const float denom = (float)(pulse_end_index - pulse_start_index);
+
+        for (uint16_t i = pulse_start_index; i < pulse_end_index; i++) {
+            const float t = (float)(i - pulse_start_index) / denom;
+            waveform_buffer[i].voltage_volts = vcap_start - (dv * t);
+        }
+    }
+
+    for (uint16_t i = pulse_end_index; i < waveform_index; i++) {
+        waveform_buffer[i].voltage_volts = vcap_end;
+    }
 }
 
 static void send_waveform_data(void) {
@@ -584,29 +784,113 @@ static void send_waveform_data(void) {
     }
 
     char line[WAVEFORM_LINE_BUFFER_SIZE];
-    int n = snprintf(line, sizeof(line), "WAVEFORM,%u",
-                     (unsigned int)waveform_index);
-
-    for (uint16_t i = 0; i < waveform_index; i++) {
-        if (n <= 0 || n >= (int)sizeof(line)) break;
-        n += snprintf(line + n, sizeof(line) - (size_t)n, ",%.2f,%.2f",
-                      waveform_buffer[i].current_amps,
-                      waveform_buffer[i].voltage_volts);
-        if (n >= (int)sizeof(line)) break;
+    int n = snprintf(line, sizeof(line), "WAVEFORM_START,%u,%u,%u",
+                     (unsigned int)waveform_index,
+                     (unsigned int)waveform_pulse_start_index,
+                     (unsigned int)waveform_pulse_end_index);
+    if (n > 0 && n < (int)sizeof(line)) {
+        uartSend(line);
     }
 
-    uartSend(line);
+    for (uint16_t chunk_start = 0; chunk_start < waveform_index;
+         chunk_start += (uint16_t)WAVEFORM_CHUNK_SAMPLES) {
+        uint16_t remaining = (uint16_t)(waveform_index - chunk_start);
+        uint16_t chunk_count = (remaining > (uint16_t)WAVEFORM_CHUNK_SAMPLES)
+                                   ? (uint16_t)WAVEFORM_CHUNK_SAMPLES
+                                   : remaining;
 
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "DBG,WAVEFORM_TX,count=%u,format=WAVEFORM_CSV",
-             (unsigned int)waveform_index);
+        n = snprintf(line, sizeof(line), "WAVEFORM_DATA,%u,%u",
+                     (unsigned int)chunk_start, (unsigned int)chunk_count);
+
+        for (uint16_t i = 0; i < chunk_count; i++) {
+            uint16_t sample_idx = (uint16_t)(chunk_start + i);
+            if (n <= 0 || n >= (int)sizeof(line)) break;
+            n += snprintf(line + n, sizeof(line) - (size_t)n, ",%.2f,%.2f",
+                          waveform_buffer[sample_idx].current_amps,
+                          waveform_buffer[sample_idx].voltage_volts);
+            if (n >= (int)sizeof(line)) break;
+        }
+
+        if (n <= 0 || n >= (int)sizeof(line)) {
+            char warn[96];
+            snprintf(warn, sizeof(warn),
+                     "DBG,WAVEFORM_CHUNK_TRUNCATED,start=%u,count=%u,buf=%u",
+                     (unsigned int)chunk_start, (unsigned int)chunk_count,
+                     (unsigned int)sizeof(line));
+            uartSend(warn);
+            continue;
+        }
+
+        uartSend(line);
+    }
+
+    uartSend("WAVEFORM_END");
+
+    char dbg[96];
+    snprintf(dbg, sizeof(dbg),
+             "DBG,WAVEFORM_TX,count=%u,chunks=%u,chunk_size=%u,format=CHUNKED",
+             (unsigned int)waveform_index,
+             (unsigned int)((waveform_index + WAVEFORM_CHUNK_SAMPLES - 1U) /
+                            WAVEFORM_CHUNK_SAMPLES),
+             (unsigned int)WAVEFORM_CHUNK_SAMPLES);
     uartSend(dbg);
+}
+
+static uint16_t get_planned_active_pulse_ms(void) {
+    uint32_t active_ms = 0U;
+
+    /* FINDING: preheat path uses the same TIM1 PWM pulse engine (doPulseMsPwm)
+     * as the main weld pulse; it is not simple GPIO on/off toggling. */
+    if (preheat_enabled && preheat_ms > 0U) {
+        active_ms += preheat_ms;
+
+        /* Preheat OFF gap is now waveform-captured to make the drop visible. */
+        if (weld_mode >= 1U && preheat_gap_ms > 0U) {
+            active_ms += preheat_gap_ms;
+        }
+    }
+
+    if (weld_mode >= 1U) active_ms += weld_d1_ms;
+    if (weld_mode >= 2U) active_ms += weld_d2_ms;
+    if (weld_mode >= 3U) active_ms += weld_d3_ms;
+
+    if (active_ms > WAVEFORM_MAX_PULSE_MS) {
+        active_ms = WAVEFORM_MAX_PULSE_MS;
+    }
+
+    return (uint16_t)active_ms;
 }
 
 /* ============ Helpers ============ */
 static void uartSend(const char* s) {
-    HAL_UART_Transmit(&huart1, (uint8_t*)s, (uint16_t)strlen(s), 50);
-    HAL_UART_Transmit(&huart1, (uint8_t*)"\r\n", 2, 50);
+    if (s == NULL) {
+        return;
+    }
+
+    const uint8_t* msg = (const uint8_t*)s;
+    size_t remaining = strlen(s);
+
+    while (remaining > 0U) {
+        uint16_t chunk = (remaining > UART_TX_CHUNK_SIZE)
+                             ? (uint16_t)UART_TX_CHUNK_SIZE
+                             : (uint16_t)remaining;
+
+        HAL_StatusTypeDef st = HAL_UART_Transmit(&huart1, (uint8_t*)msg, chunk,
+                                                 UART_TX_TIMEOUT_MS);
+        if (st != HAL_OK) {
+            break;
+        }
+
+        msg += chunk;
+        remaining -= chunk;
+
+        if (remaining > 0U) {
+            HAL_Delay(1);
+        }
+    }
+
+    static const uint8_t crlf[2] = {'\r', '\n'};
+    (void)HAL_UART_Transmit(&huart1, (uint8_t*)crlf, 2U, UART_TX_TIMEOUT_MS);
 }
 
 static inline void pwmOff(void) {
@@ -713,8 +997,35 @@ static void applyReadyTimeout(void) {
 }
 
 static uint16_t pctToDuty(uint8_t pct) {
-    if (pct >= 100) return PWM_MAX;
-    return (uint16_t)((uint32_t)pct * PWM_MAX / 100U);
+    float duty_pct;
+
+    // Empirical calibration from measured 50% power data at constant charge
+    // level:
+    // - duty=723 (70.7%) -> 1502A (~37% of 4033A)
+    // - duty=788 (77.0%) -> 2378A (~59% of 4033A)
+    // - duty=870 (85.0%) -> 2656A (~66% of 4033A)
+    // Target: ~2017A (50% of 4033A)
+    // Linear interpolation between duty=723 and duty=788 gives ~duty=761,
+    // which is ~74% duty at 50% power. Use piecewise-linear mapping around 74%.
+    // Expected duty checkpoints: 25%->379, 50%->757, 75%->890, 100%->1023.
+    if (pct == 0U) {
+        return 0U;
+    } else if (pct <= 50U) {
+        // 0-50% power -> 0-74% duty (linear)
+        duty_pct = ((float)pct / 50.0f) * 0.74f;
+    } else if (pct < 100U) {
+        // 50-100% power -> 74-100% duty (linear)
+        duty_pct = 0.74f + (((float)pct - 50.0f) / 50.0f) * 0.26f;
+    } else {
+        duty_pct = 1.0f;
+    }
+
+    uint16_t duty = (uint16_t)lroundf(duty_pct * (float)PWM_MAX);
+
+    // Clamp to valid range
+    if (duty > PWM_MAX) duty = PWM_MAX;
+
+    return duty;
 }
 
 static inline void delayMsExact(uint16_t ms) {
@@ -732,14 +1043,13 @@ static void doPulseMsPwm(uint16_t ms, uint16_t duty) {
     if (ms > MAX_WELD_MS) ms = MAX_WELD_MS;
 
     /*
-     * Timing optimization: cache cap voltage once before each pulse.
-     * readCapVoltage() is intentionally NOT called in the fast 200us sampling
-     * path.
+     * IMPORTANT: keep inter-pulse timing deterministic.
+     * Do not perform slow ADC reads here, otherwise OFF gaps get stretched
+     * before the next PWM ON edge.
      */
-    cached_vcap = readCapVoltage();
-
     pwmOnDuty(duty);
-    capturePulseAmps(ms);  // Measure while FET is on
+
+    capturePulseAmps(ms, duty);  // Measure while FET is on
     pwmOff();
 }
 
@@ -799,6 +1109,16 @@ static void fireRecipe(void) {
 
     clampParams();
 
+    const uint16_t planned_pulse_ms = get_planned_active_pulse_ms();
+    uint32_t planned_active_samples =
+        ((uint32_t)planned_pulse_ms * 1000U) / WAVEFORM_SAMPLE_INTERVAL_US;
+    uint32_t planned_total_samples = (uint32_t)WAVEFORM_PRE_SAMPLES +
+                                     planned_active_samples +
+                                     (uint32_t)WAVEFORM_POST_SAMPLES;
+    if (planned_total_samples > WAVEFORM_BUFFER_SIZE) {
+        planned_total_samples = WAVEFORM_BUFFER_SIZE;
+    }
+
     /* === WELD SEQUENCE (modified per refactor plan) === */
 
     /* Step 1: Disable charger */
@@ -812,47 +1132,259 @@ static void fireRecipe(void) {
     current_peak_amps = 0.0f;
     /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
     cal_vcap_before = readCapVoltage();
-
-    /* Start waveform capture after pre-weld settling, right before pulse train.
-     */
-    start_weld_pulse_capture();
+    cached_vcap = cal_vcap_before;
 
     uartSend("EVENT,WELD_START");
 
     pwmOff();
     HAL_Delay(2);
 
-    uint32_t t0 = HAL_GetTick();
+    /* Start capture before pulse so waveform includes 1ms pre-buffer baseline
+     * before MOSFET firing (samples 0-9). */
+    start_weld_pulse_capture();
+    capture_waveform_samples((uint16_t)WAVEFORM_PRE_SAMPLES);
+    waveform_pulse_start_index = (uint16_t)WAVEFORM_PRE_SAMPLES;
+
+    /* Measure weld duration with microsecond precision to avoid +1ms skew from
+     * HAL tick quantization while preserving waveform alignment. */
+    uint32_t weld_start_us = micros_now();
 
     /* === Execute weld pulse (HRTIM/PWM code UNTOUCHED) === */
     if (preheat_enabled && preheat_ms > 0) {
-        doPulseMsPwm(preheat_ms, pctToDuty(preheat_pct));
-        if (preheat_gap_ms > 0) {
-            pwmOff();
-            delayMsExact(preheat_gap_ms);
+        uint16_t preheat_start_idx = waveform_index;
+        uint16_t preheat_duty = pctToDuty(preheat_pct);
+        uint16_t preheat_linear_duty =
+            (uint16_t)(((uint32_t)preheat_pct * PWM_MAX) / 100U);
+
+        {
+            char cdbg[160];
+            snprintf(
+                cdbg, sizeof(cdbg),
+                "DBG,PWM_COMP,phase=preheat,pct=%u,linear_duty=%u,comp_duty=%u",
+                (unsigned int)preheat_pct, (unsigned int)preheat_linear_duty,
+                (unsigned int)preheat_duty);
+            uartSend(cdbg);
+        }
+
+        doPulseMsPwm(preheat_ms, preheat_duty);
+
+        {
+            uint16_t preheat_end_idx = waveform_index;
+            uint16_t preheat_samples =
+                (preheat_end_idx >= preheat_start_idx)
+                    ? (uint16_t)(preheat_end_idx - preheat_start_idx)
+                    : 0U;
+            float preheat_max_amps = 0.0f;
+            float preheat_sum_amps = 0.0f;
+            for (uint16_t i = preheat_start_idx; i < preheat_end_idx; i++) {
+                float a = waveform_buffer[i].current_amps;
+                if (a > preheat_max_amps) preheat_max_amps = a;
+                preheat_sum_amps += a;
+            }
+            float preheat_avg_amps =
+                (preheat_samples > 0U)
+                    ? (preheat_sum_amps / (float)preheat_samples)
+                    : 0.0f;
+
+            char pdbg[220];
+            snprintf(pdbg, sizeof(pdbg),
+                     "DBG,PREHEAT_CAPTURE_END,cfg_ms=%u,duty=%u,samples=%u,"
+                     "start_idx=%u,end_idx=%u,avg_a=%.2f,max_a=%.2f",
+                     (unsigned int)preheat_ms, (unsigned int)preheat_duty,
+                     (unsigned int)preheat_samples,
+                     (unsigned int)preheat_start_idx,
+                     (unsigned int)preheat_end_idx, preheat_avg_amps,
+                     preheat_max_amps);
+            uartSend(pdbg);
+        }
+
+        if (preheat_gap_ms > 0U) {
+            pwmOff();  // hard-off during gap
+
+            uint32_t gap_start_us = micros_now();
+            uint32_t gap_deadline_us =
+                gap_start_us + ((uint32_t)preheat_gap_ms * 1000U);
+            uint16_t gap_start_idx = waveform_index;
+            uint16_t planned_gap_samples =
+                (uint16_t)(((uint32_t)preheat_gap_ms * 1000U) /
+                           WAVEFORM_SAMPLE_INTERVAL_US);
+
+            {
+                char gdbg[140];
+                snprintf(gdbg, sizeof(gdbg),
+                         "DBG,PREHEAT_GAP_START,cfg_ms=%u,start_us=%lu,mosfet="
+                         "OFF,planned_samples=%u",
+                         (unsigned int)preheat_gap_ms,
+                         (unsigned long)gap_start_us,
+                         (unsigned int)planned_gap_samples);
+                uartSend(gdbg);
+            }
+
+            if (planned_gap_samples > 0U) {
+                capture_waveform_samples(planned_gap_samples);
+            }
+
+            while ((int32_t)(micros_now() - gap_deadline_us) < 0) {
+                __NOP();
+            }
+
+            uint32_t gap_end_us = micros_now();
+            uint16_t gap_end_idx = waveform_index;
+            uint16_t captured_gap_samples =
+                (gap_end_idx >= gap_start_idx)
+                    ? (uint16_t)(gap_end_idx - gap_start_idx)
+                    : 0U;
+
+            float gap_max_amps = 0.0f;
+            float gap_sum_amps = 0.0f;
+            for (uint16_t i = gap_start_idx; i < gap_end_idx; i++) {
+                float a = waveform_buffer[i].current_amps;
+                if (a > gap_max_amps) gap_max_amps = a;
+                gap_sum_amps += a;
+            }
+            float gap_avg_amps =
+                (captured_gap_samples > 0U)
+                    ? (gap_sum_amps / (float)captured_gap_samples)
+                    : 0.0f;
+
+            {
+                char gdbg[196];
+                snprintf(gdbg, sizeof(gdbg),
+                         "DBG,PREHEAT_GAP_END,cfg_ms=%u,actual_us=%lu,captured_"
+                         "samples=%u,avg_a=%.2f,max_a=%.2f,mosfet=OFF",
+                         (unsigned int)preheat_gap_ms,
+                         (unsigned long)(gap_end_us - gap_start_us),
+                         (unsigned int)captured_gap_samples, gap_avg_amps,
+                         gap_max_amps);
+                uartSend(gdbg);
+            }
         }
     }
 
     uint16_t mainDuty = pctToDuty(weld_power_pct);
+    uint16_t main_linear_duty =
+        (uint16_t)(((uint32_t)weld_power_pct * PWM_MAX) / 100U);
+
+    {
+        char cdbg[160];
+        snprintf(cdbg, sizeof(cdbg),
+                 "DBG,PWM_COMP,phase=main,pct=%u,linear_duty=%u,comp_duty=%u",
+                 (unsigned int)weld_power_pct, (unsigned int)main_linear_duty,
+                 (unsigned int)mainDuty);
+        uartSend(cdbg);
+    }
 
     if (weld_mode >= 1) {
+        uint16_t main1_start_idx = waveform_index;
         doPulseMsPwm(weld_d1_ms, mainDuty);
+        uint16_t main1_end_idx = waveform_index;
+        char mdbg[180];
+        snprintf(
+            mdbg, sizeof(mdbg),
+            "DBG,MAIN1_CAPTURE_END,cfg_ms=%u,samples=%u,start_idx=%u,end_idx=%"
+            "u",
+            (unsigned int)weld_d1_ms,
+            (unsigned int)((main1_end_idx >= main1_start_idx)
+                               ? (uint16_t)(main1_end_idx - main1_start_idx)
+                               : 0U),
+            (unsigned int)main1_start_idx, (unsigned int)main1_end_idx);
+        uartSend(mdbg);
     }
     if (weld_mode >= 2) {
         if (weld_gap1_ms) delayMsExact(weld_gap1_ms);
+        uint16_t main2_start_idx = waveform_index;
         doPulseMsPwm(weld_d2_ms, mainDuty);
+        uint16_t main2_end_idx = waveform_index;
+        char mdbg[180];
+        snprintf(
+            mdbg, sizeof(mdbg),
+            "DBG,MAIN2_CAPTURE_END,cfg_ms=%u,samples=%u,start_idx=%u,end_idx=%"
+            "u",
+            (unsigned int)weld_d2_ms,
+            (unsigned int)((main2_end_idx >= main2_start_idx)
+                               ? (uint16_t)(main2_end_idx - main2_start_idx)
+                               : 0U),
+            (unsigned int)main2_start_idx, (unsigned int)main2_end_idx);
+        uartSend(mdbg);
     }
     if (weld_mode >= 3) {
         if (weld_gap2_ms) delayMsExact(weld_gap2_ms);
+        uint16_t main3_start_idx = waveform_index;
         doPulseMsPwm(weld_d3_ms, mainDuty);
+        uint16_t main3_end_idx = waveform_index;
+        char mdbg[180];
+        snprintf(
+            mdbg, sizeof(mdbg),
+            "DBG,MAIN3_CAPTURE_END,cfg_ms=%u,samples=%u,start_idx=%u,end_idx=%"
+            "u",
+            (unsigned int)weld_d3_ms,
+            (unsigned int)((main3_end_idx >= main3_start_idx)
+                               ? (uint16_t)(main3_end_idx - main3_start_idx)
+                               : 0U),
+            (unsigned int)main3_start_idx, (unsigned int)main3_end_idx);
+        uartSend(mdbg);
     }
 
-    uint32_t total_ms = HAL_GetTick() - t0;
+    uint32_t weld_end_us = micros_now();
+    uint32_t total_us = weld_end_us - weld_start_us;
+    uint32_t total_ms = (total_us + 500U) / 1000U;
 
     pwmOff();
 
-    /* Phase 3: stop waveform capture immediately when pulse sequence ends. */
+    /* Active pulse end is derived from configured pulse_ms, not loop latency.
+     * Formula: pulse_end_idx = pre_samples + (pulse_ms * 10 samples/ms). */
+    {
+        uint32_t pulse_end_index =
+            (uint32_t)waveform_pulse_start_index + planned_active_samples;
+        if (pulse_end_index > planned_total_samples) {
+            pulse_end_index = planned_total_samples;
+        }
+        if (pulse_end_index > WAVEFORM_BUFFER_SIZE) {
+            pulse_end_index = WAVEFORM_BUFFER_SIZE;
+        }
+        waveform_pulse_end_index = (uint16_t)pulse_end_index;
+    }
+    if (waveform_index < WAVEFORM_BUFFER_SIZE) {
+        uint16_t remaining_samples =
+            (uint16_t)(WAVEFORM_BUFFER_SIZE - waveform_index);
+        uint16_t post_samples =
+            (remaining_samples < (uint16_t)WAVEFORM_POST_SAMPLES)
+                ? remaining_samples
+                : (uint16_t)WAVEFORM_POST_SAMPLES;
+        capture_waveform_samples(post_samples);
+    }
+
+    /* Phase 3: stop waveform capture after full window. */
     end_weld_pulse_capture();
+
+    /* Timing/debug uses configured pulse length and actual captured samples. */
+    {
+        uint32_t pulse_samples =
+            (waveform_pulse_end_index > waveform_pulse_start_index)
+                ? ((uint32_t)waveform_pulse_end_index -
+                   (uint32_t)waveform_pulse_start_index)
+                : 0U;
+        uint32_t pulse_us = pulse_samples * WAVEFORM_SAMPLE_INTERVAL_US;
+        total_ms = (pulse_us + 500U) / 1000U;
+
+        uint32_t capture_ms =
+            ((uint32_t)WAVEFORM_PRE_SAMPLES * WAVEFORM_SAMPLE_INTERVAL_US +
+             (uint32_t)planned_pulse_ms * 1000U +
+             (uint32_t)WAVEFORM_POST_SAMPLES * WAVEFORM_SAMPLE_INTERVAL_US +
+             500U) /
+            1000U;
+
+        char tdbg[192];
+        snprintf(tdbg, sizeof(tdbg),
+                 "DBG,WAVEFORM_TIMING,pulse_ms=%lu,capture_ms=%lu,wf_samples=%"
+                 "u,planned_samples=%lu,pulse_start_idx=%u,pulse_end_idx=%u",
+                 (unsigned long)total_ms, (unsigned long)capture_ms,
+                 (unsigned int)waveform_index,
+                 (unsigned long)planned_total_samples,
+                 (unsigned int)waveform_pulse_start_index,
+                 (unsigned int)waveform_pulse_end_index);
+        uartSend(tdbg);
+    }
 
     welding_now = false;
     last_weld_ms = HAL_GetTick();
@@ -867,30 +1399,60 @@ static void fireRecipe(void) {
     /* Step 6: ADC diagnostic snapshot AFTER weld (diagnostic only) */
     cal_vcap_after = readCapVoltage();
 
+    /* Voltage overlay: hold pre-pulse at vcap_before, interpolate during active
+     * pulse window, then hold post-pulse at vcap_after. */
+    apply_waveform_voltage_interpolation(cal_vcap_before, cal_vcap_after,
+                                         waveform_pulse_start_index,
+                                         waveform_pulse_end_index);
+    {
+        char vdbg[160];
+        snprintf(
+            vdbg, sizeof(vdbg),
+            "DBG,WAVEFORM_VOLTAGE,method=pre_hold_pulse_interp_post_hold,start="
+            "%.3f,end=%.3f,count=%u,pulse_start_idx=%u,pulse_end_idx=%u",
+            cal_vcap_before, cal_vcap_after, (unsigned int)waveform_index,
+            (unsigned int)waveform_pulse_start_index,
+            (unsigned int)waveform_pulse_end_index);
+        uartSend(vdbg);
+    }
+
     float delta_v = cal_vcap_before - cal_vcap_after;
     float time_s = total_ms / 1000.0f;
 
-    /* Voltage drop across leads at average current */
+    /* Average lead drop and I^2R loss from live configurable lead resistance.
+     */
     float v_drop_leads = cal_current_avg * lead_resistance_ohms;
+    float lead_loss_joules =
+        cal_current_avg * cal_current_avg * lead_resistance_ohms * time_s;
 
-    /* Voltage actually delivered at the weld tips */
-    float v_at_tips = cal_vcap_before - v_drop_leads;
-    if (v_at_tips < 0.0f) v_at_tips = 0.0f;
+    /* Gross capacitor-delivered energy minus lead I^2R losses. */
+    float gross_energy_joules = cal_vcap_before * cal_current_avg * time_s;
+    float energy_joules = gross_energy_joules - lead_loss_joules;
+    if (!isfinite(energy_joules) || energy_joules < 0.0f) {
+        energy_joules = 0.0f;
+    }
 
-    /* True energy delivered to weld spot (not cap bank energy) */
-    float energy_joules = v_at_tips * cal_current_avg * time_s;
+    /* Equivalent average voltage delivered at the weld tips. */
+    float v_at_tips = (cal_current_avg > 0.0f && time_s > 0.0f)
+                          ? (energy_joules / (cal_current_avg * time_s))
+                          : (cal_vcap_before - v_drop_leads);
+    if (!isfinite(v_at_tips) || v_at_tips < 0.0f) v_at_tips = 0.0f;
 
-    char buf[256];
+    char buf[384];
     snprintf(buf, sizeof(buf),
              "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
              "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
              "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
-             "avg_a=%.1f,v_tips=%.3f,energy_j=%.2f",
+             "avg_a=%.1f,v_tips=%.3f,energy_j=%.2f,pulse_start_sample=%u,pulse_"
+             "end_sample=%u,wf_samples=%u",
              (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
              weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
              preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
              (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
-             delta_v, cal_current_avg, v_at_tips, energy_joules);
+             delta_v, cal_current_avg, v_at_tips, energy_joules,
+             (unsigned int)waveform_pulse_start_index,
+             (unsigned int)waveform_pulse_end_index,
+             (unsigned int)waveform_index);
     uartSend(buf);
 
     /* Phase 3: transmit waveform CSV burst right after weld completion event.
@@ -1599,9 +2161,36 @@ static void parseCommand(char* line) {
         return;
     }
 
+    /* UI save flakiness root cause: some clients send lead_r_mohm while
+     * firmware only accepted LEAD_R in ohms. Accept both ohm and mΩ command
+     * variants. */
     if (strncmp(line, "LEAD_R,", 7) == 0 ||
-        strncmp(line, "SET_LEAD_R,", 11) == 0) {
-        const char* value_str = (line[0] == 'L') ? (line + 7) : (line + 11);
+        strncmp(line, "SET_LEAD_R,", 11) == 0 ||
+        strncmp(line, "LEAD_R_MOHM,", 12) == 0 ||
+        strncmp(line, "SET_LEAD_R_MOHM,", 16) == 0 ||
+        strncmp(line, "lead_r_mohm,", 12) == 0 ||
+        strncmp(line, "set_lead_r_mohm,", 16) == 0) {
+        bool value_is_mohm = false;
+        const char* value_str = NULL;
+
+        if (strncmp(line, "LEAD_R,", 7) == 0) {
+            value_str = line + 7;
+        } else if (strncmp(line, "SET_LEAD_R,", 11) == 0) {
+            value_str = line + 11;
+        } else if (strncmp(line, "LEAD_R_MOHM,", 12) == 0) {
+            value_is_mohm = true;
+            value_str = line + 12;
+        } else if (strncmp(line, "SET_LEAD_R_MOHM,", 16) == 0) {
+            value_is_mohm = true;
+            value_str = line + 16;
+        } else if (strncmp(line, "lead_r_mohm,", 12) == 0) {
+            value_is_mohm = true;
+            value_str = line + 12;
+        } else {
+            value_is_mohm = true;
+            value_str = line + 16;
+        }
+
         char* endptr = NULL;
         float v = strtof(value_str, &endptr);
 
@@ -1609,6 +2198,10 @@ static void parseCommand(char* line) {
             !isfinite(v)) {
             uartSend("ERR,LEAD_R_PARSE");
             return;
+        }
+
+        if (value_is_mohm) {
+            v *= 0.001f;
         }
 
         if (v < LEAD_RESISTANCE_MIN_OHMS || v > LEAD_RESISTANCE_MAX_OHMS) {
@@ -1626,7 +2219,9 @@ static void parseCommand(char* line) {
         return;
     }
 
-    if (strcmp(line, "GET_LEAD_R") == 0 || strcmp(line, "LEAD_R?") == 0) {
+    if (strcmp(line, "GET_LEAD_R") == 0 || strcmp(line, "LEAD_R?") == 0 ||
+        strcmp(line, "GET_LEAD_R_MOHM") == 0 ||
+        strcmp(line, "lead_r_mohm?") == 0) {
         snprintf(response, sizeof(response), "LEAD_R,ohm=%.6f,mohm=%.3f",
                  lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
         uartSend(response);
