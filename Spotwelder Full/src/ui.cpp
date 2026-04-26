@@ -66,6 +66,10 @@
 #define C_GREY lv_color_hex(0x888888)
 #define C_DARK_GREY lv_color_hex(0x333355)
 
+static const float CFG_LEAD_R_MIN_MOHM = 0.5f;
+static const float CFG_LEAD_R_MAX_MOHM = 5.0f;
+static const int   CFG_LEAD_R_SCALE = 10;  // 0.1 mΩ slider resolution
+
 // ============================================================
 // CALLBACKS
 // ============================================================
@@ -238,6 +242,8 @@ static lv_obj_t* lbl_cfg_hold_time = nullptr;
 static lv_obj_t* btn_cfg_hold_time = nullptr;
 static lv_obj_t* lbl_cfg_cwp = nullptr;  // Contact With Pedal label
 static lv_obj_t* btn_cfg_cwp = nullptr;  // Contact With Pedal button
+static lv_obj_t* slider_cfg_lead_r = nullptr;
+static lv_obj_t* lbl_cfg_lead_r = nullptr;
 
 // ============================================================
 // STATIC UI HANDLES  (Status tab)
@@ -1463,6 +1469,14 @@ static const char* hold_time_text(uint8_t steps) {
             return "2.5 s";
         case 6:
             return "3.0 s";
+        case 7:
+            return "3.5 s";
+        case 8:
+            return "4.0 s";
+        case 9:
+            return "4.5 s";
+        case 10:
+            return "5.0 s";
         default:
             return "1.0 s";
     }
@@ -1480,6 +1494,29 @@ static void update_cfg_cwp_label() {
     if (btn_cfg_cwp)
         lv_obj_set_style_bg_color(
             btn_cfg_cwp, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY, 0);
+}
+
+static float clamp_cfg_lead_r_mohm(float value) {
+    float clamped = value;
+    if (!isfinite(clamped)) clamped = 2.0f;
+    if (clamped < CFG_LEAD_R_MIN_MOHM) clamped = CFG_LEAD_R_MIN_MOHM;
+    if (clamped > CFG_LEAD_R_MAX_MOHM) clamped = CFG_LEAD_R_MAX_MOHM;
+    return clamped;
+}
+
+static void update_cfg_lead_r_label() {
+    _cfg.lead_resistance_mohm = clamp_cfg_lead_r_mohm(_cfg.lead_resistance_mohm);
+
+    if (slider_cfg_lead_r) {
+        int slider_value = (int)lroundf(_cfg.lead_resistance_mohm * CFG_LEAD_R_SCALE);
+        lv_slider_set_value(slider_cfg_lead_r, slider_value, LV_ANIM_OFF);
+    }
+
+    if (lbl_cfg_lead_r) {
+        char text[24];
+        snprintf(text, sizeof(text), "%.1f mΩ", (double)_cfg.lead_resistance_mohm);
+        lv_label_set_text(lbl_cfg_lead_r, text);
+    }
 }
 
 // ============================================================
@@ -1559,8 +1596,8 @@ static void on_cfg_brightness(lv_event_t* e) {
 
 static void on_cfg_hold_time(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    // Cycle: 1(0.5s) -> 2(1.0s) -> ... -> 6(3.0s) -> 1(0.5s)
-    _cfg.contact_hold_steps = (_cfg.contact_hold_steps % 6) + 1;
+    // Cycle: 1(0.5s) -> ... -> 10(5.0s) -> 1(0.5s)
+    _cfg.contact_hold_steps = (_cfg.contact_hold_steps % 10) + 1;
     update_cfg_hold_time_label();
     notify_config_changed();
 }
@@ -1571,6 +1608,26 @@ static void on_cfg_cwp_toggle(lv_event_t* e) {
     update_cfg_cwp_label();
     notify_config_changed();
     if (_cwp_cb) _cwp_cb(_cfg.contact_with_pedal);
+}
+
+static void on_cfg_lead_r_slider(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED) return;
+
+    if (!slider_cfg_lead_r) return;
+
+    int raw = lv_slider_get_value(slider_cfg_lead_r);
+    float mohm = clamp_cfg_lead_r_mohm((float)raw / (float)CFG_LEAD_R_SCALE);
+
+    if (fabsf(_cfg.lead_resistance_mohm - mohm) > 0.0001f) {
+        _cfg.lead_resistance_mohm = mohm;
+    }
+
+    update_cfg_lead_r_label();
+
+    if (code == LV_EVENT_RELEASED) {
+        notify_config_changed();
+    }
 }
 
 // ============================================================
@@ -1683,6 +1740,44 @@ static void build_config_tab(lv_obj_t* tab) {
         BTN_W, BTN_H, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY);
     lv_obj_add_event_cb(btn_cfg_cwp, on_cfg_cwp_toggle, LV_EVENT_CLICKED,
                         nullptr);
+    y += ROW_H;
+
+    // Lead resistance (mΩ)
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Lead Resistance (mΩ)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+
+    slider_cfg_lead_r = lv_slider_create(cont);
+    lv_obj_set_size(slider_cfg_lead_r, BTN_W + 80, 12);
+    lv_obj_set_pos(slider_cfg_lead_r, BTN_X, y + 18);
+    lv_slider_set_range(slider_cfg_lead_r,
+                        (int)lroundf(CFG_LEAD_R_MIN_MOHM * CFG_LEAD_R_SCALE),
+                        (int)lroundf(CFG_LEAD_R_MAX_MOHM * CFG_LEAD_R_SCALE));
+    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_DARK_GREY, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_ACCENT, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_WHITE, LV_PART_KNOB);
+    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_KNOB);
+    lv_obj_set_style_radius(slider_cfg_lead_r, 6, LV_PART_MAIN);
+    lv_obj_set_style_radius(slider_cfg_lead_r, 6, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(slider_cfg_lead_r, 10, LV_PART_KNOB);
+    lv_obj_add_event_cb(slider_cfg_lead_r, on_cfg_lead_r_slider,
+                        LV_EVENT_VALUE_CHANGED, nullptr);
+    lv_obj_add_event_cb(slider_cfg_lead_r, on_cfg_lead_r_slider,
+                        LV_EVENT_RELEASED, nullptr);
+    make_interaction_safe(slider_cfg_lead_r);
+
+    lbl_cfg_lead_r = lv_label_create(cont);
+    lv_obj_set_style_text_color(lbl_cfg_lead_r, C_ACCENT, 0);
+    lv_obj_set_style_text_font(lbl_cfg_lead_r, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(lbl_cfg_lead_r, BTN_X + BTN_W + 92, y + 10);
+    update_cfg_lead_r_label();
+
     y += ROW_H + 12;
 
     // ---- Section: Startup ----
@@ -2178,6 +2273,7 @@ void ui_load_config(const ConfigState& cfg) {
     update_cfg_brightness_label();
     update_cfg_cwp_label();
     update_cfg_hold_time_label();
+    update_cfg_lead_r_label();
     // Apply step sizes to spinboxes
     apply_time_step_to_spinboxes();
 }

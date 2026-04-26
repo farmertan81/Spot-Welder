@@ -452,17 +452,25 @@ static void chargerStateMachine(void) {
  * ============ */
 
 static void sendStatusPacket(void) {
-    char buf[192];
+    char buf[384];
 
-    /* --- Packet 1: STATUS (system state, ADC-based diagnostics) --- */
+    /* --- Packet 1: STATUS (system state + full runtime recipe/settings) --- */
     float vcap = readCapVoltage();
     float power_f = (float)weld_power_pct;
     snprintf(buf, sizeof(buf),
              "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
-             "temp=%.2f,mode=%d,power=%.2f,vdda=%.3f,lead_r_ohm=%.6f",
+             "temp=%.2f,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u,"
+             "power=%.2f,preheat_en=%d,preheat_ms=%u,preheat_pct=%u,"
+             "preheat_gap_ms=%u,trigger_mode=%u,contact_hold_steps=%u,"
+             "contact_with_pedal=%u,vdda=%.3f,lead_r_ohm=%.6f",
              armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
-             temp_filtered_c, (int)weld_mode, power_f, measured_vdda,
-             lead_resistance_ohms);
+             temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
+             (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
+             (unsigned)weld_gap2_ms, (unsigned)weld_d3_ms, power_f,
+             preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
+             (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
+             (unsigned)trigger_mode, (unsigned)contact_hold_steps,
+             (unsigned)contact_with_pedal, measured_vdda, lead_resistance_ohms);
     uartSend(buf);
 
     /* --- Packet 2: STATUS2 (INA226 telemetry) --- */
@@ -805,9 +813,11 @@ static void send_waveform_data(void) {
         for (uint16_t i = 0; i < chunk_count; i++) {
             uint16_t sample_idx = (uint16_t)(chunk_start + i);
             if (n <= 0 || n >= (int)sizeof(line)) break;
-            n += snprintf(line + n, sizeof(line) - (size_t)n, ",%.2f,%.2f",
-                          waveform_buffer[sample_idx].current_amps,
-                          waveform_buffer[sample_idx].voltage_volts);
+            n += snprintf(
+                line + n, sizeof(line) - (size_t)n, ",%lu,%.2f,%.2f",
+                (unsigned long)waveform_buffer[sample_idx].timestamp_us,
+                waveform_buffer[sample_idx].voltage_volts,
+                waveform_buffer[sample_idx].current_amps);
             if (n >= (int)sizeof(line)) break;
         }
 
@@ -827,12 +837,13 @@ static void send_waveform_data(void) {
     uartSend("WAVEFORM_END");
 
     char dbg[96];
-    snprintf(dbg, sizeof(dbg),
-             "DBG,WAVEFORM_TX,count=%u,chunks=%u,chunk_size=%u,format=CHUNKED",
-             (unsigned int)waveform_index,
-             (unsigned int)((waveform_index + WAVEFORM_CHUNK_SAMPLES - 1U) /
-                            WAVEFORM_CHUNK_SAMPLES),
-             (unsigned int)WAVEFORM_CHUNK_SAMPLES);
+    snprintf(
+        dbg, sizeof(dbg),
+        "DBG,WAVEFORM_TX,count=%u,chunks=%u,chunk_size=%u,format=CHUNKED_TVI",
+        (unsigned int)waveform_index,
+        (unsigned int)((waveform_index + WAVEFORM_CHUNK_SAMPLES - 1U) /
+                       WAVEFORM_CHUNK_SAMPLES),
+        (unsigned int)WAVEFORM_CHUNK_SAMPLES);
     uartSend(dbg);
 }
 
@@ -2049,8 +2060,11 @@ static void parseCommand(char* line) {
             weld_gap2_ms = (uint16_t)v_gap2;
             weld_d3_ms = (uint16_t)v_d3;
             clampParams();
-            snprintf(response, sizeof(response), "ACK,SET_PULSE,mode=%d",
-                     weld_mode);
+            snprintf(response, sizeof(response),
+                     "ACK,SET_PULSE,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u",
+                     weld_mode, (unsigned)weld_d1_ms, (unsigned)weld_gap1_ms,
+                     (unsigned)weld_d2_ms, (unsigned)weld_gap2_ms,
+                     (unsigned)weld_d3_ms);
             uartSend(response);
         } else {
             uartSend("DENY,BAD_SET_PULSE");
@@ -2090,8 +2104,10 @@ static void parseCommand(char* line) {
             preheat_pct = (uint8_t)v_pct;
             if (n >= 4) preheat_gap_ms = (uint16_t)v_gap;
             clampParams();
-            snprintf(response, sizeof(response), "ACK,SET_PREHEAT,en=%d",
-                     preheat_enabled ? 1 : 0);
+            snprintf(response, sizeof(response),
+                     "ACK,SET_PREHEAT,en=%d,ms=%u,pct=%u,gap=%u",
+                     preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
+                     (unsigned)preheat_pct, (unsigned)preheat_gap_ms);
             uartSend(response);
         } else {
             uartSend("DENY,BAD_SET_PREHEAT");

@@ -112,9 +112,14 @@ uint16_t preheat_ms = 20;
 uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
-static float lead_resistance_ohms = 0.00187f;  // configurable, persisted
+static float lead_resistance_ohms = 0.00200f;  // configurable, persisted
 static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f;
 static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f;
+
+// Local ESP32 UI range (mΩ) for Config tab lead resistance control.
+static const float UI_LEAD_R_MIN_MOHM = 0.5f;
+static const float UI_LEAD_R_MAX_MOHM = 5.0f;
+static const float UI_LEAD_R_DEFAULT_MOHM = 2.0f;
 
 static const uint8_t TRIGGER_MODE_PEDAL = 1;
 static const uint8_t TRIGGER_MODE_CONTACT = 2;
@@ -155,6 +160,7 @@ static const uint32_t STM32_BOOT_RESYNC_DEBOUNCE_MS = 1500;
 // Forward declarations
 static void sendBootConfig();
 static void syncSettingsAfterUiReconnect();
+static void syncUiConfigFromRuntime();
 
 // =========================
 // READY heartbeat
@@ -712,6 +718,11 @@ void pollStm32Uart() {
 
                 } else if (stmLine.startsWith("ACK,SET_PULSE,")) {
                     sendToPi(stmLine);
+                    sendToPi(String("ACK,SET_PULSE,mode=") + String(weld_mode) +
+                             ",d1=" + String(weld_d1) + ",gap1=" +
+                             String(weld_gap1) + ",d2=" + String(weld_d2) +
+                             ",gap2=" + String(weld_gap2) + ",d3=" +
+                             String(weld_d3));
                     sendToPi(buildStatus());
 
                 } else if (stmLine.startsWith("ACK,SET_POWER,")) {
@@ -720,6 +731,11 @@ void pollStm32Uart() {
 
                 } else if (stmLine.startsWith("ACK,SET_PREHEAT,")) {
                     sendToPi(stmLine);
+                    sendToPi(String("ACK,SET_PREHEAT,en=") +
+                             String(preheat_enabled ? 1 : 0) +
+                             ",ms=" + String(preheat_ms) +
+                             ",pct=" + String(preheat_pct) +
+                             ",gap=" + String(preheat_gap_ms));
                     sendToPi(buildStatus());
 
                 } else if (stmLine.startsWith("ACK,SET_TRIGGER_MODE,")) {
@@ -735,6 +751,7 @@ void pollStm32Uart() {
                     if (extractIntField(stmLine, "steps=", iv)) {
                         contact_hold_steps = (uint8_t)iv;
                     }
+                    syncUiConfigFromRuntime();
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -743,6 +760,7 @@ void pollStm32Uart() {
                         stmLine.substring(strlen("ACK,SET_CONTACT_WITH_PEDAL,"))
                             .toInt();
                     contact_with_pedal = (v == 1);
+                    syncUiConfigFromRuntime();
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -921,6 +939,8 @@ void pollStm32Uart() {
                             weld_v = stm_vcap;
                         }
                     }
+
+                    syncUiConfigFromRuntime();
 
                     stm_last_status_ms = millis();
                     stm_synced = true;
@@ -1161,6 +1181,8 @@ void processCommand(String cmd) {
         lead_resistance_ohms = ohms;
         save_lead_resistance_to_nvs();
         sendLeadResistanceToStm32(lead_resistance_ohms);
+        sendToPi(String("ACK,LEAD_R,ohm=") + String(lead_resistance_ohms, 6) +
+                 ",mohm=" + String(lead_resistance_ohms * 1000.0f, 3));
         sendToPi(buildStatus());
         return;
     }
@@ -1363,6 +1385,14 @@ static void apply_brightness(uint8_t level) {
                   (double)val);
 }
 
+static float clamp_lead_r_mohm_ui(float value) {
+    float clamped = value;
+    if (!isfinite(clamped)) clamped = UI_LEAD_R_DEFAULT_MOHM;
+    if (clamped < UI_LEAD_R_MIN_MOHM) clamped = UI_LEAD_R_MIN_MOHM;
+    if (clamped > UI_LEAD_R_MAX_MOHM) clamped = UI_LEAD_R_MAX_MOHM;
+    return clamped;
+}
+
 static void save_config_to_nvs(const ConfigState& cfg) {
     prefs.begin("weldcfg", false);
     prefs.putBool("holdRepeat", cfg.hold_to_repeat);
@@ -1373,6 +1403,7 @@ static void save_config_to_nvs(const ConfigState& cfg) {
     prefs.putBool("cwPedal", cfg.contact_with_pedal);
     prefs.putUChar("trigMode", trigger_mode);
     prefs.putUChar("holdSteps", cfg.contact_hold_steps);
+    prefs.putFloat("leadRmohm", clamp_lead_r_mohm_ui(cfg.lead_resistance_mohm));
     prefs.end();
     Serial.println("[Config] Saved to NVS");
 }
@@ -1390,9 +1421,27 @@ static ConfigState load_config_from_nvs() {
     trigger_mode = prefs.getUChar("trigMode", trigger_mode);
     cfg.contact_hold_steps =
         prefs.getUChar("holdSteps", cfg.contact_hold_steps);
+
+    // Prefer consolidated weldcfg key; fallback to legacy namespace key.
+    bool has_lead_r_in_weldcfg = prefs.isKey("leadRmohm");
+    if (has_lead_r_in_weldcfg) {
+        cfg.lead_resistance_mohm =
+            prefs.getFloat("leadRmohm", cfg.lead_resistance_mohm);
+    }
     contact_hold_steps = cfg.contact_hold_steps;  // sync global
 
     prefs.end();
+
+    if (!has_lead_r_in_weldcfg) {
+        prefs.begin("spotwelder", true);
+        cfg.lead_resistance_mohm =
+            prefs.getFloat("lead_r_mohm", UI_LEAD_R_DEFAULT_MOHM);
+        prefs.end();
+    }
+
+    cfg.lead_resistance_mohm = clamp_lead_r_mohm_ui(cfg.lead_resistance_mohm);
+    lead_resistance_ohms = cfg.lead_resistance_mohm / 1000.0f;
+
     Serial.println("[Config] Loaded from NVS");
     return cfg;
 }
@@ -1415,28 +1464,39 @@ static void save_recipe_to_nvs() {
 }
 
 static void save_lead_resistance_to_nvs() {
-    prefs.begin("spotwelder", false);
-    prefs.putFloat("lead_r_mohm", lead_resistance_ohms * 1000.0f);
+    float lead_r_mohm = clamp_lead_r_mohm_ui(lead_resistance_ohms * 1000.0f);
+
+    // New consolidated location with other config values.
+    prefs.begin("weldcfg", false);
+    prefs.putFloat("leadRmohm", lead_r_mohm);
     prefs.end();
+
+    // Legacy key kept for backward compatibility during migration.
+    prefs.begin("spotwelder", false);
+    prefs.putFloat("lead_r_mohm", lead_r_mohm);
+    prefs.end();
+
     Serial.printf("[Config] Lead resistance saved: %.3f mOhm\n",
-                  (double)(lead_resistance_ohms * 1000.0f));
+                  (double)lead_r_mohm);
 }
 
 static void load_lead_resistance_from_nvs() {
-    prefs.begin("spotwelder", true);
-    float lead_r_mohm = prefs.getFloat("lead_r_mohm", 1.87f);
+    // Prefer consolidated key in weldcfg.
+    prefs.begin("weldcfg", true);
+    bool has_weldcfg_key = prefs.isKey("leadRmohm");
+    float lead_r_mohm = prefs.getFloat("leadRmohm", UI_LEAD_R_DEFAULT_MOHM);
     prefs.end();
 
-    float ohms = lead_r_mohm / 1000.0f;
-    if (!isfinite(ohms) || ohms < LEAD_RESISTANCE_MIN_OHMS ||
-        ohms > LEAD_RESISTANCE_MAX_OHMS) {
-        lead_resistance_ohms = 0.00187f;
-        Serial.println(
-            "[Config] Invalid lead resistance in NVS, using default 1.87 mOhm");
-        return;
+    if (!has_weldcfg_key) {
+        // Fallback to legacy namespace used before Session 4.
+        prefs.begin("spotwelder", true);
+        lead_r_mohm = prefs.getFloat("lead_r_mohm", UI_LEAD_R_DEFAULT_MOHM);
+        prefs.end();
     }
 
-    lead_resistance_ohms = ohms;
+    lead_r_mohm = clamp_lead_r_mohm_ui(lead_r_mohm);
+    lead_resistance_ohms = lead_r_mohm / 1000.0f;
+
     Serial.printf("[Config] Lead resistance loaded: %.3f mOhm\n",
                   (double)(lead_resistance_ohms * 1000.0f));
 }
@@ -1628,20 +1688,61 @@ static void syncSettingsAfterUiReconnect() {
     Serial.println("[TCP] Re-sync complete (current state preserved)");
 }
 
+static void syncUiConfigFromRuntime() {
+    ConfigState cfg = ui_get_config();
+    bool changed = false;
+
+    uint8_t hold_steps = contact_hold_steps;
+    if (hold_steps < 1) hold_steps = 1;
+    if (hold_steps > 10) hold_steps = 10;
+
+    if (cfg.contact_hold_steps != hold_steps) {
+        cfg.contact_hold_steps = hold_steps;
+        changed = true;
+    }
+
+    if (cfg.contact_with_pedal != contact_with_pedal) {
+        cfg.contact_with_pedal = contact_with_pedal;
+        changed = true;
+    }
+
+    float lead_r_mohm = clamp_lead_r_mohm_ui(lead_resistance_ohms * 1000.0f);
+    if (fabsf(cfg.lead_resistance_mohm - lead_r_mohm) > 0.0001f) {
+        cfg.lead_resistance_mohm = lead_r_mohm;
+        changed = true;
+    }
+
+    if (changed) {
+        ui_load_config(cfg);
+    }
+}
+
 // Callback from UI when config changes
 static void onConfigChange(const ConfigState& cfg) {
-    apply_brightness(cfg.brightness);
+    ConfigState normalized_cfg = cfg;
+    normalized_cfg.lead_resistance_mohm =
+        clamp_lead_r_mohm_ui(normalized_cfg.lead_resistance_mohm);
+
+    apply_brightness(normalized_cfg.brightness);
 
     // Sync contact_hold_steps from ConfigState to main.cpp global and STM32
-    if (cfg.contact_hold_steps != contact_hold_steps) {
-        contact_hold_steps = cfg.contact_hold_steps;
+    if (normalized_cfg.contact_hold_steps != contact_hold_steps) {
+        contact_hold_steps = normalized_cfg.contact_hold_steps;
         char buf[40];
         snprintf(buf, sizeof(buf), "SET_CONTACT_HOLD,%d",
                  (int)contact_hold_steps);
         processCommand(String(buf));
     }
 
-    save_config_to_nvs(cfg);
+    float target_lead_ohm = normalized_cfg.lead_resistance_mohm / 1000.0f;
+    if (fabsf(target_lead_ohm - lead_resistance_ohms) > 0.000001f) {
+        char buf[48];
+        snprintf(buf, sizeof(buf), "SET_LEAD_R,%.3f",
+                 (double)normalized_cfg.lead_resistance_mohm);
+        processCommand(String(buf));
+    }
+
+    save_config_to_nvs(normalized_cfg);
 }
 
 // Callback from UI when trigger source changes (Status tab buttons)
@@ -1756,7 +1857,11 @@ void setup() {
         }
 
         // Sync globals from loaded config (no STM32 commands)
-        contact_with_pedal = cfg.contact_with_pedal;
+        // Force safety-critical defaults regardless of NVS
+        // (user can change after boot, but we always start safe)
+        stm_armed = false;                    // DISARMED
+        trigger_mode = TRIGGER_MODE_PEDAL;   // MANUAL/PEDAL
+        contact_with_pedal = true;           // require pedal gating
         load_lead_resistance_from_nvs();
 
         // Push loaded config to UI widgets (display-side only)
