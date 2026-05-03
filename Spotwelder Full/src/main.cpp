@@ -58,7 +58,7 @@ static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;
 
 // STM32 UART line limits
 static const size_t MAX_LINE_LENGTH = 2048;
-static const size_t MAX_WAVEFORM_LINE_LENGTH = 4096;
+static const size_t MAX_WAVEFORM_LINE_LENGTH = 8192;
 
 // =========================
 // STM32-sourced INA226 data (parsed from STATUS2 packets)
@@ -168,6 +168,10 @@ static void syncUiConfigFromRuntime();
 static bool uiConnected = false;
 static uint32_t lastReadySentMs = 0;
 static const uint32_t READY_PERIOD_MS = 1000;
+
+// STATUS forwarding throttle state (shared by parser + command fast-path).
+static uint32_t lastStatusForwardMs = 0;
+static const uint32_t STATUS_FORWARD_MIN_INTERVAL_MS = 100;
 
 /* ============================================================
  * TOUCH FILTER / DEBOUNCE  (verbatim from proven Touch project)
@@ -368,6 +372,7 @@ static void debounced_touchpad_read(lv_indev_t* indev, lv_indev_data_t* data) {
 // =========================
 void sendToPi(const String& msg);
 void forwardToStm32(const String& line);
+void updateScreenDisplay();
 void pollStm32Uart();
 void processCommand(String cmd);
 void ensureWiFiAndServer();
@@ -509,6 +514,45 @@ String buildStatus() {
     return status;
 }
 
+void updateScreenDisplay() {
+    WelderDisplayState ds;
+    ds.pack_voltage = stm_vpack;
+    ds.temperature = temperature_c;
+    ds.charger_current = stm_charger_on ? stm_ichg : 0.0f;
+    ds.cell1_v = stm_cell1;
+    ds.cell2_v = stm_cell2;
+    ds.cell3_v = stm_cell3;
+    ds.weld_v = weld_v;
+    ds.cap_v = cap_v;
+    ds.weld_v_b = weld_v_b;
+    ds.weld_v_a = weld_v_a;
+    ds.cap_v_b = cap_v_b;
+    ds.cap_v_a = cap_v_a;
+    ds.weld_v_drop = weld_v_b - weld_v_a;
+    ds.cap_v_drop = cap_v_b - cap_v_a;
+    ds.energy_cap_j = energy_cap_j;
+    ds.energy_weld_j = energy_weld_j;
+    ds.energy_loss_j = energy_loss_j;
+    ds.armed = stm_armed;
+    ds.welding = welding_now;
+    ds.charging = stm_charger_on;
+    ds.weld_count = weld_count;
+    ds.weld_mode = weld_mode;
+    ds.pulse_d1 = weld_d1;
+    ds.pulse_gap1 = weld_gap1;
+    ds.pulse_d2 = weld_d2;
+    ds.pulse_gap2 = weld_gap2;
+    ds.pulse_d3 = weld_d3;
+    ds.power_pct = weld_power_pct;
+    ds.preheat_enabled = preheat_enabled;
+    ds.preheat_ms = preheat_ms;
+    ds.preheat_pct = preheat_pct;
+    ds.preheat_gap_ms = preheat_gap_ms;
+    ds.trigger_mode = trigger_mode;
+    ds.contact_hold_steps = contact_hold_steps;
+    ui_update(ds);
+}
+
 // =========================
 // TCP / UART helpers
 // =========================
@@ -516,10 +560,12 @@ void sendToPi(const String& msg) {
     if (client && client.connected()) {
         client.print(msg);
         client.print("\n");
+
+        lastTcpRxMs = millis();  // ✅ FIX: treat TX as activity
+
         Serial.printf("[TCP] TX: %s\n", msg.c_str());
     }
 }
-
 void forwardToStm32(const String& line) {
     String out = line;
     out.trim();
@@ -721,8 +767,8 @@ void pollStm32Uart() {
                     sendToPi(String("ACK,SET_PULSE,mode=") + String(weld_mode) +
                              ",d1=" + String(weld_d1) + ",gap1=" +
                              String(weld_gap1) + ",d2=" + String(weld_d2) +
-                             ",gap2=" + String(weld_gap2) + ",d3=" +
-                             String(weld_d3));
+                             ",gap2=" + String(weld_gap2) +
+                             ",d3=" + String(weld_d3));
                     sendToPi(buildStatus());
 
                 } else if (stmLine.startsWith("ACK,SET_POWER,")) {
@@ -949,9 +995,9 @@ void pollStm32Uart() {
                     Serial.printf("[SYNC] d1=%d power=%d preheat=%d\n", weld_d1,
                                   weld_power_pct, preheat_ms);
 
-                    static uint32_t lastStatusForwardMs = 0;
                     uint32_t now = millis();
-                    if ((now - lastStatusForwardMs) >= 500) {
+                    if ((now - lastStatusForwardMs) >=
+                        STATUS_FORWARD_MIN_INTERVAL_MS) {
                         sendToPi(buildStatus());
                         lastStatusForwardMs = now;
                     }
@@ -1132,6 +1178,10 @@ void processCommand(String cmd) {
         weld_d3 = values[5];
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1141,6 +1191,10 @@ void processCommand(String cmd) {
         if (weld_power_pct > 100) weld_power_pct = 100;
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1165,6 +1219,10 @@ void processCommand(String cmd) {
         preheat_gap_ms = values[3];
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1183,7 +1241,10 @@ void processCommand(String cmd) {
         sendLeadResistanceToStm32(lead_resistance_ohms);
         sendToPi(String("ACK,LEAD_R,ohm=") + String(lead_resistance_ohms, 6) +
                  ",mohm=" + String(lead_resistance_ohms * 1000.0f, 3));
-        sendToPi(buildStatus());
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1194,6 +1255,10 @@ void processCommand(String cmd) {
         trigger_mode = (uint8_t)mode;
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1204,6 +1269,10 @@ void processCommand(String cmd) {
         contact_hold_steps = (uint8_t)steps;
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1212,6 +1281,10 @@ void processCommand(String cmd) {
         contact_with_pedal = (val == 1);
 
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1224,11 +1297,19 @@ void processCommand(String cmd) {
 
     if (cmd.startsWith("ARM,")) {
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
     if (cmd == "IWZERO" || cmd == "IWDBG") {
         forwardToStm32(cmd);
+        updateScreenDisplay();    // redraw touch UI with new values
+        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+        lastStatusForwardMs =
+            millis();  // reset throttle so next auto-STATUS doesn't double-fire
         return;
     }
 
@@ -1247,6 +1328,10 @@ void processCommand(String cmd) {
     // like AMC_LIVE, DBG_SHUNT, etc.)
     Serial.printf("[PASSTHROUGH->STM32] %s\n", cmd.c_str());
     forwardToStm32(cmd);
+    updateScreenDisplay();    // redraw touch UI with new values
+    sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
+    lastStatusForwardMs =
+        millis();  // reset throttle so next auto-STATUS doesn't double-fire
 }
 
 // =========================
@@ -1793,10 +1878,11 @@ void setup() {
     Serial.println("[Boot] 1/4 Initializing firmware...");
 
     // --- UART to STM32 ---
-    STM32Serial.setRxBufferSize(4096);  // VERY important for waveform bursts
-    STM32Serial.begin(460800, SERIAL_8N1, STM32_TO_ESP32_PIN,
+    STM32Serial.setRxBufferSize(
+        8192);  // LAMBO buffer for large waveform bursts
+    STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
-    Serial.println("✅ STM32 UART bridge ready (Serial2 @ 460800)");
+    Serial.println("✅ STM32 UART bridge ready (Serial2 @ 2000000)");
 
     // --- Front button ---
     pinMode(BUTTON_PIN, INPUT_PULLUP);
@@ -1859,9 +1945,9 @@ void setup() {
         // Sync globals from loaded config (no STM32 commands)
         // Force safety-critical defaults regardless of NVS
         // (user can change after boot, but we always start safe)
-        stm_armed = false;                    // DISARMED
-        trigger_mode = TRIGGER_MODE_PEDAL;   // MANUAL/PEDAL
-        contact_with_pedal = true;           // require pedal gating
+        stm_armed = false;                  // DISARMED
+        trigger_mode = TRIGGER_MODE_PEDAL;  // MANUAL/PEDAL
+        contact_with_pedal = true;          // require pedal gating
         load_lead_resistance_from_nvs();
 
         // Push loaded config to UI widgets (display-side only)
