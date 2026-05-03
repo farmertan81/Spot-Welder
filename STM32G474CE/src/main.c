@@ -40,6 +40,9 @@ static float readThermistor(void);
 static float readCapVoltage(void);
 static bool contactDetectedRaw(float* out_vcap);
 static bool contactDetected(void);
+static void persistent_defaults(PersistentSettings* out);
+static void persistent_from_runtime(PersistentSettings* out);
+static void apply_loaded_settings(const PersistentSettings* in);
 
 /* NEW: Shunt sensing / ADC helpers */
 static uint32_t adcReadSingleConfigured(ADC_HandleTypeDef* hadc,
@@ -1810,6 +1813,76 @@ static bool contactDetected(void) {
     return g_contact_state;
 }
 
+static void persistent_defaults(PersistentSettings* out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    out->lead_resistance_ohms = 0.0011f;
+    out->pulse_mode = 1;
+    out->pulse_d1_ms = 10;
+    out->pulse_gap1_ms = 0;
+    out->pulse_d2_ms = 0;
+    out->pulse_gap2_ms = 0;
+    out->pulse_d3_ms = 0;
+    out->power_pct = 100;
+    out->trigger_mode = 1;
+    out->contact_hold_steps = 2;
+    out->contact_with_pedal = 1;
+    out->preheat_en = 0;
+    out->preheat_ms = 20;
+    out->preheat_pct = 30;
+    out->preheat_gap_ms = 3;
+}
+
+static void persistent_from_runtime(PersistentSettings* out) {
+    if (!out) return;
+    out->lead_resistance_ohms = lead_resistance_ohms;
+    out->pulse_mode = weld_mode;
+    out->pulse_d1_ms = weld_d1_ms;
+    out->pulse_gap1_ms = weld_gap1_ms;
+    out->pulse_d2_ms = weld_d2_ms;
+    out->pulse_gap2_ms = weld_gap2_ms;
+    out->pulse_d3_ms = weld_d3_ms;
+    out->power_pct = weld_power_pct;
+    out->trigger_mode = trigger_mode;
+    out->contact_hold_steps = contact_hold_steps;
+    out->contact_with_pedal = contact_with_pedal;
+    out->preheat_en = preheat_enabled ? 1U : 0U;
+    out->preheat_ms = preheat_ms;
+    out->preheat_pct = preheat_pct;
+    out->preheat_gap_ms = preheat_gap_ms;
+}
+
+static void apply_loaded_settings(const PersistentSettings* in) {
+    if (!in) return;
+
+    lead_resistance_ohms = in->lead_resistance_ohms;
+    weld_mode = in->pulse_mode;
+    weld_d1_ms = in->pulse_d1_ms;
+    weld_gap1_ms = in->pulse_gap1_ms;
+    weld_d2_ms = in->pulse_d2_ms;
+    weld_gap2_ms = in->pulse_gap2_ms;
+    weld_d3_ms = in->pulse_d3_ms;
+    weld_power_pct = in->power_pct;
+    trigger_mode = in->trigger_mode;
+    contact_hold_steps = in->contact_hold_steps;
+    contact_with_pedal = in->contact_with_pedal;
+    preheat_enabled = (in->preheat_en != 0U);
+    preheat_ms = in->preheat_ms;
+    preheat_pct = in->preheat_pct;
+    preheat_gap_ms = in->preheat_gap_ms;
+
+    clampParams();
+
+    if (lead_resistance_ohms < LEAD_RESISTANCE_MIN_OHMS) {
+        lead_resistance_ohms = LEAD_RESISTANCE_MIN_OHMS;
+    }
+    if (lead_resistance_ohms > LEAD_RESISTANCE_MAX_OHMS) {
+        lead_resistance_ohms = LEAD_RESISTANCE_MAX_OHMS;
+    }
+
+    persistent_from_runtime(&g_persistent_settings);
+}
+
 static void clampParams(void) {
     if (weld_mode < 1) weld_mode = 1;
     if (weld_mode > 3) weld_mode = 3;
@@ -3398,7 +3471,7 @@ static void parseCommand(char* line) {
         int v_mode = 1, v_d1 = 0, v_gap1 = 0, v_d2 = 0, v_gap2 = 0, v_d3 = 0;
         int n = sscanf(line, "SET_PULSE,%d,%d,%d,%d,%d,%d", &v_mode, &v_d1,
                        &v_gap1, &v_d2, &v_gap2, &v_d3);
-        if (n >= 2) {
+        if (n == 6) {
             weld_mode = (uint8_t)v_mode;
             weld_d1_ms = (uint16_t)v_d1;
             weld_gap1_ms = (uint16_t)v_gap1;
@@ -3406,12 +3479,15 @@ static void parseCommand(char* line) {
             weld_gap2_ms = (uint16_t)v_gap2;
             weld_d3_ms = (uint16_t)v_d3;
             clampParams();
-            snprintf(response, sizeof(response),
-                     "ACK,SET_PULSE,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u",
-                     weld_mode, (unsigned)weld_d1_ms, (unsigned)weld_gap1_ms,
-                     (unsigned)weld_d2_ms, (unsigned)weld_gap2_ms,
-                     (unsigned)weld_d3_ms);
-            uartSend(response);
+
+            persistent_from_runtime(&g_persistent_settings);
+            if (!flash_settings_save(&g_persistent_settings)) {
+                uartSend("DENY,SET_PULSE,FLASH_FAIL");
+                return;
+            }
+
+            uartSend("ACK,SET_PULSE");
+            sendStatusPacket();
         } else {
             uartSend("DENY,BAD_SET_PULSE");
         }
@@ -3434,9 +3510,15 @@ static void parseCommand(char* line) {
     if (strncmp(line, "SET_POWER,", 10) == 0) {
         weld_power_pct = (uint8_t)atoi(line + 10);
         clampParams();
+        persistent_from_runtime(&g_persistent_settings);
+        if (!flash_settings_save(&g_persistent_settings)) {
+            uartSend("DENY,SET_POWER,FLASH_SAVE_FAILED");
+            return;
+        }
         snprintf(response, sizeof(response), "ACK,SET_POWER,pct=%d",
                  weld_power_pct);
         uartSend(response);
+        sendStatusPacket();
         return;
     }
 
@@ -3450,11 +3532,17 @@ static void parseCommand(char* line) {
             preheat_pct = (uint8_t)v_pct;
             if (n >= 4) preheat_gap_ms = (uint16_t)v_gap;
             clampParams();
+            persistent_from_runtime(&g_persistent_settings);
+            if (!flash_settings_save(&g_persistent_settings)) {
+                uartSend("DENY,SET_PREHEAT,FLASH_SAVE_FAILED");
+                return;
+            }
             snprintf(response, sizeof(response),
                      "ACK,SET_PREHEAT,en=%d,ms=%u,pct=%u,gap=%u",
                      preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
                      (unsigned)preheat_pct, (unsigned)preheat_gap_ms);
             uartSend(response);
+            sendStatusPacket();
         } else {
             uartSend("DENY,BAD_SET_PREHEAT");
         }
@@ -3467,9 +3555,16 @@ static void parseCommand(char* line) {
         if (v > 2) v = 2;
         trigger_mode = (uint8_t)v;
 
+        persistent_from_runtime(&g_persistent_settings);
+        if (!flash_settings_save(&g_persistent_settings)) {
+            uartSend("DENY,SET_TRIGGER_MODE,FLASH_SAVE_FAILED");
+            return;
+        }
+
         snprintf(response, sizeof(response), "ACK,SET_TRIGGER_MODE,mode=%d",
                  trigger_mode);
         uartSend(response);
+        sendStatusPacket();
         return;
     }
 
@@ -3477,9 +3572,15 @@ static void parseCommand(char* line) {
     if (strncmp(line, cwp_prefix, strlen(cwp_prefix)) == 0) {
         int v = atoi(line + strlen(cwp_prefix));
         contact_with_pedal = (v == 0) ? 0 : 1;
+        persistent_from_runtime(&g_persistent_settings);
+        if (!flash_settings_save(&g_persistent_settings)) {
+            uartSend("DENY,SET_CONTACT_WITH_PEDAL,FLASH_SAVE_FAILED");
+            return;
+        }
         snprintf(response, sizeof(response), "ACK,SET_CONTACT_WITH_PEDAL,%d",
                  contact_with_pedal);
         uartSend(response);
+        sendStatusPacket();
         return;
     }
 
@@ -3517,9 +3618,16 @@ static void parseCommand(char* line) {
         if (v > 10) v = 10;
         contact_hold_steps = (uint8_t)v;
 
+        persistent_from_runtime(&g_persistent_settings);
+        if (!flash_settings_save(&g_persistent_settings)) {
+            uartSend("DENY,SET_CONTACT_HOLD,FLASH_SAVE_FAILED");
+            return;
+        }
+
         snprintf(response, sizeof(response), "ACK,SET_CONTACT_HOLD,steps=%d",
                  contact_hold_steps);
         uartSend(response);
+        sendStatusPacket();
         return;
     }
 
@@ -3575,17 +3683,17 @@ static void parseCommand(char* line) {
         }
 
         lead_resistance_ohms = v;
-        g_persistent_settings.lead_r = v;
-        bool save_ok = flash_settings_save(&g_persistent_settings);
-        if (save_ok) {
-            char ack[80];
-            snprintf(ack, sizeof(ack), "ACK,LEAD_R,ohm=%.6f,mohm=%.3f",
-                     lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
-            uartSend(ack);
-            sendStatusPacket();  // Immediate broadcast so UI updates right away
-        } else {
-            uartSend("DENY,LEAD_R,FLASH_SAVE_FAILED\r\n");
+        persistent_from_runtime(&g_persistent_settings);
+        if (!flash_settings_save(&g_persistent_settings)) {
+            uartSend("DENY,LEAD_R,FLASH_SAVE_FAILED");
+            return;
         }
+
+        char ack[80];
+        snprintf(ack, sizeof(ack), "ACK,LEAD_R,ohm=%.6f,mohm=%.3f",
+                 lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
+        uartSend(ack);
+        sendStatusPacket();  // Immediate broadcast so UI updates right away
         return;
     }
 
@@ -3705,15 +3813,6 @@ static void pollContactTrigger(void) {
 
 int main(void) {
     HAL_Init();
-    flash_settings_init();
-    bool load_ok = flash_settings_load(&g_persistent_settings);
-    if (load_ok) {
-        lead_resistance_ohms = g_persistent_settings.lead_r;
-    } else {
-        // Flash load failed - use hardcoded defaults
-        lead_resistance_ohms = 0.0011f;  // 1.1 mΩ default
-        uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS\r\n");
-    }
     SystemClock_Config();
     SystemCoreClockUpdate();
     HAL_InitTick(TICK_INT_PRIORITY);
@@ -3739,6 +3838,18 @@ int main(void) {
 
     MX_I2C1_Init(); /* I2C1 for INA226 sensors – graceful, no hang */
     MX_USART1_UART_Init();
+
+    persistent_defaults(&g_persistent_settings);
+    flash_settings_init();
+    bool load_ok = flash_settings_load(&g_persistent_settings);
+    if (load_ok) {
+        apply_loaded_settings(&g_persistent_settings);
+    } else {
+        persistent_defaults(&g_persistent_settings);
+        apply_loaded_settings(&g_persistent_settings);
+        uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS");
+    }
+
     MX_ADC1_Init();
     OPAMP1->CSR &= ~OPAMP_CSR_OPAMPxEN;
     MX_ADC2_Init(); /* ADC2 for PA4 (AMC1311B OUTN = ADC2_IN17) */
@@ -3757,10 +3868,7 @@ int main(void) {
 
     boot_ms = HAL_GetTick();
 
-    /* Always boot in PEDAL trigger mode (MODE=1). Runtime switching is allowed,
-     * but mode is intentionally non-persistent and resets to PEDAL after
-     * reboot. */
-    trigger_mode = 1;
+    /* Trigger mode and other runtime settings are now restored from flash. */
 
     g_contact_threshold_v = CONTACT_THRESHOLD_V_DEFAULT;
     g_contact_state = false;

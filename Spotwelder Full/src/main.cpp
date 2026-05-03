@@ -763,11 +763,16 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,READY,")) {
-                    int v = stmLine.substring(10).toInt();
+                } else if (stmLine.startsWith("ACK,READY")) {
+                    int v = stm_ready ? 1 : 0;
+                    int comma = stmLine.lastIndexOf(',');
+                    if (comma >= 0 && (comma + 1) < (int)stmLine.length()) {
+                        v = stmLine.substring(comma + 1).toInt();
+                    }
                     stm_ready = (v == 1);
+                    sendToPi(stmLine);
 
-                } else if (stmLine.startsWith("ACK,SET_PULSE,")) {
+                } else if (stmLine.startsWith("ACK,SET_PULSE")) {
                     sendToPi(stmLine);
                     sendToPi(String("ACK,SET_PULSE,mode=") + String(weld_mode) +
                              ",d1=" + String(weld_d1) + ",gap1=" +
@@ -776,11 +781,11 @@ void pollStm32Uart() {
                              ",d3=" + String(weld_d3));
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,SET_POWER,")) {
+                } else if (stmLine.startsWith("ACK,SET_POWER")) {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,SET_PREHEAT,")) {
+                } else if (stmLine.startsWith("ACK,SET_PREHEAT")) {
                     sendToPi(stmLine);
                     sendToPi(String("ACK,SET_PREHEAT,en=") +
                              String(preheat_enabled ? 1 : 0) +
@@ -789,7 +794,7 @@ void pollStm32Uart() {
                              ",gap=" + String(preheat_gap_ms));
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,SET_TRIGGER_MODE,")) {
+                } else if (stmLine.startsWith("ACK,SET_TRIGGER_MODE")) {
                     int iv = 0;
                     if (extractIntField(stmLine, "mode=", iv)) {
                         trigger_mode = (uint8_t)iv;
@@ -797,7 +802,7 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,SET_CONTACT_HOLD,")) {
+                } else if (stmLine.startsWith("ACK,SET_CONTACT_HOLD")) {
                     int iv = 0;
                     if (extractIntField(stmLine, "steps=", iv)) {
                         contact_hold_steps = (uint8_t)iv;
@@ -806,7 +811,7 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,SET_CONTACT_WITH_PEDAL,")) {
+                } else if (stmLine.startsWith("ACK,SET_CONTACT_WITH_PEDAL")) {
                     int v =
                         stmLine.substring(strlen("ACK,SET_CONTACT_WITH_PEDAL,"))
                             .toInt();
@@ -815,7 +820,7 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
-                } else if (stmLine.startsWith("ACK,LEAD_R,")) {
+                } else if (stmLine.startsWith("ACK,LEAD_R")) {
                     float fv = NAN;
                     if (extractFloatField(stmLine, "ohm=", fv) &&
                         isfinite(fv)) {
@@ -1095,6 +1100,12 @@ void pollStm32Uart() {
                 } else if (stmLine.startsWith("ACK,IWZERO,")) {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("ACK,") ||
+                           stmLine.startsWith("DENY,")) {
+                    // Forward any ACK/DENY packet even if this firmware
+                    // version doesn't have a dedicated handler for it yet.
+                    sendToPi(stmLine);
 
                 } else if (stmLine.startsWith("RXHEALTH,")) {
                     // keep local only

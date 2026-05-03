@@ -185,8 +185,13 @@ bool settings_flash_save(const PersistentSettings* settings) {
 
     // Write settings to Flash (64-bit chunks for STM32G4)
     // STM32G4 Flash writes must be 64-bit (double word) aligned
-    const uint64_t* data_ptr = (const uint64_t*)&settings_with_crc;
-    uint32_t num_dwords = (sizeof(PersistentSettings) + 7U) / 8U;
+    enum { SETTINGS_WRITE_BYTES = ((sizeof(PersistentSettings) + 7U) & ~7U) };
+    uint8_t write_buffer[SETTINGS_WRITE_BYTES];
+    memset(write_buffer, 0, sizeof(write_buffer));
+    memcpy(write_buffer, &settings_with_crc, sizeof(PersistentSettings));
+
+    const uint64_t* data_ptr = (const uint64_t*)write_buffer;
+    uint32_t num_dwords = SETTINGS_WRITE_BYTES / 8U;
     flash_debug_u32("FLASH_DWORDS", num_dwords);
 
     for (uint32_t i = 0; i < num_dwords; i++) {
