@@ -121,6 +121,11 @@ static const float UI_LEAD_R_MIN_MOHM = 0.5f;
 static const float UI_LEAD_R_MAX_MOHM = 5.0f;
 static const float UI_LEAD_R_DEFAULT_MOHM = 2.0f;
 
+// Tracks host-initiated LEAD_R updates that are waiting on STM32 ACK/DENY.
+// This makes it explicit that ESP32 must not synthesize ACKs for SET_LEAD_R.
+static bool lead_r_update_inflight = false;
+static float pending_lead_r_ohms = NAN;
+
 static const uint8_t TRIGGER_MODE_PEDAL = 1;
 static const uint8_t TRIGGER_MODE_CONTACT = 2;
 
@@ -817,6 +822,16 @@ void pollStm32Uart() {
                         lead_resistance_ohms = fv;
                         save_lead_resistance_to_nvs();
                     }
+                    lead_r_update_inflight = false;
+                    pending_lead_r_ohms = NAN;
+                    sendToPi(stmLine);
+                    sendToPi(buildStatus());
+
+                } else if (stmLine.startsWith("DENY,LEAD_R")) {
+                    // STM32 rejected LEAD_R update, so clear pending state and
+                    // forward authoritative DENY upstream.
+                    lead_r_update_inflight = false;
+                    pending_lead_r_ohms = NAN;
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -1236,15 +1251,14 @@ void processCommand(String cmd) {
             return;
         }
 
-        lead_resistance_ohms = ohms;
-        save_lead_resistance_to_nvs();
-        sendLeadResistanceToStm32(lead_resistance_ohms);
-        sendToPi(String("ACK,LEAD_R,ohm=") + String(lead_resistance_ohms, 6) +
-                 ",mohm=" + String(lead_resistance_ohms * 1000.0f, 3));
-        updateScreenDisplay();    // redraw touch UI with new values
-        sendToPi(buildStatus());  // immediate STATUS to Flask (bypass throttle)
-        lastStatusForwardMs =
-            millis();  // reset throttle so next auto-STATUS doesn't double-fire
+        // LEAD_R flow MUST be authoritative from STM32:
+        // 1) forward to STM32,
+        // 2) wait for STM32 ACK/DENY,
+        // 3) only then mirror persistence locally.
+        // Never send a synthetic ACK from ESP32 here.
+        pending_lead_r_ohms = ohms;
+        lead_r_update_inflight = true;
+        sendLeadResistanceToStm32(ohms);
         return;
     }
 

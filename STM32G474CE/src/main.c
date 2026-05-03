@@ -4,8 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include "stm32g4xx_hal.h"
 #include "stm32_settings_flash.h"
+#include "stm32g4xx_hal.h"
 
 /* ===== Forward decls ===== */
 static void SystemClock_Config(void);
@@ -49,8 +49,12 @@ static uint32_t adcReadChannelWithTiming(ADC_HandleTypeDef* hadc,
                                          uint32_t sampling_time,
                                          uint32_t timeout_ms);
 static void adcPrepareFastCurrentChannels(void);
+static void adcPrepareVcapNChannel(void);
 static uint32_t adcChannelEnumToNumber(uint32_t channel_enum);
 static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n);
+static bool adcReadFastTriplet(uint32_t* out_p, uint32_t* out_n,
+                               uint32_t* out_vp);
+static uint32_t adcReadFastVcapN(void);
 static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
                                           uint16_t duty);
 
@@ -259,7 +263,7 @@ static float cal_current_avg = 0.0f;
 /* Configurable lead resistance (default 1.1 mΩ).
  * Measured: 0.54 mΩ + 0.57 mΩ = 1.1 mΩ total (4-wire Kelvin test).
  * 41% improvement over previous leads (1.87 mΩ → 1.1 mΩ). */
-static float lead_resistance_ohms = 0.0011f;           // 1.1 mΩ measured
+static float lead_resistance_ohms = 0.0011f;  // 1.1 mΩ measured
 static PersistentSettings g_persistent_settings = {0};
 static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f; /* 0.1 mΩ */
 static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f; /* 10.0 mΩ */
@@ -292,6 +296,7 @@ static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f; /* 10.0 mΩ */
  * 1 = re-apply ADC channel config inside adcReadFastCurrentPair() for A/B
  * check. 0 = rely only on pre-config from adcPrepareFastCurrentChannels(). */
 #define ADC_DEBUG_USE_OLD_CONFIG 0
+#define ADC_PAIR_VERBOSE_DEBUG 0  // Set to 1 only for debugging ADC reads
 
 #define ADC_FAST_CURRENT_P_CHANNEL ADC_CHANNEL_2
 #define ADC_FAST_CURRENT_N_CHANNEL ADC_CHANNEL_3
@@ -352,6 +357,7 @@ static float cached_vcap = 0.0f;
 /* ADC1 mode tracking so fast pulse sampling can run without per-sample
  * reconfiguration jitter. */
 static bool adc1_fast_current_mode = false;
+static bool adc2_fast_vcap_mode = false;
 static uint32_t adc1_fast_rank1_channel = 0U;
 static uint32_t adc1_fast_rank2_channel = 0U;
 
@@ -671,6 +677,25 @@ static uint32_t adcChannelEnumToNumber(uint32_t channel_enum) {
     }
 }
 
+static void adcPrepareVcapNChannel(void) {
+    adc2_fast_vcap_mode = false;
+    HAL_ADC_Stop(&hadc2);
+
+    ADC_ChannelConfTypeDef sConfig = {0};
+    sConfig.Channel = ADC_CHANNEL_17;
+    sConfig.Rank = ADC_REGULAR_RANK_1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    sConfig.OffsetNumber = ADC_OFFSET_NONE;
+    sConfig.Offset = 0;
+
+    if (HAL_ADC_ConfigChannel(&hadc2, &sConfig) != HAL_OK) {
+        uartSend("DENY,ADC2_CH17_CFG_FAIL\r\n");
+        return;
+    }
+    adc2_fast_vcap_mode = true;
+}
+
 static void adcPrepareFastCurrentChannels(void) {
     ADC_ChannelConfTypeDef sConfig = {0};
 
@@ -681,12 +706,12 @@ static void adcPrepareFastCurrentChannels(void) {
     adc1_fast_rank1_channel = 0U;
     adc1_fast_rank2_channel = 0U;
 
-    /* Configure for scan mode with 2 channels */
+    /* Configure for scan mode with 3 channels */
     hadc1.Init.ScanConvMode = ADC_SCAN_ENABLE;
     hadc1.Init.ContinuousConvMode = DISABLE;
     hadc1.Init.DiscontinuousConvMode =
         DISABLE; /* NOT needed for register read */
-    hadc1.Init.NbrOfConversion = 2;
+    hadc1.Init.NbrOfConversion = 3;
     hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
 
     if (HAL_ADC_Init(&hadc1) != HAL_OK) {
@@ -708,11 +733,9 @@ static void adcPrepareFastCurrentChannels(void) {
     }
     adc1_fast_rank1_channel = adcChannelEnumToNumber(sConfig.Channel);
 
-    {
-        char ch2_msg[60];
-        snprintf(ch2_msg, sizeof(ch2_msg), "DBG,ADC_CH_SET,rank=1,channel=2");
-        uartSend(ch2_msg);
-    }
+#if ADC_PAIR_VERBOSE_DEBUG
+    uartSend("DBG,ADC_CH_SET,rank=1,channel=2\r\n");
+#endif
 
     /* Configure Channel 3 (N) - Rank 2 */
     sConfig.Channel = ADC_CHANNEL_3;
@@ -726,21 +749,31 @@ static void adcPrepareFastCurrentChannels(void) {
     }
     adc1_fast_rank2_channel = adcChannelEnumToNumber(sConfig.Channel);
 
-    {
-        char ch3_msg[60];
-        snprintf(ch3_msg, sizeof(ch3_msg), "DBG,ADC_CH_SET,rank=2,channel=3");
-        uartSend(ch3_msg);
+#if ADC_PAIR_VERBOSE_DEBUG
+    uartSend("DBG,ADC_CH_SET,rank=2,channel=3\r\n");
+#endif
+
+    /* Configure Channel 4 (V_cap+) - Rank 3 */
+    sConfig.Channel = ADC_CHANNEL_4;  // PA3 = AMC1311B CAP OUTP
+    sConfig.Rank = ADC_REGULAR_RANK_3;
+    sConfig.SamplingTime = ADC_SAMPLETIME_47CYCLES_5;
+    sConfig.SingleDiff = ADC_SINGLE_ENDED;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+        uartSend("DENY,CH4_CFG_FAIL\r\n");
+        return;
     }
 
-    {
-        char cfg_msg[100];
-        snprintf(cfg_msg, sizeof(cfg_msg),
-                 "DBG,ADC_CFG,mode=register,scan=1,nbr=2,disc=0");
-        uartSend(cfg_msg);
-    }
+#if ADC_PAIR_VERBOSE_DEBUG
+    uartSend("DBG,ADC_CH_SET,rank=3,channel=4\r\n");
+    uartSend("DBG,ADC_CFG,mode=register,scan=1,nbr=3,disc=0\r\n");
+#endif
 
     adc1_fast_current_mode = true;
-    uartSend("DBG,ADC_FAST_MODE_OK");
+#if ADC_PAIR_VERBOSE_DEBUG
+    uartSend("DBG,ADC_FAST_MODE_OK\r\n");
+#endif
+
+    adcPrepareVcapNChannel(); /* Pre-configure ADC2 for fast V_cap- reads */
 }
 
 /* Fast-path weld current read using register-level ADC access. */
@@ -763,7 +796,9 @@ static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n) {
         uint32_t stop_timeout = 100000U;
         while (hadc1.Instance->CR & ADC_CR_ADSTP) {
             if (--stop_timeout == 0U) {
+#if ADC_PAIR_VERBOSE_DEBUG
                 uartSend("DBG,ADSTP_TIMEOUT");
+#endif
                 return false;
             }
         }
@@ -775,7 +810,9 @@ static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n) {
         uint32_t ready_timeout = 100000U;
         while (!(hadc1.Instance->ISR & ADC_ISR_ADRDY)) {
             if (--ready_timeout == 0U) {
+#if ADC_PAIR_VERBOSE_DEBUG
                 uartSend("DBG,ADRDY_TIMEOUT");
+#endif
                 return false;
             }
         }
@@ -792,7 +829,9 @@ static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n) {
     while (!(hadc1.Instance->ISR & ADC_ISR_EOC)) {
         if (--timeout == 0U) {
             hadc1.Instance->CR |= ADC_CR_ADSTP;
+#if ADC_PAIR_VERBOSE_DEBUG
             uartSend("DBG,REG_POLL1_TIMEOUT");
+#endif
             return false;
         }
     }
@@ -805,10 +844,12 @@ static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n) {
     while (!(hadc1.Instance->ISR & ADC_ISR_EOC)) {
         if (--timeout == 0U) {
             hadc1.Instance->CR |= ADC_CR_ADSTP;
+#if ADC_PAIR_VERBOSE_DEBUG
             char msg[60];
             snprintf(msg, sizeof(msg), "DBG,REG_POLL2_TIMEOUT,p=%u",
                      (unsigned int)(*out_p));
             uartSend(msg);
+#endif
             return false;
         }
     }
@@ -826,11 +867,115 @@ static bool adcReadFastCurrentPair(uint32_t* out_p, uint32_t* out_n) {
         }
     }
 
+#if ADC_PAIR_VERBOSE_DEBUG
     {
         char msg[80];
         snprintf(msg, sizeof(msg), "DBG,ADC_PAIR,ok,p=%u,n=%u",
                  (unsigned int)(*out_p), (unsigned int)(*out_n));
         uartSend(msg);
+    }
+#endif
+
+    return true;
+}
+
+static uint32_t adcReadFastVcapN(void) {
+    if (hadc2.Instance->CR & ADC_CR_ADSTART) {
+        hadc2.Instance->CR |= ADC_CR_ADSTP;
+        uint32_t t = 10000U;
+        while (hadc2.Instance->CR & ADC_CR_ADSTP) {
+            if (--t == 0U) return 0U;
+        }
+    }
+    hadc2.Instance->ISR = ADC_ISR_EOC | ADC_ISR_EOS;
+    hadc2.Instance->CR |= ADC_CR_ADSTART;
+    uint32_t t = 100000U;
+    while (!(hadc2.Instance->ISR & ADC_ISR_EOC)) {
+        if (--t == 0U) return 0U;
+    }
+    return hadc2.Instance->DR;
+}
+
+/* Fast-path weld current + Vcap+ read using register-level ADC access. */
+static bool adcReadFastTriplet(uint32_t* out_p, uint32_t* out_n,
+                               uint32_t* out_vp) {
+    if (!out_p || !out_n || !out_vp) {
+        return false;
+    }
+
+    *out_p = 0U;
+    *out_n = 0U;
+    *out_vp = 0U;
+
+    if (!adc1_fast_current_mode) {
+        return false;
+    }
+
+    if (hadc1.Instance->CR & ADC_CR_ADSTART) {
+        hadc1.Instance->CR |= ADC_CR_ADSTP;
+        uint32_t stop_timeout = 100000U;
+        while (hadc1.Instance->CR & ADC_CR_ADSTP) {
+            if (--stop_timeout == 0U) {
+#if ADC_PAIR_VERBOSE_DEBUG
+                uartSend("DBG,ADSTP_TIMEOUT");
+#endif
+                return false;
+            }
+        }
+    }
+
+    if (!(hadc1.Instance->CR & ADC_CR_ADEN)) {
+        hadc1.Instance->CR |= ADC_CR_ADEN;
+        uint32_t ready_timeout = 100000U;
+        while (!(hadc1.Instance->ISR & ADC_ISR_ADRDY)) {
+            if (--ready_timeout == 0U) {
+#if ADC_PAIR_VERBOSE_DEBUG
+                uartSend("DBG,ADRDY_TIMEOUT");
+#endif
+                return false;
+            }
+        }
+    }
+
+    hadc1.Instance->ISR = ADC_ISR_EOC | ADC_ISR_EOS;
+    hadc1.Instance->CR |= ADC_CR_ADSTART;
+
+    uint32_t timeout = 100000U;
+    while (!(hadc1.Instance->ISR & ADC_ISR_EOC)) {
+        if (--timeout == 0U) {
+            hadc1.Instance->CR |= ADC_CR_ADSTP;
+#if ADC_PAIR_VERBOSE_DEBUG
+            uartSend("DBG,REG_POLL1_TIMEOUT");
+#endif
+            return false;
+        }
+    }
+    *out_p = hadc1.Instance->DR;
+
+    timeout = 100000U;
+    while (!(hadc1.Instance->ISR & ADC_ISR_EOC)) {
+        if (--timeout == 0U) {
+            hadc1.Instance->CR |= ADC_CR_ADSTP;
+            return false;
+        }
+    }
+    *out_n = hadc1.Instance->DR;
+
+    timeout = 100000U;
+    while (!(hadc1.Instance->ISR & ADC_ISR_EOC)) {
+        if (--timeout == 0U) {
+            hadc1.Instance->CR |= ADC_CR_ADSTP;
+            return false;
+        }
+    }
+    *out_vp = hadc1.Instance->DR;
+
+    hadc1.Instance->CR |= ADC_CR_ADSTP;
+    timeout = 100000U;
+    while (hadc1.Instance->CR & ADC_CR_ADSTP) {
+        if (--timeout == 0U) {
+            break;
+        }
     }
 
     return true;
@@ -896,11 +1041,13 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
 
         int32_t diff = 0;
         float amps = 0.0f;
+        float v_cap_live = cached_vcap;
         uint32_t sample_capture_us = now_us;
 
         if (pulse_uses_pwm_window) {
             int32_t best_diff = 0;
             float best_amps = 0.0f;
+            float best_v_cap_live = cached_vcap;
             uint32_t best_sample_us = now_us;
             uint32_t slot_anchor_us = next_sample_us;
             bool have_sweep_sample = false;
@@ -925,11 +1072,13 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
 
                 uint32_t p = 0U;
                 uint32_t n = 0U;
-                if (!adcReadFastCurrentPair(&p, &n)) {
+                uint32_t v_p = 0U;
+                if (!adcReadFastTriplet(&p, &n, &v_p)) {
                     continue;
                 }
 
                 uint32_t sweep_sample_us = micros_now();
+                uint32_t v_n = adc2_fast_vcap_mode ? adcReadFastVcapN() : 0U;
 
                 int32_t sweep_diff = (int32_t)p - (int32_t)n;
                 if (sweep_diff < 0) {
@@ -944,9 +1093,17 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
                     sweep_amps = 0.0f;
                 }
 
+                float sweep_v_cap_live = ((float)v_p - (float)v_n) *
+                                         (measured_vdda / 4095.0f) *
+                                         V_CAP_DIVIDER;
+                if (!isfinite(sweep_v_cap_live) || sweep_v_cap_live < 0.0f) {
+                    sweep_v_cap_live = 0.0f;
+                }
+
                 if (!have_sweep_sample || sweep_amps >= best_amps) {
                     best_amps = sweep_amps;
                     best_diff = sweep_diff;
+                    best_v_cap_live = sweep_v_cap_live;
                     best_sample_us = sweep_sample_us;
                     have_sweep_sample = true;
                 }
@@ -958,15 +1115,19 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
 
             diff = best_diff;
             amps = best_amps;
+            v_cap_live = best_v_cap_live;
             sample_capture_us = best_sample_us;
         } else {
             uint32_t p = 0U;
             uint32_t n = 0U;
+            uint32_t v_p = 0U;
             if (tim2_fet_killed) break;
-            if (!adcReadFastCurrentPair(&p, &n)) {
+            if (!adcReadFastTriplet(&p, &n, &v_p)) {
                 continue;
             }
             sample_capture_us = micros_now();
+
+            uint32_t v_n = adc2_fast_vcap_mode ? adcReadFastVcapN() : 0U;
 
             diff = (int32_t)p - (int32_t)n;
             if (diff < 0) {
@@ -977,6 +1138,12 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
             float v_shunt = v_adc / SHUNT_GAIN;
             amps = (v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
             if (!isfinite(amps) || amps < 0.0f) amps = 0.0f;
+
+            v_cap_live = ((float)v_p - (float)v_n) * (measured_vdda / 4095.0f) *
+                         V_CAP_DIVIDER;
+            if (!isfinite(v_cap_live) || v_cap_live < 0.0f) {
+                v_cap_live = 0.0f;
+            }
         }
 
         if ((uint32_t)diff > peak_raw) peak_raw = (uint32_t)diff;
@@ -985,7 +1152,7 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
         sample_count++;
 
         (void)waveform_push_sample(
-            amps, cached_vcap,
+            amps, v_cap_live,
             (uint32_t)(sample_capture_us - waveform_capture_start_us));
 
         waveform_last_sample_us = sample_capture_us;
@@ -1091,7 +1258,9 @@ static void start_weld_pulse_capture(void) {
     waveform_capture_start_us = micros_now();
     waveform_last_sample_us = waveform_capture_start_us;
     waveform_capture_active = true;
+#if ADC_PAIR_VERBOSE_DEBUG
     uartSend("DBG,WAVEFORM_CAPTURE_START");
+#endif
 }
 
 static bool waveform_push_sample(float current_amps, float voltage_volts,
@@ -1262,6 +1431,7 @@ static void capture_waveform_samples(uint16_t sample_count) {
         }
     }
 
+#if ADC_PAIR_VERBOSE_DEBUG
     /* Report first and last sample current values for ADC debug. */
     if (waveform_index > 0U) {
         char wf_debug[120];
@@ -1271,6 +1441,7 @@ static void capture_waveform_samples(uint16_t sample_count) {
                  waveform_buffer[waveform_index - 1U].current_amps);
         uartSend(wf_debug);
     }
+#endif
 }
 
 static uint16_t capture_waveform_until_deadline(uint32_t deadline_us) {
@@ -1333,6 +1504,7 @@ static uint16_t capture_waveform_until_deadline(uint32_t deadline_us) {
 
 static void end_weld_pulse_capture(void) {
     waveform_capture_active = false;
+#if ADC_PAIR_VERBOSE_DEBUG
     char dbg[96];
     snprintf(dbg, sizeof(dbg),
              "DBG,WAVEFORM_CAPTURE_STOP,count=%u,pulse_start_idx=%u,pulse_end_"
@@ -1341,6 +1513,7 @@ static void end_weld_pulse_capture(void) {
              (unsigned int)waveform_pulse_start_index,
              (unsigned int)waveform_pulse_end_index);
     uartSend(dbg);
+#endif
 }
 
 static void apply_waveform_voltage_interpolation(float vcap_start,
@@ -1384,7 +1557,9 @@ static void apply_waveform_voltage_interpolation(float vcap_start,
 
 static void send_waveform_data(void) {
     if (waveform_index == 0) {
+#if ADC_PAIR_VERBOSE_DEBUG
         uartSend("DBG,WAVEFORM_EMPTY");
+#endif
         return;
     }
 
@@ -1436,12 +1611,14 @@ static void send_waveform_data(void) {
         }
 
         if (n <= 0 || n >= (int)sizeof(line)) {
+#if ADC_PAIR_VERBOSE_DEBUG
             char warn[96];
             snprintf(warn, sizeof(warn),
                      "DBG,WAVEFORM_CHUNK_TRUNCATED,start=%u,count=%u,buf=%u",
                      (unsigned int)chunk_start, (unsigned int)chunk_count,
                      (unsigned int)sizeof(line));
             uartSend(warn);
+#endif
             continue;
         }
 
@@ -1498,6 +1675,7 @@ static void send_waveform_data(void) {
         }
     }
 
+#if ADC_PAIR_VERBOSE_DEBUG
     char dbg[96];
     snprintf(
         dbg, sizeof(dbg),
@@ -1507,6 +1685,7 @@ static void send_waveform_data(void) {
                        WAVEFORM_CHUNK_SAMPLES),
         (unsigned int)WAVEFORM_CHUNK_SAMPLES);
     uartSend(dbg);
+#endif
 }
 
 static uint16_t get_planned_active_pulse_ms(void) {
@@ -1901,7 +2080,9 @@ static void fireRecipe(void) {
         uartSend("DENY,ADC_FAST_CFG_FAIL");
         return;
     }
-    uartSend("DBG,ADC_FAST_MODE_OK");
+#if ADC_PAIR_VERBOSE_DEBUG
+    uartSend("DBG,ADC_FAST_MODE_OK\r\n");
+#endif
 
     /* Warmup loop - ADC needs time to stabilize after reconfiguration.
      * We only need to verify conversions complete successfully. */
@@ -1913,11 +2094,13 @@ static void fireRecipe(void) {
         if (adcReadFastCurrentPair(&p_warmup, &n_warmup)) {
             warmup_ok = true;
 
+#if ADC_PAIR_VERBOSE_DEBUG
             char warmup_msg[100];
             snprintf(warmup_msg, sizeof(warmup_msg),
                      "DBG,ADC_WARMUP_OK,tries=%d,p=%lu,n=%lu", warmup_tries + 1,
                      (unsigned long)p_warmup, (unsigned long)n_warmup);
             uartSend(warmup_msg);
+#endif
             break;
         }
         /* Can enable this if additional settle time is needed. */
@@ -1930,6 +2113,7 @@ static void fireRecipe(void) {
         return;
     }
 
+#if ADC_PAIR_VERBOSE_DEBUG
     char adc_debug[120];
     snprintf(adc_debug, sizeof(adc_debug),
              "DBG,ADC_PRE_WELD,ok=%d,p_raw=%lu,n_raw=%lu,diff=%ld",
@@ -1937,6 +2121,7 @@ static void fireRecipe(void) {
              (unsigned long)n_warmup,
              (long)((int32_t)p_warmup - (int32_t)n_warmup));
     uartSend(adc_debug);
+#endif
 
     uartSend("EVENT,WELD_START");
 
@@ -2008,6 +2193,7 @@ static void fireRecipe(void) {
         uint16_t preheat_linear_duty =
             (uint16_t)(((uint32_t)preheat_pct * PWM_MAX) / 100U);
 
+#if ADC_PAIR_VERBOSE_DEBUG
         {
             char cdbg[160];
             snprintf(
@@ -2017,6 +2203,7 @@ static void fireRecipe(void) {
                 (unsigned int)preheat_duty);
             uartSend(cdbg);
         }
+#endif
 
         uint16_t preheat_end_idx = waveform_index;
         (void)doPulseMsPwm(preheat_ms, preheat_duty, &wf_preheat_start_us,
@@ -2132,6 +2319,7 @@ static void fireRecipe(void) {
         }
         actual_pulse_end_index = main1_end_idx;
         waveform_main_end_index = main1_end_idx;
+#if ADC_PAIR_VERBOSE_DEBUG
         char mdbg[180];
         snprintf(
             mdbg, sizeof(mdbg),
@@ -2143,6 +2331,7 @@ static void fireRecipe(void) {
                                : 0U),
             (unsigned int)main1_start_idx, (unsigned int)main1_end_idx);
         uartSend(mdbg);
+#endif
     }
     if (weld_mode >= 2) {
         if (weld_gap1_ms) captureGapMsWithWaveform(weld_gap1_ms);
@@ -2174,6 +2363,7 @@ static void fireRecipe(void) {
         }
         actual_pulse_end_index = main2_end_idx;
         waveform_main_end_index = main2_end_idx;
+#if ADC_PAIR_VERBOSE_DEBUG
         char mdbg[180];
         snprintf(
             mdbg, sizeof(mdbg),
@@ -2185,6 +2375,7 @@ static void fireRecipe(void) {
                                : 0U),
             (unsigned int)main2_start_idx, (unsigned int)main2_end_idx);
         uartSend(mdbg);
+#endif
     }
     if (weld_mode >= 3) {
         if (weld_gap2_ms) captureGapMsWithWaveform(weld_gap2_ms);
@@ -2216,6 +2407,7 @@ static void fireRecipe(void) {
         }
         actual_pulse_end_index = main3_end_idx;
         waveform_main_end_index = main3_end_idx;
+#if ADC_PAIR_VERBOSE_DEBUG
         char mdbg[180];
         snprintf(
             mdbg, sizeof(mdbg),
@@ -2227,6 +2419,7 @@ static void fireRecipe(void) {
                                : 0U),
             (unsigned int)main3_start_idx, (unsigned int)main3_end_idx);
         uartSend(mdbg);
+#endif
     }
 
     if (!main_pulse_started) {
@@ -2323,6 +2516,7 @@ static void fireRecipe(void) {
              500U) /
             1000U;
 
+#if ADC_PAIR_VERBOSE_DEBUG
         char tdbg[224];
         snprintf(tdbg, sizeof(tdbg),
                  "DBG,WAVEFORM_TIMING,pulse_ms=%lu,pulse_us=%lu,capture_ms=%lu,"
@@ -2334,8 +2528,10 @@ static void fireRecipe(void) {
                  (unsigned int)waveform_pulse_start_index,
                  (unsigned int)waveform_pulse_end_index);
         uartSend(tdbg);
+#endif
     }
 
+#if ADC_PAIR_VERBOSE_DEBUG
     if (preheat_debug_ready) {
         uint16_t preheat_samples =
             (preheat_debug_end_idx >= preheat_debug_start_idx)
@@ -2365,7 +2561,9 @@ static void fireRecipe(void) {
                  preheat_max_amps);
         uartSend(pdbg);
     }
+#endif
 
+#if ADC_PAIR_VERBOSE_DEBUG
     if (gap_debug_ready) {
         uint16_t captured_gap_samples =
             (gap_debug_end_idx >= gap_debug_start_idx)
@@ -2402,7 +2600,9 @@ static void fireRecipe(void) {
                  gap_max_amps);
         uartSend(gdbg_end);
     }
+#endif
 
+#if ADC_PAIR_VERBOSE_DEBUG
     {
         char cdbg[160];
         snprintf(cdbg, sizeof(cdbg),
@@ -2411,6 +2611,7 @@ static void fireRecipe(void) {
                  (unsigned int)mainDuty);
         uartSend(cdbg);
     }
+#endif
 
     welding_now = false;
     last_weld_ms = HAL_GetTick();
@@ -2436,6 +2637,7 @@ static void fireRecipe(void) {
     apply_waveform_voltage_interpolation(cal_vcap_before, cal_vcap_after,
                                          waveform_pulse_start_index,
                                          waveform_pulse_end_index);
+#if ADC_PAIR_VERBOSE_DEBUG
     {
         char vdbg[160];
         snprintf(
@@ -2447,6 +2649,7 @@ static void fireRecipe(void) {
             (unsigned int)waveform_pulse_end_index);
         uartSend(vdbg);
     }
+#endif
 
     /* Recompute pulse statistics from actual captured pulse window.
      * waveform_pulse_* indices are [start, end) (end is exclusive). */
@@ -2600,7 +2803,7 @@ static void fireRecipe(void) {
              weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
              preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
              (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
-             delta_v, cal_current_avg, v_at_tips, energy_cap_joules,
+             delta_v, cal_current_avg, v_at_tips, energy_weld_joules,
              energy_cap_joules, energy_leads_joules, energy_weld_joules,
              pulse_duration_ms, (unsigned int)waveform_pulse_start_index,
              (unsigned int)waveform_pulse_end_index,
@@ -3063,23 +3266,31 @@ static float readThermistor(void) {
  * - At steady state: vcap should match INA226 vpack reading
  */
 static float readCapVoltage(void) {
+    /* Prevent race with measureVDDA() ADC1 reconfiguration while vcap is
+     * sampled. */
+    adc1_fast_current_mode = false;
+
     uint32_t sumP = 0, sumN = 0;
     const int samples = 16;
+    int valid = 0;
 
     for (int i = 0; i < samples; i++) {
         uint32_t p = adcReadChannel(ADC_CHANNEL_4);    // PA3
         uint32_t n = adcReadChannel2(ADC_CHANNEL_17);  // PA4
 
-        if (p == 0xFFFF || n == 0xFFFF) return 0.0f;
+        if (p == 0xFFFF || n == 0xFFFF) continue;
 
         sumP += p;
         sumN += n;
+        valid++;
     }
+
+    if (valid == 0) return 0.0f;
 
     float vdda = measured_vdda;
 
-    float vP = ((float)sumP / samples) * (vdda / 4095.0f);
-    float vN = ((float)sumN / samples) * (vdda / 4095.0f);
+    float vP = ((float)sumP / valid) * (vdda / 4095.0f);
+    float vN = ((float)sumN / valid) * (vdda / 4095.0f);
 
     float v = (vP - vN) * V_CAP_DIVIDER;
 
@@ -3365,10 +3576,16 @@ static void parseCommand(char* line) {
 
         lead_resistance_ohms = v;
         g_persistent_settings.lead_r = v;
-        flash_settings_save(&g_persistent_settings);
-        snprintf(response, sizeof(response), "ACK,LEAD_R,ohm=%.6f,mohm=%.3f",
-                 lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
-        uartSend(response);
+        bool save_ok = flash_settings_save(&g_persistent_settings);
+        if (save_ok) {
+            char ack[80];
+            snprintf(ack, sizeof(ack), "ACK,LEAD_R,ohm=%.6f,mohm=%.3f",
+                     lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
+            uartSend(ack);
+            sendStatusPacket();  // Immediate broadcast so UI updates right away
+        } else {
+            uartSend("DENY,LEAD_R,FLASH_SAVE_FAILED\r\n");
+        }
         return;
     }
 
@@ -3489,8 +3706,14 @@ static void pollContactTrigger(void) {
 int main(void) {
     HAL_Init();
     flash_settings_init();
-    flash_settings_load(&g_persistent_settings);
-    lead_resistance_ohms = g_persistent_settings.lead_r;
+    bool load_ok = flash_settings_load(&g_persistent_settings);
+    if (load_ok) {
+        lead_resistance_ohms = g_persistent_settings.lead_r;
+    } else {
+        // Flash load failed - use hardcoded defaults
+        lead_resistance_ohms = 0.0011f;  // 1.1 mΩ default
+        uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS\r\n");
+    }
     SystemClock_Config();
     SystemCoreClockUpdate();
     HAL_InitTick(TICK_INT_PRIORITY);
@@ -3596,6 +3819,7 @@ int main(void) {
         applyArmTimeout();
         applyReadyTimeout();
 
+#if ADC_PAIR_VERBOSE_DEBUG
         {
             static int last_contact_dbg = -1;
             int c = contactDetected() ? 1 : 0;
@@ -3607,6 +3831,7 @@ int main(void) {
                 uartSend(cbuf);
             }
         }
+#endif
 
         {
             static uint32_t last_temp_ms = 0;
