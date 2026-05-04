@@ -20,7 +20,7 @@
 
 /* Magic number for settings validity check */
 #define SETTINGS_MAGIC 0x53504F54UL /* "SPOT" in ASCII */
-#define SETTINGS_VERSION 2U
+#define SETTINGS_VERSION 3U
 
 /**
  * Persistent settings structure.
@@ -48,6 +48,9 @@ typedef struct __attribute__((packed)) {
     uint16_t preheat_ms;         // Preheat duration
     uint8_t preheat_pct;         // Preheat power
     uint16_t preheat_gap_ms;     // Gap after preheat
+
+    uint8_t control_mode;  // 0=time, 1=joule
+    float joule_target_j;  // 0..300 J target
 
     uint32_t crc32;  // Keep at end
 } PersistentSettings;

@@ -137,6 +137,8 @@ static bool resolve_phase_end_from_waveform(uint16_t start_index,
  * C = (t × 1.4427) / R = 413F
  * Config: 6× 1000F/3V caps, 3S2P */
 #define CAP_FARADS 413.0f
+#define JOULE_OVERSHOOT_COMP \
+    0.2f /* Joules - compensate for FET turn-off delay */
 
 /* ============ Thermistor / ADC ============ */
 #define THERM_SERIES_R 10000.0f
@@ -232,6 +234,24 @@ static volatile bool preheat_enabled = false;
 static volatile uint16_t preheat_ms = 20;
 static volatile uint8_t preheat_pct = 30;
 static volatile uint16_t preheat_gap_ms = 3;
+
+/* ============ Control mode (persisted from Flash) ============ */
+uint8_t control_mode = 0; /* 0=time, 1=joule */
+
+/* Joule settings (persisted from Flash) */
+float joule_target_j = 50.0f;
+uint32_t joule_max_ms = 40;
+float joule_min_current_a = 0.5f;
+
+/* Runtime Joule tracking
+ * joule_accumulated is workpiece energy (lead-compensated) used for control. */
+float joule_accumulated = 0.0f;           /* Workpiece Joules */
+float joule_total_accumulated = 0.0f;     /* Total Joules from caps (V*I*dt) */
+float joule_lead_loss_accumulated = 0.0f; /* Estimated lead losses (I^2*R*dt) */
+bool joule_target_reached = false;
+bool joule_timeout_abort = false;
+bool joule_bad_contact_abort = false;
+uint32_t joule_actual_duration_us = 0;
 
 /* ============ Trigger Settings ============ */
 static volatile uint8_t trigger_mode = 1;        // 1 = pedal, 2 = contact
@@ -555,25 +575,66 @@ static void chargerStateMachine(void) {
  * ============ */
 
 static void sendStatusPacket(void) {
-    char buf[384];
+    char buf[512];
 
     /* --- Packet 1: STATUS (system state + full runtime recipe/settings) --- */
     float vcap = readCapVoltage();
     float power_f = (float)weld_power_pct;
-    snprintf(buf, sizeof(buf),
-             "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
-             "temp=%.2f,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u,"
-             "power=%.2f,preheat_en=%d,preheat_ms=%u,preheat_pct=%u,"
-             "preheat_gap_ms=%u,trigger_mode=%u,contact_hold_steps=%u,"
-             "contact_with_pedal=%u,vdda=%.3f,lead_r_ohm=%.6f",
-             armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
-             temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
-             (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
-             (unsigned)weld_gap2_ms, (unsigned)weld_d3_ms, power_f,
-             preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
-             (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
-             (unsigned)trigger_mode, (unsigned)contact_hold_steps,
-             (unsigned)contact_with_pedal, measured_vdda, lead_resistance_ohms);
+
+    if (control_mode == 1U) {
+        const char* joule_status = "RUNNING";
+        if (joule_target_reached) {
+            joule_status = "OK";
+        } else if (joule_timeout_abort) {
+            joule_status = "TIMEOUT";
+        } else if (joule_bad_contact_abort) {
+            joule_status = "BAD_CONTACT";
+        }
+
+        /* joule_actual is workpiece energy (lead-compensated control variable).
+         * Debug fields show total source energy and estimated lead-loss energy.
+         */
+        snprintf(buf, sizeof(buf),
+                 "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
+                 "temp=%.2f,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u,"
+                 "power=%.2f,preheat_en=%d,preheat_ms=%u,preheat_pct=%u,"
+                 "preheat_gap_ms=%u,trigger_mode=%u,contact_hold_steps=%u,"
+                 "contact_with_pedal=%u,vdda=%.3f,lead_r_ohm=%.6f,"
+                 "control_mode=%u,joule_target_j=%.1f,joule_target=%.1f,joule_"
+                 "actual=%.1f,"
+                 "joule_total=%.1f,joule_lead_loss=%.1f,"
+                 "joule_duration_ms=%lu,joule_status=%s",
+                 armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
+                 temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
+                 (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
+                 (unsigned)weld_gap2_ms, (unsigned)weld_d3_ms, power_f,
+                 preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
+                 (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
+                 (unsigned)trigger_mode, (unsigned)contact_hold_steps,
+                 (unsigned)contact_with_pedal, measured_vdda,
+                 lead_resistance_ohms, (unsigned)control_mode, joule_target_j,
+                 joule_target_j, joule_accumulated, joule_total_accumulated,
+                 joule_lead_loss_accumulated,
+                 (unsigned long)(joule_actual_duration_us / 1000U),
+                 joule_status);
+    } else {
+        snprintf(buf, sizeof(buf),
+                 "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
+                 "temp=%.2f,mode=%d,d1=%u,gap1=%u,d2=%u,gap2=%u,d3=%u,"
+                 "power=%.2f,preheat_en=%d,preheat_ms=%u,preheat_pct=%u,"
+                 "preheat_gap_ms=%u,trigger_mode=%u,contact_hold_steps=%u,"
+                 "contact_with_pedal=%u,vdda=%.3f,lead_r_ohm=%.6f,"
+                 "control_mode=%u,joule_target_j=%.1f",
+                 armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
+                 temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
+                 (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
+                 (unsigned)weld_gap2_ms, (unsigned)weld_d3_ms, power_f,
+                 preheat_enabled ? 1 : 0, (unsigned)preheat_ms,
+                 (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
+                 (unsigned)trigger_mode, (unsigned)contact_hold_steps,
+                 (unsigned)contact_with_pedal, measured_vdda,
+                 lead_resistance_ohms, (unsigned)control_mode, joule_target_j);
+    }
     uartSend(buf);
 
     /* --- Packet 2: STATUS2 (INA226 telemetry) --- */
@@ -1014,6 +1075,12 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
     uint32_t pulse_end_estimate_us = pulse_start_us + pulse_duration_us;
     uint32_t next_sample_us = pulse_start_us;
 
+    const bool joule_mode_active = (control_mode == 1U);
+    const uint32_t joule_bad_contact_limit_us = 5000U;
+    uint32_t joule_low_current_streak_us = 0U;
+    uint32_t joule_duration_offset_us = joule_actual_duration_us;
+    uint32_t joule_last_sample_elapsed_us = 0U;
+
     /*
      * ── BRICK SHITHOUSE TIMING ──────────────────────────────────────────
      *
@@ -1157,6 +1224,96 @@ static void capturePulseAmpsForDurationUs(uint32_t pulse_duration_us,
         (void)waveform_push_sample(
             amps, v_cap_live,
             (uint32_t)(sample_capture_us - waveform_capture_start_us));
+
+        if (joule_mode_active) {
+            uint32_t elapsed_us = sample_capture_us - pulse_start_us;
+            uint32_t dt_us = elapsed_us - joule_last_sample_elapsed_us;
+            if (dt_us == 0U) {
+                dt_us = WAVEFORM_SAMPLE_INTERVAL_US;
+            }
+            joule_last_sample_elapsed_us = elapsed_us;
+            joule_actual_duration_us = joule_duration_offset_us + elapsed_us;
+            float joule_dt_sec = (float)dt_us * 1.0e-6f;
+
+            /* Real-time Joule integration (lead-compensated):
+             * Total power = Vcap * I
+             * Lead loss power = I^2 * R_lead
+             * Workpiece power = Total - Lead losses */
+            float total_power_w = v_cap_live * amps;
+            if (!isfinite(total_power_w) || total_power_w < 0.0f) {
+                total_power_w = 0.0f;
+            }
+
+            float lead_loss_power_w = amps * amps * lead_resistance_ohms;
+            if (!isfinite(lead_loss_power_w) || lead_loss_power_w < 0.0f) {
+                lead_loss_power_w = 0.0f;
+            }
+
+            float workpiece_power_w = total_power_w - lead_loss_power_w;
+            if (!isfinite(workpiece_power_w) || workpiece_power_w < 0.0f) {
+                workpiece_power_w = 0.0f;
+            }
+
+            joule_total_accumulated += total_power_w * joule_dt_sec;
+            joule_lead_loss_accumulated += lead_loss_power_w * joule_dt_sec;
+            joule_accumulated += workpiece_power_w * joule_dt_sec;
+
+            /* 1) Highest priority: stop immediately when workpiece target is
+             * met. */
+            if (joule_accumulated >= (joule_target_j - JOULE_OVERSHOOT_COMP)) {
+                joule_target_reached = true;
+                pwmOff();
+                tim2_fet_killed = true;
+                char jdbg[196];
+                snprintf(jdbg, sizeof(jdbg),
+                         "DBG,JOULE_TARGET_REACHED,target_j=%.2f,cutoff_j=%.2f,"
+                         "actual_j=%.2f,total_j=%.2f,loss_j=%.2f,elapsed_us=%"
+                         "lu,dt_us=%lu",
+                         joule_target_j, joule_target_j - JOULE_OVERSHOOT_COMP,
+                         joule_accumulated, joule_total_accumulated,
+                         joule_lead_loss_accumulated, (unsigned long)elapsed_us,
+                         (unsigned long)dt_us);
+                uartSend(jdbg);
+                break;
+            }
+
+            /* 2) Safety backup timeout (only if energy target did not fire). */
+            if (elapsed_us >= (joule_max_ms * 1000U)) {
+                joule_timeout_abort = true;
+                pwmOff();
+                tim2_fet_killed = true;
+                char jdbg[176];
+                snprintf(jdbg, sizeof(jdbg),
+                         "DBG,JOULE_TIMEOUT,target_j=%.2f,actual_j=%.2f,max_ms="
+                         "%lu,elapsed_us=%lu",
+                         joule_target_j, joule_accumulated,
+                         (unsigned long)joule_max_ms,
+                         (unsigned long)elapsed_us);
+                uartSend(jdbg);
+                break;
+            }
+
+            /* 3) Bad contact: current too low continuously for >5 ms */
+            if (amps < joule_min_current_a) {
+                joule_low_current_streak_us += dt_us;
+            } else {
+                joule_low_current_streak_us = 0U;
+            }
+
+            if (joule_low_current_streak_us >= joule_bad_contact_limit_us) {
+                joule_bad_contact_abort = true;
+                pwmOff();
+                tim2_fet_killed = true;
+                char jdbg[176];
+                snprintf(jdbg, sizeof(jdbg),
+                         "DBG,JOULE_BAD_CONTACT,target_j=%.2f,actual_j=%.2f,"
+                         "low_current_us=%lu",
+                         joule_target_j, joule_accumulated,
+                         (unsigned long)joule_low_current_streak_us);
+                uartSend(jdbg);
+                break;
+            }
+        }
 
         waveform_last_sample_us = sample_capture_us;
         next_sample_us += WAVEFORM_SAMPLE_INTERVAL_US;
@@ -1831,6 +1988,8 @@ static void persistent_defaults(PersistentSettings* out) {
     out->preheat_ms = 20;
     out->preheat_pct = 30;
     out->preheat_gap_ms = 3;
+    out->control_mode = 0;
+    out->joule_target_j = 50.0f;
 }
 
 static void persistent_from_runtime(PersistentSettings* out) {
@@ -1850,6 +2009,8 @@ static void persistent_from_runtime(PersistentSettings* out) {
     out->preheat_ms = preheat_ms;
     out->preheat_pct = preheat_pct;
     out->preheat_gap_ms = preheat_gap_ms;
+    out->control_mode = control_mode;
+    out->joule_target_j = joule_target_j;
 }
 
 static void apply_loaded_settings(const PersistentSettings* in) {
@@ -1870,6 +2031,8 @@ static void apply_loaded_settings(const PersistentSettings* in) {
     preheat_ms = in->preheat_ms;
     preheat_pct = in->preheat_pct;
     preheat_gap_ms = in->preheat_gap_ms;
+    control_mode = in->control_mode;
+    joule_target_j = in->joule_target_j;
 
     clampParams();
 
@@ -1902,6 +2065,11 @@ static void clampParams(void) {
 
     if (contact_hold_steps < 1) contact_hold_steps = 1;
     if (contact_hold_steps > 10) contact_hold_steps = 10;
+
+    if (control_mode > 1U) control_mode = 0U;
+    if (!isfinite(joule_target_j)) joule_target_j = 50.0f;
+    if (joule_target_j < 0.0f) joule_target_j = 0.0f;
+    if (joule_target_j > 300.0f) joule_target_j = 300.0f;
 }
 
 static void applyArmTimeout(void) {
@@ -2114,6 +2282,13 @@ static void fireRecipe(void) {
 
     clampParams();
 
+    if (control_mode == 1U) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "DBG,JOULE_MODE_ACTIVE,target=%.1f",
+                 joule_target_j);
+        uartSend(buf);
+    }
+
     const uint16_t planned_pulse_ms = get_planned_active_pulse_ms();
     uint32_t planned_active_samples =
         ((uint32_t)planned_pulse_ms * 1000U) / WAVEFORM_SAMPLE_INTERVAL_US;
@@ -2135,6 +2310,16 @@ static void fireRecipe(void) {
 
     welding_now = true;
     current_peak_amps = 0.0f;
+
+    /* Reset Joule runtime tracking at weld start. */
+    joule_accumulated = 0.0f;
+    joule_total_accumulated = 0.0f;
+    joule_lead_loss_accumulated = 0.0f;
+    joule_target_reached = false;
+    joule_timeout_abort = false;
+    joule_bad_contact_abort = false;
+    joule_actual_duration_us = 0U;
+
     /* Step 3: ADC diagnostic snapshot BEFORE weld (diagnostic only) */
     cal_vcap_before = readCapVoltage();
     cached_vcap = cal_vcap_before;
@@ -2362,8 +2547,11 @@ static void fireRecipe(void) {
     uint16_t mainDuty = pctToDuty(weld_power_pct);
     uint16_t main_linear_duty =
         (uint16_t)(((uint32_t)weld_power_pct * PWM_MAX) / 100U);
+    bool joule_stop_requested =
+        (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
+                                 joule_bad_contact_abort);
 
-    if (weld_mode >= 1) {
+    if (weld_mode >= 1 && !joule_stop_requested) {
         uint16_t main1_start_idx = waveform_index;
         uint32_t* main1_start_us_ptr = NULL;
         if (!main_pulse_started) {
@@ -2406,7 +2594,12 @@ static void fireRecipe(void) {
         uartSend(mdbg);
 #endif
     }
-    if (weld_mode >= 2) {
+
+    joule_stop_requested =
+        (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
+                                 joule_bad_contact_abort);
+
+    if (weld_mode >= 2 && !joule_stop_requested) {
         if (weld_gap1_ms) captureGapMsWithWaveform(weld_gap1_ms);
         uint16_t main2_start_idx = waveform_index;
         uint32_t* main2_start_us_ptr = NULL;
@@ -2450,7 +2643,12 @@ static void fireRecipe(void) {
         uartSend(mdbg);
 #endif
     }
-    if (weld_mode >= 3) {
+
+    joule_stop_requested =
+        (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
+                                 joule_bad_contact_abort);
+
+    if (weld_mode >= 3 && !joule_stop_requested) {
         if (weld_gap2_ms) captureGapMsWithWaveform(weld_gap2_ms);
         uint16_t main3_start_idx = waveform_index;
         uint32_t* main3_start_us_ptr = NULL;
@@ -2864,23 +3062,25 @@ static void fireRecipe(void) {
     float v_at_tips = avg_vcap_pulse - v_drop_leads;
     if (!isfinite(v_at_tips) || v_at_tips < 0.0f) v_at_tips = 0.0f;
 
-    char buf[448];
-    snprintf(buf, sizeof(buf),
-             "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
-             "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
-             "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
-             "avg_a=%.1f,v_tips=%.3f,energy_j=%.2f,energy_cap_j=%.2f,energy_"
-             "lead_j=%.2f,energy_weld_j=%.2f,pulse_ms=%.2f,pulse_start_sample=%"
-             "u,pulse_end_sample=%u,wf_samples=%u",
-             (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
-             weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
-             preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
-             (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
-             delta_v, cal_current_avg, v_at_tips, energy_weld_joules,
-             energy_cap_joules, energy_leads_joules, energy_weld_joules,
-             pulse_duration_ms, (unsigned int)waveform_pulse_start_index,
-             (unsigned int)waveform_pulse_end_index,
-             (unsigned int)waveform_index);
+    char buf[576];
+    snprintf(
+        buf, sizeof(buf),
+        "EVENT,WELD_DONE,total_ms=%lu,mode=%d,d1=%d,gap1=%d,d2=%d,gap2=%d,"
+        "d3=%d,power_pct=%d,preheat_en=%d,preheat_ms=%d,"
+        "peak_a=%.1f,adc_raw=%lu,vcap_b=%.3f,vcap_a=%.3f,delta_v=%.3f,"
+        "avg_a=%.1f,v_tips=%.3f,energy_j=%.2f,energy_cap_j=%.2f,energy_"
+        "lead_j=%.2f,energy_weld_j=%.2f,joule_total_j=%.2f,"
+        "joule_workpiece_j=%.2f,joule_loss_j=%.2f,pulse_ms=%.2f,"
+        "pulse_start_sample=%u,pulse_end_sample=%u,wf_samples=%u",
+        (unsigned long)total_ms, weld_mode, weld_d1_ms, weld_gap1_ms,
+        weld_d2_ms, weld_gap2_ms, weld_d3_ms, weld_power_pct,
+        preheat_enabled ? 1 : 0, preheat_ms, current_peak_amps,
+        (unsigned long)cal_adc_peak_raw, cal_vcap_before, cal_vcap_after,
+        delta_v, cal_current_avg, v_at_tips, energy_weld_joules,
+        energy_cap_joules, energy_leads_joules, energy_weld_joules,
+        joule_total_accumulated, joule_accumulated, joule_lead_loss_accumulated,
+        pulse_duration_ms, (unsigned int)waveform_pulse_start_index,
+        (unsigned int)waveform_pulse_end_index, (unsigned int)waveform_index);
     uartSend(buf);
 
     /* Phase 3: transmit waveform CSV burst right after weld completion event.
@@ -3522,6 +3722,59 @@ static void parseCommand(char* line) {
         return;
     }
 
+    if (strncmp(line, "SET_MODE,", 9) == 0) {
+        int new_mode_i = atoi(line + 9);
+        if (new_mode_i >= 0 && new_mode_i <= 1) {
+            control_mode = (uint8_t)new_mode_i;
+            clampParams();
+            persistent_from_runtime(&g_persistent_settings);
+            if (!flash_settings_save(&g_persistent_settings)) {
+                uartSend("DENY,SET_MODE,FLASH_SAVE_FAILED");
+                return;
+            }
+            snprintf(response, sizeof(response), "ACK,SET_MODE,mode=%u",
+                     (unsigned)control_mode);
+            uartSend(response);
+            sendStatusPacket();
+        } else {
+            uartSend("DENY,SET_MODE,RANGE");
+        }
+        return;
+    }
+
+    if (strncmp(line, "SET_JOULE_TARGET,", 17) == 0) {
+        char* endptr = NULL;
+        float new_target = strtof(line + 17, &endptr);
+        if (endptr == (line + 17) || (endptr && *endptr != '\0') ||
+            !isfinite(new_target)) {
+            uartSend("DENY,SET_JOULE_TARGET,PARSE");
+            return;
+        }
+
+        if (new_target >= 0.0f && new_target <= 300.0f) {
+            float old_target = joule_target_j;
+            snprintf(response, sizeof(response),
+                     "DBG,SET_JOULE_TARGET,old=%.1f,new=%.1f", old_target,
+                     new_target);
+            uartSend(response);
+
+            joule_target_j = new_target;
+            clampParams();
+            persistent_from_runtime(&g_persistent_settings);
+            if (!flash_settings_save(&g_persistent_settings)) {
+                uartSend("DENY,SET_JOULE_TARGET,FLASH_SAVE_FAILED");
+                return;
+            }
+            snprintf(response, sizeof(response), "ACK,SET_JOULE_TARGET,j=%.1f",
+                     joule_target_j);
+            uartSend(response);
+            sendStatusPacket();
+        } else {
+            uartSend("DENY,SET_JOULE_TARGET,RANGE");
+        }
+        return;
+    }
+
     if (strncmp(line, "SET_PREHEAT,", 12) == 0) {
         int v_en = 0, v_ms = 0, v_pct = 0, v_gap = 0;
         int n = sscanf(line, "SET_PREHEAT,%d,%d,%d,%d", &v_en, &v_ms, &v_pct,
@@ -3848,6 +4101,14 @@ int main(void) {
         persistent_defaults(&g_persistent_settings);
         apply_loaded_settings(&g_persistent_settings);
         uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS");
+    }
+
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf),
+                 "DBG,BOOT,control_mode=%d,joule_target_j=%.1f", control_mode,
+                 joule_target_j);
+        uartSend(buf);
     }
 
     MX_ADC1_Init();
