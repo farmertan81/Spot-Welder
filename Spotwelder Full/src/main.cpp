@@ -71,6 +71,62 @@ static float stm_cell2 = 0.0f;
 static float stm_cell3 = 0.0f;
 static float stm_ichg = 0.0f;
 
+/**
+ * DISPLAY-ONLY VOLTAGE SMOOTHER FOR ESP32 TFT/LVGL
+ * Prevents screen label flicker while keeping raw telemetry for logic/bridge.
+ * Threshold: 0.02V (20mV)
+ */
+class VoltageDisplaySmoother {
+   private:
+    struct Channel {
+        float lastValue;
+        bool initialized;
+    };
+
+    static const int MAX_CHANNELS = 8;
+    Channel channels[MAX_CHANNELS];
+    float threshold;
+
+   public:
+    explicit VoltageDisplaySmoother(float thresh = 0.02f) : threshold(thresh) {
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            channels[i].initialized = false;
+            channels[i].lastValue = 0.0f;
+        }
+    }
+
+    float getDisplayValue(int channel, float rawValue) {
+        if (channel < 0 || channel >= MAX_CHANNELS) return rawValue;
+
+        if (!channels[channel].initialized) {
+            channels[channel].lastValue = rawValue;
+            channels[channel].initialized = true;
+            return rawValue;
+        }
+
+        float delta = fabsf(rawValue - channels[channel].lastValue);
+        if (delta < threshold) {
+            return channels[channel].lastValue;
+        }
+
+        channels[channel].lastValue = rawValue;
+        return rawValue;
+    }
+};
+
+enum VoltageChannel {
+    CH_VPACK = 0,
+    CH_VCAP = 1,
+    CH_CELL1 = 2,
+    CH_CELL2 = 3,
+    CH_CELL3 = 4,
+    CH_VLOW = 5,
+    CH_VMID = 6
+};
+
+// Global instance used only when rendering values on local TFT/LVGL.
+static VoltageDisplaySmoother tftSmoother(0.02f);
+
 // Voltage/energy naming migration (Phase 1B):
 // - Canonical names from STM32: weld_v/cap_v + *_b/*_a and energy_*_j.
 // - Backward compatibility: keep old vcap_b/vcap_a fields alive in bridge
@@ -520,21 +576,34 @@ String buildStatus() {
 }
 
 void updateScreenDisplay() {
+    // RAW telemetry path for logic/calculations/bridge packets.
+    const float raw_vpack = stm_vpack;
+    const float raw_cell1 = stm_cell1;
+    const float raw_cell2 = stm_cell2;
+    const float raw_cell3 = stm_cell3;
+    const float raw_cap_v = cap_v;
+
     WelderDisplayState ds;
-    ds.pack_voltage = stm_vpack;
+
+    // DISPLAY-ONLY smoothing path (local TFT/LVGL labels):
+    ds.pack_voltage = tftSmoother.getDisplayValue(CH_VPACK, raw_vpack);
+    ds.cell1_v = tftSmoother.getDisplayValue(CH_CELL1, raw_cell1);
+    ds.cell2_v = tftSmoother.getDisplayValue(CH_CELL2, raw_cell2);
+    ds.cell3_v = tftSmoother.getDisplayValue(CH_CELL3, raw_cell3);
+    ds.cap_v = tftSmoother.getDisplayValue(CH_VCAP, raw_cap_v);
+
     ds.temperature = temperature_c;
     ds.charger_current = stm_charger_on ? stm_ichg : 0.0f;
-    ds.cell1_v = stm_cell1;
-    ds.cell2_v = stm_cell2;
-    ds.cell3_v = stm_cell3;
     ds.weld_v = weld_v;
-    ds.cap_v = cap_v;
     ds.weld_v_b = weld_v_b;
     ds.weld_v_a = weld_v_a;
     ds.cap_v_b = cap_v_b;
     ds.cap_v_a = cap_v_a;
+
+    // Keep derived math raw/authoritative.
     ds.weld_v_drop = weld_v_b - weld_v_a;
     ds.cap_v_drop = cap_v_b - cap_v_a;
+
     ds.energy_cap_j = energy_cap_j;
     ds.energy_weld_j = energy_weld_j;
     ds.energy_loss_j = energy_loss_j;
@@ -2113,45 +2182,9 @@ void loop() {
         ui_set_touch_active(hw_touch);
     }
 
-    // --- Update on-screen UI (now using STM32-sourced INA226 data) ---
-    {
-        WelderDisplayState ds;
-        ds.pack_voltage = stm_vpack;
-        ds.temperature = temperature_c;
-        ds.charger_current = stm_charger_on ? stm_ichg : 0.0f;
-        ds.cell1_v = stm_cell1;
-        ds.cell2_v = stm_cell2;
-        ds.cell3_v = stm_cell3;
-        ds.weld_v = weld_v;
-        ds.cap_v = cap_v;
-        ds.weld_v_b = weld_v_b;
-        ds.weld_v_a = weld_v_a;
-        ds.cap_v_b = cap_v_b;
-        ds.cap_v_a = cap_v_a;
-        ds.weld_v_drop = weld_v_b - weld_v_a;
-        ds.cap_v_drop = cap_v_b - cap_v_a;
-        ds.energy_cap_j = energy_cap_j;
-        ds.energy_weld_j = energy_weld_j;
-        ds.energy_loss_j = energy_loss_j;
-        ds.armed = stm_armed;
-        ds.welding = welding_now;
-        ds.charging = stm_charger_on;
-        ds.weld_count = weld_count;
-        ds.weld_mode = weld_mode;
-        ds.pulse_d1 = weld_d1;
-        ds.pulse_gap1 = weld_gap1;
-        ds.pulse_d2 = weld_d2;
-        ds.pulse_gap2 = weld_gap2;
-        ds.pulse_d3 = weld_d3;
-        ds.power_pct = weld_power_pct;
-        ds.preheat_enabled = preheat_enabled;
-        ds.preheat_ms = preheat_ms;
-        ds.preheat_pct = preheat_pct;
-        ds.preheat_gap_ms = preheat_gap_ms;
-        ds.trigger_mode = trigger_mode;
-        ds.contact_hold_steps = contact_hold_steps;
-        ui_update(ds);
-    }
+    // --- Update on-screen UI (display-smoothing applied inside helper) ---
+    updateScreenDisplay();
 
     delay(5);
 }
+
