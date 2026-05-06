@@ -16,6 +16,7 @@ static void init_tim2_1mhz(void);
 static void MX_ADC1_Init(void);
 static void MX_ADC2_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_IWDG_Init(void);
 static void i2c_bus_recovery(void);
 
 static void uartSend(const char* s);
@@ -110,8 +111,7 @@ static bool resolve_phase_end_from_waveform(uint16_t start_index,
 #define LED_PORT GPIOC
 #define LED_PIN GPIO_PIN_6
 
-/* Legacy PA6 contact input is intentionally not used anymore.
- * Contact is now detected via AMC1311B capacitor voltage. */
+/* Contact detection uses AMC1311B capacitor voltage sensing on PA3/PA4. */
 
 /* NEW: Charger enable pin */
 #define CHARGER_EN_PORT GPIOB
@@ -211,6 +211,7 @@ TIM_HandleTypeDef htim1;
 ADC_HandleTypeDef hadc1;
 ADC_HandleTypeDef hadc2;
 I2C_HandleTypeDef hi2c1;
+IWDG_HandleTypeDef hiwdg;
 
 /* ==== VDDA Calibration ==== */
 /* STM32G474: Factory VREFINT cal was measured at VDDA = 3.0V (3000 mV).
@@ -3162,13 +3163,6 @@ static void MX_GPIO_Init(void) {
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
-    /* Legacy PA6 input kept configured as a hardware fallback only.
-     * Runtime contact detection now uses AMC1311B vcap thresholding. */
-    GPIO_InitStruct.Pin = GPIO_PIN_6;
-    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
     /* NEW: PB2 = CHARGER_EN output, default LOW (charger disabled) */
     GPIO_InitStruct.Pin = CHARGER_EN_PIN;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -3495,6 +3489,19 @@ static void MX_I2C1_Init(void) {
     if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK) {
         ina226_ok = false;
         return;
+    }
+}
+
+static void MX_IWDG_Init(void) {
+    hiwdg.Instance = IWDG;
+    hiwdg.Init.Prescaler = IWDG_PRESCALER_256;
+    hiwdg.Init.Reload = 100; /* ~800 ms timeout @ 32 kHz LSI */
+    hiwdg.Init.Window = IWDG_WINDOW_DISABLE;
+
+    if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
+        uartSend("ERR,IWDG_INIT_FAILED");
+    } else {
+        uartSend("DBG,IWDG_ENABLED,timeout_ms=800");
     }
 }
 
@@ -4182,7 +4189,11 @@ int main(void) {
 
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
+    MX_IWDG_Init();
+
     while (1) {
+        HAL_IWDG_Refresh(&hiwdg);
+
         pollPedal();
         pollContactTrigger();
         applyArmTimeout();
@@ -4310,9 +4321,6 @@ void TIM1_UP_TIM16_IRQHandler(void) { HAL_TIM_IRQHandler(&htim1); }
  *
  * DIER.UIE is armed ONLY during active weld pulses (preheat / main) and
  * disarmed before gap delays, so this ISR never fires during gap timing.
- *
- * Critical for future synchronous buck converter dead-time accuracy.
- * ═══════════════════════════════════════════════════════════════════════════
  */
 void TIM2_IRQHandler(void) {
     if (TIM2->SR & TIM_SR_UIF) {

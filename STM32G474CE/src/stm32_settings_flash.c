@@ -5,6 +5,7 @@
 
 #include "stm32_settings_flash.h"
 
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -33,16 +34,22 @@ static uint32_t crc32_calculate(const uint8_t* data, uint32_t length) {
 }
 
 /**
+ * Calculate CRC for settings payload (all bytes before crc32 field).
+ * @param settings Pointer to settings struct
+ * @return Computed CRC32 value
+ */
+static uint32_t settings_calc_crc(const PersistentSettings* settings) {
+    const size_t crc_data_size = offsetof(PersistentSettings, crc32);
+    return crc32_calculate((const uint8_t*)settings, (uint32_t)crc_data_size);
+}
+
+/**
  * Verify settings struct CRC.
  * @param settings Pointer to settings struct
  * @return true if CRC matches
  */
 static bool settings_verify_crc(const PersistentSettings* settings) {
-    // CRC is calculated over all bytes EXCEPT the crc32 field itself
-    size_t crc_data_size = sizeof(PersistentSettings) - sizeof(uint32_t);
-    uint32_t calculated_crc =
-        crc32_calculate((const uint8_t*)settings, crc_data_size);
-    return (calculated_crc == settings->crc32);
+    return (settings_calc_crc(settings) == settings->crc32);
 }
 
 /**
@@ -50,8 +57,7 @@ static bool settings_verify_crc(const PersistentSettings* settings) {
  * @param settings Pointer to settings struct to update
  */
 static void settings_update_crc(PersistentSettings* settings) {
-    size_t crc_data_size = sizeof(PersistentSettings) - sizeof(uint32_t);
-    settings->crc32 = crc32_calculate((const uint8_t*)settings, crc_data_size);
+    settings->crc32 = settings_calc_crc(settings);
 }
 
 extern UART_HandleTypeDef huart1;
@@ -151,7 +157,33 @@ bool settings_flash_save(const PersistentSettings* settings) {
     settings_with_crc.version = SETTINGS_VERSION;
     settings_update_crc(&settings_with_crc);
 
-    flash_debug_u32("FLASH_CRC", settings_with_crc.crc32);
+    flash_debug_u32("FLASH_NEW_CRC", settings_with_crc.crc32);
+
+    // Skip erase/program when payload CRC and headers are unchanged.
+    const PersistentSettings* flash_settings =
+        (const PersistentSettings*)SETTINGS_FLASH_BASE_ADDR;
+    uint32_t flash_calc_crc = settings_calc_crc(flash_settings);
+
+    flash_debug_u32("FLASH_CUR_CRC", flash_settings->crc32);
+    flash_debug_u32("FLASH_CUR_CALC_CRC", flash_calc_crc);
+
+    char cmp_buf[128];
+    snprintf(cmp_buf, sizeof(cmp_buf),
+             "DBG,FLASH_CMP,flash_crc=0x%08lX,new_crc=0x%08lX\r\n",
+             (unsigned long)flash_calc_crc,
+             (unsigned long)settings_with_crc.crc32);
+    flash_debug_send(cmp_buf);
+
+    const bool flash_header_valid =
+        (flash_settings->magic == SETTINGS_MAGIC) &&
+        (flash_settings->version == SETTINGS_VERSION);
+    const bool flash_crc_valid =
+        flash_header_valid && (flash_settings->crc32 == flash_calc_crc);
+
+    if (flash_crc_valid && (flash_calc_crc == settings_with_crc.crc32)) {
+        flash_debug_send("DBG,FLASH_SKIP_UNCHANGED\r\n");
+        return true;
+    }
 
     // Unlock Flash for write/erase
     status = HAL_FLASH_Unlock();
