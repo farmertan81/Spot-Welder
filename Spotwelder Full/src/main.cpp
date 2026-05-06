@@ -490,6 +490,17 @@ static inline bool isNoisyKeepaliveLine(const String& s) {
 // =========================
 // Status builder
 // =========================
+/**
+ * buildStatus() - System state packet
+ *
+ * NOTE: Voltage telemetry is NOT included here.
+ * All voltages are sent via STATUS2 only to ensure
+ * Flask web UI and ESP32 TFT display stay in sync.
+ *
+ * Including voltages in both STATUS and STATUS2 caused
+ * display mismatch due to cached values confusing the
+ * 20mV display smoother.
+ */
 String buildStatus() {
     bool enabled = stm_armed;
 
@@ -513,39 +524,15 @@ String buildStatus() {
     long cooldown_ms = (long)(WELD_COOLDOWN - (now - last_weld_time));
     if (cooldown_ms < 0) cooldown_ms = 0;
 
-    /* Use STM32-sourced charger current */
-    float ichg = stm_charger_on ? stm_ichg : 0.0f;
-    if (fabs(ichg) < 0.2f && !welding_now) ichg = 0.0f;
-
     float iweld = (fabs(stm_weld_current) < 0.002f) ? 0.0f : stm_weld_current;
-
-    float weld_drop_v = weld_v_b - weld_v_a;
-    float cap_drop_v = cap_v_b - cap_v_a;
 
     String status = "STATUS";
     status += ",enabled=" + String(enabled ? 1 : 0);
+    status += ",armed=" + String(stm_armed ? 1 : 0);
+    status += ",ready=" + String(stm_ready ? 1 : 0);
+    status += ",welding=" + String(welding_now ? 1 : 0);
     status += ",state=" + state;
-    status += ",vpack=" + String(stm_vpack, 3);
-    status += ",vlow=" + String(stm_vlow, 3);
-    status += ",vmid=" + String(stm_vmid, 3);
-    status += ",cell1=" + String(stm_cell1, 3);
-    status += ",cell2=" + String(stm_cell2, 3);
-    status += ",cell3=" + String(stm_cell3, 3);
-    status += ",ichg=" + String(ichg, 3);
     status += ",iweld=" + String(iweld, 3);
-    status += ",weld_v=" + String(weld_v, 3);
-    status += ",cap_v=" + String(cap_v, 3);
-    status += ",vcap=" + String(stm_vcap, 3);  // legacy alias of weld_v
-    status +=
-        ",vcap_b=" + String(vcap_b, 3);  // legacy field for Flask compatibility
-    status +=
-        ",vcap_a=" + String(vcap_a, 3);  // legacy field for Flask compatibility
-    status += ",weld_v_b=" + String(weld_v_b, 3);
-    status += ",weld_v_a=" + String(weld_v_a, 3);
-    status += ",cap_v_b=" + String(cap_v_b, 3);
-    status += ",cap_v_a=" + String(cap_v_a, 3);
-    status += ",weld_v_drop=" + String(weld_drop_v, 3);
-    status += ",cap_v_drop=" + String(cap_drop_v, 3);
     status += ",energy_cap_j=" + String(energy_cap_j, 3);
     status += ",energy_weld_j=" + String(energy_weld_j, 3);
     status += ",energy_loss_j=" + String(energy_loss_j, 3);
