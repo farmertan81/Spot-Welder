@@ -74,7 +74,7 @@ static float stm_ichg = 0.0f;
 /**
  * DISPLAY-ONLY VOLTAGE SMOOTHER FOR ESP32 TFT/LVGL
  * Prevents screen label flicker while keeping raw telemetry for logic/bridge.
- * Threshold: 0.02V (20mV)
+ * Threshold: 0.005V (5mV)
  */
 class VoltageDisplaySmoother {
    private:
@@ -125,7 +125,7 @@ enum VoltageChannel {
 };
 
 // Global instance used only when rendering values on local TFT/LVGL.
-static VoltageDisplaySmoother tftSmoother(0.02f);
+static VoltageDisplaySmoother tftSmoother(0.005f);
 
 // Voltage/energy naming migration (Phase 1B):
 // - Canonical names from STM32: weld_v/cap_v + *_b/*_a and energy_*_j.
@@ -150,6 +150,16 @@ static float stm_power = 0.0f;        // weld power setting from STATUS
 static bool stm_ina_ok = false;       // INA226 health flag from STATUS2
 static bool stm_charger_on = false;   // chg_en field from STATUS2
 static uint32_t last_status2_ms = 0;  // timestamp of last STATUS2
+
+// Dual-path bridge timing:
+// - STATUS2 is forwarded raw at 500ms cadence (graph/calc consumers)
+// - DISPLAY is sent smoothed at 1000ms cadence (UI label consumers)
+static String rawStatus2Packet;
+static bool hasRawStatus2Data = false;
+unsigned long lastStatus2Forward = 0;
+unsigned long lastDisplayUpdate = 0;
+const int STATUS2_INTERVAL = 500;
+const int DISPLAY_INTERVAL = 1000;
 
 // =========================
 // UI / mirrored settings
@@ -562,6 +572,37 @@ String buildStatus() {
     return status;
 }
 
+/**
+ * Build DISPLAY packet with smoothed voltages for UI labels.
+ * Sent at 1Hz to prevent flicker and uses a 5mV deadband.
+ */
+String buildDisplayPacket() {
+    char buf[256];
+
+    const float raw_vpack = stm_vpack;
+    const float raw_cell1 = stm_cell1;
+    const float raw_cell2 = stm_cell2;
+    const float raw_cell3 = stm_cell3;
+    const float raw_vcap = cap_v;
+
+    float disp_vpack = tftSmoother.getDisplayValue(CH_VPACK, raw_vpack);
+    float disp_cell1 = tftSmoother.getDisplayValue(CH_CELL1, raw_cell1);
+    float disp_cell2 = tftSmoother.getDisplayValue(CH_CELL2, raw_cell2);
+    float disp_cell3 = tftSmoother.getDisplayValue(CH_CELL3, raw_cell3);
+    float disp_vcap = tftSmoother.getDisplayValue(CH_VCAP, raw_vcap);
+
+    snprintf(buf,
+             sizeof(buf),
+             "DISPLAY,vpack=%.3f,vcap=%.3f,cell1=%.3f,cell2=%.3f,cell3=%.3f",
+             disp_vpack,
+             disp_vcap,
+             disp_cell1,
+             disp_cell2,
+             disp_cell3);
+
+    return String(buf);
+}
+
 void updateScreenDisplay() {
     // RAW telemetry path for logic/calculations/bridge packets.
     const float raw_vpack = stm_vpack;
@@ -800,10 +841,11 @@ void pollStm32Uart() {
                 // STATUS2 packet from STM32 (INA226 data + charger state)
                 if (stmLine.startsWith("STATUS2,")) {
                     parseStatus2(stmLine);
+                    // Cache latest raw STATUS2 packet for timed forwarding.
+                    rawStatus2Packet = stmLine;
+                    hasRawStatus2Data = true;
                     // Log to serial so STATUS2 is visible in monitor
                     Serial.printf("[STM32->UART] %s\n", stmLine.c_str());
-                    // Forward to TCP client
-                    sendToPi(stmLine);
                     stmLine = "";
                     continue;
                 }
@@ -2107,6 +2149,23 @@ void loop() {
 
     static uint32_t lastStatusReqMs = 0;
     uint32_t now = millis();
+
+    // Dual-path voltage forwarding over TCP:
+    // 1) raw STATUS2 at 500ms for high-resolution graph/calc consumers
+    if ((now - lastStatus2Forward) > STATUS2_INTERVAL) {
+        if (hasRawStatus2Data) {
+            sendToPi(rawStatus2Packet);
+            lastStatus2Forward = now;
+        }
+    }
+
+    // 2) smoothed DISPLAY at 1000ms for stable UI labels
+    if ((now - lastDisplayUpdate) > DISPLAY_INTERVAL) {
+        if (hasRawStatus2Data) {
+            sendToPi(buildDisplayPacket());
+            lastDisplayUpdate = now;
+        }
+    }
 
     if ((now - lastStatusReqMs) >= 1000) {
         requestStm32Status();
