@@ -174,7 +174,7 @@ static bool resolve_phase_end_from_waveform(uint16_t start_index,
 // Actual: vlow=2.904V, vmid=5.805V, vpack=8.71V
 #define V_NODE1_SCALE 1.001327f  // Was: 0.9965f
 #define V_NODE2_SCALE 0.986048f  // Was: 0.9835f
-#define VPACK_SCALE   1.000f
+#define VPACK_SCALE   1.001149f  // Calibrated 2025-05-08: 8.71V (Fluke 87V)
 
 /* ============ Limits / Timing ============ */
 static const uint32_t WELD_COOLDOWN_MS = 500;
