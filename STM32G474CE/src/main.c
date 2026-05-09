@@ -4156,8 +4156,11 @@ int main(void) {
         /* INA226 0x40 (pack): reset + configure */
         ina226_write_reg(INA226_ADDR_PACK, INA226_REG_CONFIG, 0x8000);
         HAL_Delay(20);
-        /* CONFIG: AVG=16, VBUSCT=1.1ms, VSHCT=1.1ms, MODE=cont shunt+bus */
-        uint16_t ina_config = (0x02 << 9) | (0x04 << 6) | (0x04 << 3) | 0x07;
+        /* CONFIG: AVG=64, VBUSCT=1.1ms, VSHCT=1.1ms, MODE=cont shunt+bus
+         * AVG=64 (0x03<<9) gives √64=8x noise reduction vs single sample.
+         * Previous AVG=16 had ~10mV noise on cell1; 64 should cut to ~2-3mV.
+         * Update period: 64 × 1.1ms × 2 ≈ 141ms (still within 100ms loop). */
+        uint16_t ina_config = (0x03 << 9) | (0x04 << 6) | (0x04 << 3) | 0x07;
         ina226_write_reg(INA226_ADDR_PACK, INA226_REG_CONFIG, ina_config);
         HAL_Delay(10);
         /* Calibration register (same as ESP32 used) */
@@ -4235,7 +4238,7 @@ int main(void) {
         {
             static uint32_t last_ina_ms = 0;
             uint32_t now = HAL_GetTick();
-            if ((now - last_ina_ms) >= 100) {
+            if ((now - last_ina_ms) >= 150) { /* 150ms matches AVG=64 conversion time */
                 last_ina_ms = now;
                 ina226_read_all();
                 chargerStateMachine();
