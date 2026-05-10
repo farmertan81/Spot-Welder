@@ -4,7 +4,8 @@ This folder contains technical specifications and reference documents for the Sp
 
 ## Documents
 
-- **[BALANCER_SPECIFICATION.md](BALANCER_SPECIFICATION.md)** - 4-cell Li-ion balancer hardware and firmware specification
+- **[PIN_ASSIGNMENTS.md](PIN_ASSIGNMENTS.md)** — Master STM32G474CE pin assignment document (authoritative reference for all pin allocations)
+- **[BALANCER_SPECIFICATION.md](BALANCER_SPECIFICATION.md)** — 4-cell Li-ion balancer hardware and firmware specification
 
 ## Future Documents
 - Calibration procedures
