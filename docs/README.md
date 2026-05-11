@@ -1,14 +1,15 @@
 # Documentation
 
-This folder contains technical specifications and reference documents for the Spot Welder project.
+This folder contains final hardware and firmware reference documentation for the Spot Welder project.
 
-## Documents
+## Core Documents
 
-- **[PIN_ASSIGNMENTS.md](PIN_ASSIGNMENTS.md)** — Master STM32G474CE pin assignment document (authoritative reference for all pin allocations)
-- **[BALANCER_SPECIFICATION.md](BALANCER_SPECIFICATION.md)** — 4-cell Li-ion balancer hardware and firmware specification
+- **[PIN_ASSIGNMENTS.md](PIN_ASSIGNMENTS.md)** — Final STM32G474CE pin map (WeAct board connectors, functional group mapping, INA226 network, and expansion pins)
+- **[BALANCER_SPECIFICATION.md](BALANCER_SPECIFICATION.md)** — 4-cell passive balancer architecture and implementation details
+- **[SNUBBER_SPECIFICATION.md](SNUBBER_SPECIFICATION.md)** — RC snubber network specification (4× branches, calculations, layout guidance, and BOM)
 
 ## Future Documents
+
 - Calibration procedures
-- Test reports
-- Design decisions
-- API documentation
+- Test reports and validation logs
+- Manufacturing notes and bring-up checklist
