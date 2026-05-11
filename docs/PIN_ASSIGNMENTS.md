@@ -63,7 +63,11 @@
 | 9 | PB4 | CELL_2 | Balancer channel 2 drive (optocoupler LED) | Output | Balancer |
 | 10 | PB5 | CELL_3 | Balancer channel 3 drive (optocoupler LED) | Output | Balancer |
 | 11 | PB6 | CELL_4 | Balancer channel 4 drive (optocoupler LED) | Output | Balancer |
-| 12 | PA15 | I2C_SCL | I2C1 SCL for INA226 cluster | Bidirectional (OD) | Communication |
+| 12 | PA15 | I2C_SCL | I2C1 SCL for INA226 cluster | Bidirectional (OD) | 
+
+
+| Communication |
+
 | 13 | PB7 | I2C_SDA | I2C1 SDA for INA226 cluster | Bidirectional (OD) | Communication |
 | 14 | PA9 | USART1_TX | STM32 → ESP32 display/control link | Output | Communication |
 | 15 | PA10 | USART1_RX | ESP32 → STM32 command link | Input | Communication |
@@ -127,8 +131,8 @@ All INA226 devices share I2C1 (PA15/PB7, 4.7k pull-ups to 3V3_CLEAN).
 
 | Device | I2C Address | Measured Nodes | Purpose |
 | --- | :---: | --- | --- |
-| U8 | **0x40** | CHG_SHUNT_P / CHG_SHUNT_N, PACK_POS reference | Charge shunt monitor |
-| U9 | **0x41** | CELL1_TAP to GND_H | Cell 1 monitor |
+| U8  | **0x40** | CHG_SHUNT_P / CHG_SHUNT_N, PACK_POS reference | Charge shunt monitor |
+| U9  | **0x41** | CELL1_TAP to GND_H     | Cell 1 monitor |
 | U13 | **0x42** | CELL2_TAP to CELL1_TAP | Cell 2 monitor |
 | U12 | **0x43** | CELL3_TAP to CELL2_TAP | Cell 3 monitor |
 | U10 | **0x44** | CELL4_TAP to CELL3_TAP | Cell 4 monitor |
@@ -143,32 +147,31 @@ This gives complete per-cell and pack-level observability for balancing and safe
 
 | Net | MCU Pin | Function |
 | --- | :---: | --- |
-| PEDAL_IN | PB12 | Foot pedal trigger |
-| USART1_TX | PA9 | Serial TX to ESP32 |
-| USART1_RX | PA10 | Serial RX from ESP32 |
-| I2C_SCL | PA15 | I2C1 clock |
-| I2C_SDA | PB7 | I2C1 data |
-| CELL_1 | PB3 | Balancer channel 1 |
-| CELL_2 | PB4 | Balancer channel 2 |
-| CELL_3 | PB5 | Balancer channel 3 |
-| CELL_4 | PB6 | Balancer channel 4 |
-| CHARGE_FAULT | PB8 | Charger fault input |
-| WELD_GATE_1 | PA8 | Weld bank 1 gate command |
+| PEDAL_IN      | PB12 | Foot pedal trigger |
+| USART1_TX     | PA9 | Serial TX to ESP32 |
+| USART1_RX     | PA10 | Serial RX from ESP32 |
+| I2C_SCL       | PA15 | I2C1 clock |
+| I2C_SDA       | PB7 | I2C1 data |
+| CELL_1        | PB3 | Balancer channel 1 |
+| CELL_2        | PB4 | Balancer channel 2 |
+| CELL_3        | PB5 | Balancer channel 3 |
+| CELL_4        | PB6 | Balancer channel 4 |
+| CHARGE_FAULT  | PB8 | Charger fault input |
+| WELD_GATE_1   | PA8 | Weld bank 1 gate command |
 | CHARGE_GATE_H | PB9 | Charger high-side gate command |
 
 ### 6.2 J15 (right-side breakout group)
 
 | Net | MCU Pin | Function |
 | --- | :---: | --- |
-| WELD_GATE_2 | PB10 | Weld bank 2 gate command |
-| CHG_PWM | PB2 | Charger control/enable path |
-| CHARGE_GATE_L | PB1 | Charger low-side gate command |
-| WELD_FAULT | PA6 | Weld stage fault input |
-| THERM_IN | PA0 | Thermistor ADC |
-| SHUNT_P_ADC | PA1 | Current-sense ADC + |
-| SHUNT_N_ADC | PA2 | Current-sense ADC − |
-| VCAP_OUTP | PA3 | Capacitor ADC + |
-| VCAP_OUTN | PA4 | Capacitor ADC − |
+| WELD_GATE_2     | PB10 | Weld bank 2 gate command |
+| CHARGE_GATE_L   | PB1 | Charger low-side gate command |
+| WELD_FAULT      | PA6 | Weld stage fault input |
+| THERM_IN        | PA0 | Thermistor ADC |
+| SHUNT_P_ADC     | PA1 | Current-sense ADC + |
+| SHUNT_N_ADC     | PA2 | Current-sense ADC − |
+| VCAP_OUTP       | PA3 | Capacitor ADC + |
+| VCAP_OUTN       | PA4 | Capacitor ADC − |
 | AUX_IO_RESERVED | PB11 | Reserved post-layout I/O |
 
 ---
