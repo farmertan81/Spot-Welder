@@ -38,7 +38,7 @@
 | Functional Group | Pins | Notes |
 | --- | :---: | --- |
 | Weld control | 3 | PA8, PB10, PA6 |
-| Charger control | 4 | PB9, PB1, PB8, PB2 |
+| Charger control | 4 | PB9, PB1, PB8 |
 | Balancer control | 4 | PB3, PB4, PB5, PB6 |
 | Communication | 4 | PA9, PA10, PA15, PB7 |
 | ADC / analog sensing | 5 | PA0, PA1, PA2, PA3, PA4 |
@@ -58,30 +58,29 @@
 | 4 | PB9 | CHARGE_GATE_H | High-side gate command (charger) | Output | Charger |
 | 5 | PB1 | CHARGE_GATE_L | Low-side gate command (charger) | Output | Charger |
 | 6 | PB8 | CHARGE_FAULT | Charger fault input | Input | Charger |
-| 7 | PB2 | CHG_PWM | Charger control/enable path | Output | Charger |
-| 8 | PB3 | CELL_1 | Balancer channel 1 drive (optocoupler LED) | Output | Balancer |
-| 9 | PB4 | CELL_2 | Balancer channel 2 drive (optocoupler LED) | Output | Balancer |
-| 10 | PB5 | CELL_3 | Balancer channel 3 drive (optocoupler LED) | Output | Balancer |
-| 11 | PB6 | CELL_4 | Balancer channel 4 drive (optocoupler LED) | Output | Balancer |
-| 12 | PA15 | I2C_SCL | I2C1 SCL for INA226 cluster | Bidirectional (OD) | 
+| 7 | PB3 | CELL_1 | Balancer channel 1 drive (optocoupler LED) | Output | Balancer |
+| 8 | PB4 | CELL_2 | Balancer channel 2 drive (optocoupler LED) | Output | Balancer |
+| 9 | PB5 | CELL_3 | Balancer channel 3 drive (optocoupler LED) | Output | Balancer |
+| 10 | PB6 | CELL_4 | Balancer channel 4 drive (optocoupler LED) | Output | Balancer |
+| 11 | PA15 | I2C_SCL | I2C1 SCL for INA226 cluster | Bidirectional (OD) | 
 
 
 | Communication |
 
-| 13 | PB7 | I2C_SDA | I2C1 SDA for INA226 cluster | Bidirectional (OD) | Communication |
-| 14 | PA9 | USART1_TX | STM32 → ESP32 display/control link | Output | Communication |
-| 15 | PA10 | USART1_RX | ESP32 → STM32 command link | Input | Communication |
-| 16 | PA0 | THERM_IN | NTC thermistor ADC input | Input (Analog) | ADC |
-| 17 | PA1 | SHUNT_P_ADC | Current sense differential + | Input (Analog) | ADC |
-| 18 | PA2 | SHUNT_N_ADC | Current sense differential − | Input (Analog) | ADC |
-| 19 | PA3 | VCAP_OUTP | Capacitor sense differential + | Input (Analog) | ADC |
-| 20 | PA4 | VCAP_OUTN | Capacitor sense differential − | Input (Analog) | ADC |
-| 21 | PB12 | PEDAL_IN | Foot pedal trigger input | Input | Operator I/O |
-| 22 | PC6 | STATUS_LED | Local status LED/indicator | Output | Operator I/O |
-| 23 | PA13 | SWDIO | Debug/programming | Bidirectional | Infrastructure |
-| 24 | PA14 | SWCLK | Debug/programming | Input | Infrastructure |
-| 25 | NRST | NRST | Hardware reset | Input | Infrastructure |
-| 26 | PB11 | AUX_IO_RESERVED | Reserved routed I/O for post-layout options | I/O reserved | Infrastructure |
+| 12 | PB7 | I2C_SDA | I2C1 SDA for INA226 cluster | Bidirectional (OD) | Communication |
+| 13 | PA9 | USART1_TX | STM32 → ESP32 display/control link | Output | Communication |
+| 14 | PA10 | USART1_RX | ESP32 → STM32 command link | Input | Communication |
+| 15 | PA0 | THERM_IN | NTC thermistor ADC input | Input (Analog) | ADC |
+| 16 | PA1 | SHUNT_P_ADC | Current sense differential + | Input (Analog) | ADC |
+| 17 | PA2 | SHUNT_N_ADC | Current sense differential − | Input (Analog) | ADC |
+| 18 | PA3 | VCAP_OUTP | Capacitor sense differential + | Input (Analog) | ADC |
+| 19 | PA4 | VCAP_OUTN | Capacitor sense differential − | Input (Analog) | ADC |
+| 20 | PB12 | PEDAL_IN | Foot pedal trigger input | Input | Operator I/O |
+| 21 | PC6 | STATUS_LED | Local status LED/indicator | Output | Operator I/O |
+| 22 | PA13 | SWDIO | Debug/programming | Bidirectional | Infrastructure |
+| 23 | PA14 | SWCLK | Debug/programming | Input | Infrastructure |
+| 24 | NRST | NRST | Hardware reset | Input | Infrastructure |
+| 25 | PB11 | AUX_IO_RESERVED | Reserved routed I/O for post-layout options | I/O reserved | Infrastructure |
 
 > Notes:
 >
@@ -110,7 +109,7 @@ This drives the 16× IRL40SC228 arrangement as two synchronized banks.
 - PB9 = high-side gate command
 - PB1 = low-side gate command
 - PB8 = charger fault input
-- PB2 = charger PWM/enable control path
+
 
 ### 4.4 Communication
 
