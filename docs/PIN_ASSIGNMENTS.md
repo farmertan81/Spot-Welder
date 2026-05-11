@@ -29,9 +29,9 @@
 ### MCU utilization
 
 - **Header-accessible pins considered:** 40
-- **Allocated pins (active + infrastructure):** 26
-- **Utilization:** **65%**
-- **Available for expansion:** 14 pins
+- **Allocated pins (active + infrastructure):** 25
+- **Utilization:** **62.5%**
+- **Available for expansion:** 15 pins
 
 ### Allocation by function
 
@@ -44,11 +44,11 @@
 | ADC / analog sensing | 5 | PA0, PA1, PA2, PA3, PA4 |
 | Operator / status I/O | 2 | PB12, PC6 |
 | Debug / infrastructure | 4 | PA13, PA14, NRST, PB11 |
-| **Total** | **26** | **65% of 40** |
+| **Total** | **25** | **62.5% of 40** |
 
 ---
 
-## 3) Complete Final Pin Table (26 Allocated)
+## 3) Complete Final Pin Table (25 Allocated)
 
 | # | MCU Pin | Signal Net | Primary Function | Direction | Group |
 | :---: | :---: | --- | --- | :---: | --- |
@@ -175,10 +175,11 @@ This gives complete per-cell and pack-level observability for balancing and safe
 
 ---
 
-## 7) Available Pins for Expansion (14)
+## 7) Available Pins for Expansion (15)
 
 The following pins remain available for future features (CAN, USB, secondary UART, SPI, additional ADC, etc.):
 
+- **PB2:** Available (was CHG_PWM on current board)
 - **PA5, PA7, PA11, PA12**
 - **PB0, PB13, PB14, PB15**
 - **PC4, PC10, PC11, PC13, PC14, PC15**
@@ -196,7 +197,8 @@ Recommended usage priority:
 
 | Rev | Date | Change |
 | :---: | :---: | --- |
-| 1.1 | 2026-05-10 | Finalized complete 26-pin map, added all 5 INA226 mappings, updated J17/J15 connector tables, confirmed 65% utilization |
+| 1.1 | 2026-05-10 | Finalized complete pin map, added all 5 INA226 mappings, updated J17/J15 connector tables |
+| 1.2 | 2026-05-10 | Removed PB2 (CHG_PWM) from active map; updated tally to 25 used / 15 available (62.5% utilization) |
 
 ---
 
