@@ -1,13 +1,13 @@
 # STM32G474CE Pin Assignments (Final)
 
 > **Project:** Spot Welder (Final Schematic Freeze)
-> 
+>
 > **Controller board:** WeAct Studio STM32G474CE breakout (removable header format)
-> 
+>
 > **MCU:** STM32G474CEU6 (UFQFPN48)
-> 
+>
 > **Revision:** Final configuration for PCB layout handoff
-> 
+>
 > **Date:** 2026-05-10
 
 ---
@@ -36,7 +36,7 @@
 ### Allocation by function
 
 | Functional Group | Pins | Notes |
-|---|---:|---|
+| --- | :---: | --- |
 | Weld control | 3 | PA8, PB10, PA6 |
 | Charger control | 4 | PB9, PB1, PB8, PB2 |
 | Balancer control | 4 | PB3, PB4, PB5, PB6 |
@@ -51,7 +51,7 @@
 ## 3) Complete Final Pin Table (26 Allocated)
 
 | # | MCU Pin | Signal Net | Primary Function | Direction | Group |
-|---:|---|---|---|---|---|
+| :---: | :---: | --- | --- | :---: | --- |
 | 1 | PA8 | WELD_GATE_1 | TIM1 PWM to weld driver bank 1 (U18) | Output | Weld |
 | 2 | PB10 | WELD_GATE_2 | TIM1 PWM to weld driver bank 2 (U16) | Output | Weld |
 | 3 | PA6 | WELD_FAULT | Weld gate fault input / interlock | Input | Weld |
@@ -80,6 +80,7 @@
 | 26 | PB11 | AUX_IO_RESERVED | Reserved routed I/O for post-layout options | I/O reserved | Infrastructure |
 
 > Notes:
+>
 > - PB3/PB4 require SWD-only debug configuration (JTAG disabled) when used as GPIO balancer outputs.
 > - PA4 is used as analog negative leg input in the differential measurement chain.
 
@@ -125,7 +126,7 @@ This drives the 16× IRL40SC228 arrangement as two synchronized banks.
 All INA226 devices share I2C1 (PA15/PB7, 4.7k pull-ups to 3V3_CLEAN).
 
 | Device | I2C Address | Measured Nodes | Purpose |
-|---|---|---|---|
+| --- | :---: | --- | --- |
 | U8 | **0x40** | CHG_SHUNT_P / CHG_SHUNT_N, PACK_POS reference | Charge/weld shunt monitor |
 | U9 | **0x41** | CELL1_TAP to GND_H | Cell 1 monitor |
 | U13 | **0x42** | CELL2_TAP to CELL1_TAP | Cell 2 monitor |
@@ -141,7 +142,7 @@ This gives complete per-cell and pack-level observability for balancing and safe
 ### 6.1 J17 (left-side breakout group)
 
 | Net | MCU Pin | Function |
-|---|---|---|
+| --- | :---: | --- |
 | PEDAL_IN | PB12 | Foot pedal trigger |
 | USART1_TX | PA9 | Serial TX to ESP32 |
 | USART1_RX | PA10 | Serial RX from ESP32 |
@@ -158,6 +159,7 @@ This gives complete per-cell and pack-level observability for balancing and safe
 ### 6.2 J15 (right-side breakout group)
 
 | Net | MCU Pin | Function |
+<<<<<<< HEAD
 |---|---|---|
 | WELD_GATE_2       | PB10 | Weld bank 2 gate command |
 | CHG_PWM           | PB2 | Charger control/enable path |
@@ -169,6 +171,19 @@ This gives complete per-cell and pack-level observability for balancing and safe
 | VCAP_OUTP         | PA3 | Capacitor ADC + |
 | VCAP_OUTN         | PA4 | Capacitor ADC − |
 | AUX_IO_RESERVED   | PB11 | Reserved post-layout I/O |
+=======
+| --- | :---: | --- |
+| WELD_GATE_2 | PB10 | Weld bank 2 gate command |
+| CHG_PWM | PB2 | Charger control/enable path |
+| CHARGE_GATE_L | PB1 | Charger low-side gate command |
+| WELD_FAULT | PA6 | Weld stage fault input |
+| THERM_IN | PA0 | Thermistor ADC |
+| SHUNT_P_ADC | PA1 | Current-sense ADC + |
+| SHUNT_N_ADC | PA2 | Current-sense ADC − |
+| VCAP_OUTP | PA3 | Capacitor ADC + |
+| VCAP_OUTN | PA4 | Capacitor ADC − |
+| AUX_IO_RESERVED | PB11 | Reserved post-layout I/O |
+>>>>>>> 9b088f4c0bff357105b98ff6ad96342273283e74
 
 ---
 
@@ -181,6 +196,7 @@ The following pins remain available for future features (CAN, USB, secondary UAR
 - **PC4, PC10, PC11, PC13, PC14, PC15**
 
 Recommended usage priority:
+
 1. PA11/PA12 for USB or FDCAN
 2. PB13/PB14/PB15 + PA5 for SPI expansion
 3. PC10/PC11 for secondary UART link
@@ -191,7 +207,7 @@ Recommended usage priority:
 ## 8) Revision Log
 
 | Rev | Date | Change |
-|---|---|---|
+| :---: | :---: | --- |
 | 1.1 | 2026-05-10 | Finalized complete 26-pin map, added all 5 INA226 mappings, updated J17/J15 connector tables, confirmed 65% utilization |
 
 ---
