@@ -159,19 +159,6 @@ This gives complete per-cell and pack-level observability for balancing and safe
 ### 6.2 J15 (right-side breakout group)
 
 | Net | MCU Pin | Function |
-<<<<<<< HEAD
-|---|---|---|
-| WELD_GATE_2       | PB10 | Weld bank 2 gate command |
-| CHG_PWM           | PB2 | Charger control/enable path |
-| CHARGE_GATE_L     | PB1 | Charger low-side gate command |
-| WELD_FAULT        | PA6 | Weld stage fault input |
-| THERM_IN          | PA0 | Thermistor ADC |
-| SHUNT_P_ADC       | PA1 | Current-sense ADC + |
-| SHUNT_N_ADC       | PA2 | Current-sense ADC − |
-| VCAP_OUTP         | PA3 | Capacitor ADC + |
-| VCAP_OUTN         | PA4 | Capacitor ADC − |
-| AUX_IO_RESERVED   | PB11 | Reserved post-layout I/O |
-=======
 | --- | :---: | --- |
 | WELD_GATE_2 | PB10 | Weld bank 2 gate command |
 | CHG_PWM | PB2 | Charger control/enable path |
@@ -183,7 +170,6 @@ This gives complete per-cell and pack-level observability for balancing and safe
 | VCAP_OUTP | PA3 | Capacitor ADC + |
 | VCAP_OUTN | PA4 | Capacitor ADC − |
 | AUX_IO_RESERVED | PB11 | Reserved post-layout I/O |
->>>>>>> 9b088f4c0bff357105b98ff6ad96342273283e74
 
 ---
 
