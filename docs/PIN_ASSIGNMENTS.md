@@ -127,7 +127,7 @@ All INA226 devices share I2C1 (PA15/PB7, 4.7k pull-ups to 3V3_CLEAN).
 
 | Device | I2C Address | Measured Nodes | Purpose |
 | --- | :---: | --- | --- |
-| U8 | **0x40** | CHG_SHUNT_P / CHG_SHUNT_N, PACK_POS reference | Charge/weld shunt monitor |
+| U8 | **0x40** | CHG_SHUNT_P / CHG_SHUNT_N, PACK_POS reference | Charge shunt monitor |
 | U9 | **0x41** | CELL1_TAP to GND_H | Cell 1 monitor |
 | U13 | **0x42** | CELL2_TAP to CELL1_TAP | Cell 2 monitor |
 | U12 | **0x43** | CELL3_TAP to CELL2_TAP | Cell 3 monitor |
