@@ -3192,13 +3192,20 @@ static void performLeadCalibration(void) {
     uint32_t trigger_timeout_start = HAL_GetTick();
     const uint32_t trigger_timeout_ms = 8000U; /* 8 s max wait for trigger */
 
-    /* Mirror pollContactTrigger(): contact mode requires the tips to stay
-     * shorted for (contact_hold_steps * 500 ms) before firing, so a brief
-     * accidental touch will not start a calibration pulse.  Pedal mode fires
-     * as soon as the pedal is pressed. */
+    /* Contact-hold state (only used in contact mode). Mirrors
+     * pollContactTrigger(): require the tips to stay shorted for
+     * (contact_hold_steps * 500 ms) before firing. */
     bool contact_hold_active_local = false;
     uint32_t contact_hold_start_local = 0;
     const uint32_t hold_ms_required = (uint32_t)contact_hold_steps * 500U;
+
+    /* Decide whether contact is required, exactly like fireRecipe():
+     * contact is needed unless we are in pedal mode with the contact check
+     * explicitly disabled (contact_with_pedal == 0). */
+    bool need_contact = true;
+    if (trigger_mode == 1 && contact_with_pedal == 0) {
+        need_contact = false;
+    }
 
     bool triggered = false;
 
@@ -3208,15 +3215,28 @@ static void performLeadCalibration(void) {
         uint32_t now = HAL_GetTick();
 
         if (trigger_mode == 1) {
-            /* Pedal mode: active-low (external pull-up), RESET == pressed.
-             * Fire immediately, matching the weld pedal path. */
-            if (HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN) == GPIO_PIN_RESET) {
-                uartSend("CAL_STATUS=TRIGGER_DETECTED");
-                triggered = true;
-                break;
+            /* ---- Pedal mode ---- active-low (external pull-up): RESET == pressed. */
+            bool pedal_pressed =
+                (HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN) == GPIO_PIN_RESET);
+
+            if (pedal_pressed) {
+                if (need_contact) {
+                    /* Pedal + contact required: only fire if tips are touching. */
+                    if (contactDetected()) {
+                        uartSend("CAL_STATUS=TRIGGER_DETECTED");
+                        triggered = true;
+                        break;
+                    }
+                    /* Pedal held but no contact yet: keep waiting. */
+                } else {
+                    /* Pedal only: fire immediately. */
+                    uartSend("CAL_STATUS=TRIGGER_DETECTED");
+                    triggered = true;
+                    break;
+                }
             }
-        } else {
-            /* Contact mode: require a sustained hold like pollContactTrigger(). */
+        } else if (trigger_mode == 2) {
+            /* ---- Contact mode ---- require a sustained hold like pollContactTrigger(). */
             bool contact_now = contactDetected();
 
             if (!contact_now) {
