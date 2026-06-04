@@ -3091,6 +3091,224 @@ static void fireRecipe(void) {
     send_waveform_data();
 }
 
+/* ============================================================================
+ *  Lead-Resistance Auto-Calibration  (UART command: "CAL_LEAD_START")
+ * ============================================================================
+ *
+ *  Triggered remotely from the ESP32 / web dashboard.  The operator firmly
+ *  SHORTS the two electrode tips together, then starts calibration.
+ *
+ *  Procedure:
+ *    1. Safety gating (boot inhibit, system ready, not already welding,
+ *       weld cooldown, over-temperature, minimum cap-bank voltage).
+ *    2. Fire ONE short 100 %-duty test pulse (CAL_PULSE_MS) using the exact
+ *       same TIM2 hardware FET-kill engine the weld path uses, so the MOSFETs
+ *       can never latch on even if this routine misbehaves.
+ *    3. While the FET is on (after a short settle window), sample weld current
+ *       (shunt -> AMC1301) and cap-bank terminal voltage (AMC1311B) and keep
+ *       running sums.
+ *    4. With the tips shorted, essentially all of the cap-terminal voltage
+ *       seen during the pulse is dropped across the downstream path
+ *       (leads + MOSFET Rds_on + shunt), so the effective downstream/lead
+ *       resistance is:
+ *
+ *           R_lead = V_cap_avg / I_avg
+ *
+ *       This is precisely the quantity the Joule-mode energy model consumes
+ *       (v_at_tips = v_cap - I * lead_resistance_ohms), keeping calibration
+ *       self-consistent with how the firmware already uses the value.
+ *    5. Validate the result, persist to Flash (same path as SET_LEAD_R) and
+ *       report "CAL_RESULT=<ohms>" on success or "CAL_ERROR=<reason>".
+ *
+ *  Reported lines (consumed by the Flask backend parser):
+ *    CAL_STATUS=MEASURING        progress (non-terminal)
+ *    CAL_RESULT=0.002850         success  (resistance in Ohms)
+ *    CAL_ERROR=<REASON>          failure
+ *  Extra "DBG,CAL,..." line is diagnostic only and ignored by the parser.
+ */
+#define CAL_MIN_VOLTAGE   6.0f      /* hard cap-bank voltage floor (V)        */
+#define CAL_PULSE_MS      10U       /* total test-pulse duration (ms)         */
+#define CAL_SETTLE_US     2000U     /* settle window before sampling (us)     */
+#define CAL_MIN_CURRENT_A 50.0f     /* below this => tips not actually shorted*/
+#define CAL_R_MIN_OHMS    0.0005f   /* 0.5 mOhm plausibility floor            */
+#define CAL_R_MAX_OHMS    0.0100f   /* 10  mOhm plausibility ceiling          */
+
+static void performLeadCalibration(void) {
+    uint32_t now_ms = HAL_GetTick();
+
+    /* ---- Safety gating (mirrors fireRecipe, minus ARM / contact) ----
+     * The CAL_LEAD_START command is itself the explicit operator
+     * authorization (web UI instructs the user to short the tips first),
+     * so ARM and contact-detect are intentionally not required here. */
+    if (now_ms - boot_ms < BOOT_INHIBIT_MS) {
+        uartSend("CAL_ERROR=BOOT_INHIBIT");
+        return;
+    }
+
+    applyReadyTimeout();
+    if (!system_ready) {
+        uartSend("CAL_ERROR=NOT_READY");
+        return;
+    }
+    if (welding_now) {
+        uartSend("CAL_ERROR=BUSY");
+        return;
+    }
+    if (temp_filtered_c > 65.0f) {
+        uartSend("CAL_ERROR=OVERHEAT");
+        return;
+    }
+    if ((now_ms - last_weld_ms) < WELD_COOLDOWN_MS) {
+        uartSend("CAL_ERROR=COOLDOWN");
+        return;
+    }
+
+    /* ---- Cap-bank voltage floor ---- */
+    float v_before = readCapVoltage();
+    if (!isfinite(v_before) || v_before < CAL_MIN_VOLTAGE) {
+        char eb[64];
+        snprintf(eb, sizeof(eb), "CAL_ERROR=VOLTAGE_LOW,v=%.2f", v_before);
+        uartSend(eb);
+        return;
+    }
+
+    uartSend("CAL_STATUS=MEASURING");
+
+    /* ---- Prepare exactly like a weld: charger off, fast ADC ---- */
+    HAL_GPIO_WritePin(CHARGER_EN_PORT, CHARGER_EN_PIN, GPIO_PIN_RESET);
+    charger_enabled = false;
+    HAL_Delay(20); /* let charger node settle */
+
+    welding_now = true;
+    cached_vcap = v_before;
+
+    HAL_ADC_Stop(&hadc1);
+    adc1_fast_current_mode = false;
+    adcPrepareFastCurrentChannels();
+    if (!adc1_fast_current_mode) {
+        welding_now = false;
+        uartSend("CAL_ERROR=ADC_FAST_CFG_FAIL");
+        return;
+    }
+
+    /* ---- Fire the test pulse with the TIM2 hardware FET-kill safety net ----
+     * Mirrors doPulseMsPwm(): arm TIM2 one-pulse, start it, then FET ON. The
+     * TIM2 ISR force-kills the FET at expiry regardless of this loop. */
+    const uint32_t duration_us = (uint32_t)CAL_PULSE_MS * 1000U;
+    const float v_per_count = measured_vdda / 4095.0f;
+
+    double sum_i = 0.0;
+    double sum_v = 0.0;
+    uint32_t n = 0U;
+
+    tim2_fet_killed = false;
+    TIM2->CR1 = 0U;
+    TIM2->CNT = 0U;
+    TIM2->ARR = (duration_us > 0U) ? (duration_us - 1U) : 0U;
+    TIM2->SR = 0U;
+    TIM2->DIER = TIM_DIER_UIE;
+
+    TIM2->CR1 = TIM_CR1_CEN | TIM_CR1_OPM; /* GO */
+    pwmOnDuty(PWM_MAX);                    /* FET ON, 100 % duty */
+
+    uint32_t sample_start_us = micros_now() + CAL_SETTLE_US;
+
+    while (!tim2_fet_killed) {
+        uint32_t p = 0U, nn = 0U, v_p = 0U;
+        if (!adcReadFastTriplet(&p, &nn, &v_p)) {
+            continue;
+        }
+        /* Skip the initial settle window so we measure steady-state values. */
+        if ((int32_t)(micros_now() - sample_start_us) < 0) {
+            continue;
+        }
+
+        int32_t diff = (int32_t)p - (int32_t)nn;
+        if (diff < 0) diff = 0;
+
+        float v_adc = (float)diff * v_per_count;
+        float v_shunt = v_adc / SHUNT_GAIN;
+        float amps = (v_shunt / SHUNT_EFF_OHMS) * CURRENT_CAL_FACTOR;
+        if (!isfinite(amps) || amps < 0.0f) amps = 0.0f;
+
+        /* adc2_fast_vcap_mode is not enabled on this path (matches weld path),
+         * so the negative leg is treated as 0 just like capturePulseAmps. */
+        float v_cap = (float)v_p * v_per_count * V_CAP_DIVIDER;
+        if (!isfinite(v_cap) || v_cap < 0.0f) v_cap = 0.0f;
+
+        sum_i += (double)amps;
+        sum_v += (double)v_cap;
+        n++;
+    }
+
+    pwmOff(); /* belt-and-suspenders; ISR already killed the FET */
+    welding_now = false;
+    last_weld_ms = HAL_GetTick();
+
+    /* Re-engage charger lockout briefly, like the weld path does. */
+    __disable_irq();
+    charger_lockout = true;
+    charger_lockout_until = HAL_GetTick() + 500;
+    __enable_irq();
+
+    /* A slow read here also auto-restores ADC1 out of fast-current mode. */
+    HAL_Delay(5);
+    float v_after = readCapVoltage();
+
+    if (n == 0U) {
+        uartSend("CAL_ERROR=NO_SAMPLES");
+        return;
+    }
+
+    float i_avg = (float)(sum_i / (double)n);
+    float v_avg = (float)(sum_v / (double)n);
+
+    /* Not enough current => tips were not actually shorted. */
+    if (i_avg < CAL_MIN_CURRENT_A) {
+        char eb[80];
+        snprintf(eb, sizeof(eb), "CAL_ERROR=TIPS_NOT_SHORTED,i=%.1f", i_avg);
+        uartSend(eb);
+        return;
+    }
+
+    float r = v_avg / i_avg;
+    if (!isfinite(r) || r < CAL_R_MIN_OHMS || r > CAL_R_MAX_OHMS) {
+        char eb[96];
+        snprintf(eb, sizeof(eb),
+                 "CAL_ERROR=MEASUREMENT_FAILED,r=%.6f,v=%.3f,i=%.1f", r, v_avg,
+                 i_avg);
+        uartSend(eb);
+        return;
+    }
+
+    /* ---- Persist using the exact same path as the SET_LEAD_R handler ---- */
+    lead_resistance_ohms = r;
+    persistent_from_runtime(&g_persistent_settings);
+    bool saved = flash_settings_save(&g_persistent_settings);
+
+    /* Terminal success line (resistance in Ohms, parsed as bare float). */
+    char ok[48];
+    snprintf(ok, sizeof(ok), "CAL_RESULT=%.6f", r);
+    uartSend(ok);
+
+    /* Diagnostic line (DBG prefix -> ignored by the calibration parser). */
+    char dbg[192];
+    snprintf(dbg, sizeof(dbg),
+             "DBG,CAL,r_ohm=%.6f,r_mohm=%.3f,v_avg=%.3f,i_avg=%.1f,"
+             "v_before=%.3f,v_after=%.3f,samples=%lu,saved=%d",
+             r, r * 1000.0f, v_avg, i_avg, v_before, v_after,
+             (unsigned long)n, saved ? 1 : 0);
+    uartSend(dbg);
+
+    if (!saved) {
+        /* Value applied to runtime but Flash write failed; report non-fatally
+         * so the host still gets the measurement but knows it is not stored. */
+        uartSend("DBG,CAL,FLASH_SAVE_FAILED");
+    }
+
+    sendStatusPacket(); /* immediate UI refresh with the new lead-R */
+}
+
 static void SystemClock_Config(void) {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
     RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
@@ -3965,6 +4183,12 @@ static void parseCommand(char* line) {
         snprintf(response, sizeof(response), "LEAD_R,ohm=%.6f,mohm=%.3f",
                  lead_resistance_ohms, lead_resistance_ohms * 1000.0f);
         uartSend(response);
+        return;
+    }
+
+    if (strcmp(line, "CAL_LEAD_START") == 0 ||
+        strcmp(line, "CMD,CAL_LEAD_START") == 0) {
+        performLeadCalibration();
         return;
     }
 
