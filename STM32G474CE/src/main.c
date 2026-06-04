@@ -3127,8 +3127,6 @@ static void fireRecipe(void) {
  *  Extra "DBG,CAL,..." line is diagnostic only and ignored by the parser.
  */
 #define CAL_MIN_VOLTAGE   6.0f      /* hard cap-bank voltage floor (V)        */
-#define CAL_TRIGGER_TIMEOUT_MS 8000U /* max wait for contact/pedal (ms)       */
-#define CAL_GRIP_MS       2000U     /* firm-grip settle after contact (ms)    */
 #define CAL_PULSE_MS      10U       /* total test-pulse duration (ms)         */
 #define CAL_SETTLE_US     2000U     /* settle window before sampling (us)     */
 #define CAL_MIN_CURRENT_A 50.0f     /* below this => tips not actually shorted*/
@@ -3165,8 +3163,13 @@ static void performLeadCalibration(void) {
         return;
     }
 
-    /* ---- Cap-bank voltage floor ---- */
-    float v_before = readCapVoltage();
+    /* ---- Cap-bank voltage floor ----
+     * Use ina_vpack (INA226 cell-sum) rather than readCapVoltage().
+     * readCapVoltage() reads the AMC1311B (vcap) front-end, which only shows a
+     * meaningful value while current is flowing and reads ~0 at idle, causing a
+     * false CAL_ERROR=VOLTAGE_LOW even when the supercaps are fully charged.
+     * ina_vpack always reflects the real pack voltage. */
+    float v_before = ina_vpack;
     if (!isfinite(v_before) || v_before < CAL_MIN_VOLTAGE) {
         char eb[64];
         snprintf(eb, sizeof(eb), "CAL_ERROR=VOLTAGE_LOW,v=%.2f", v_before);
@@ -3174,57 +3177,37 @@ static void performLeadCalibration(void) {
         return;
     }
 
-    /* ---- Wait for an operator trigger: tip CONTACT or foot PEDAL ----
-     * The web UI tells the operator to either firmly short the tips together
-     * or press the pedal.  Contact gets a short grip-settle delay; pedal fires
-     * immediately.
+    /* ---- Wait for an operator trigger using the existing weld trigger ----
+     * Rather than re-implementing contact/pedal handling, reuse the same
+     * contactDetected() detector the normal weld path uses.  This automatically
+     * honours the user's configured trigger settings (threshold/debounce) and
+     * keeps calibration behaviour identical to welding.
      *
-     * Timing budget: this whole routine must finish inside the host's 12 s
-     * calibration wait (CAL_RESULT_TIMEOUT_S).  Worst case here is
-     *   trigger wait (<= CAL_TRIGGER_TIMEOUT_MS) + grip delay (CAL_GRIP_MS)
-     *   + the ~10 ms test pulse and settling, i.e. 8 + 2 + ~0.5 = ~10.5 s,
-     * leaving comfortable margin.  The blocking loops below MUST refresh the
-     * IWDG (~800 ms timeout) or the MCU will reset mid-calibration. */
+     * Timing budget: this routine must finish inside the host's 12 s
+     * calibration wait (CAL_RESULT_TIMEOUT_S).  The 8 s trigger timeout plus the
+     * ~10 ms test pulse and settling leaves comfortable margin.  The wait loop
+     * MUST refresh the IWDG (~800 ms timeout) or the MCU will reset. */
     uartSend("CAL_STATUS=WAITING_FOR_TRIGGER");
 
-    bool by_contact = false;
-    bool by_pedal = false;
-    uint32_t wait_start_ms = HAL_GetTick();
+    uint32_t trigger_start = HAL_GetTick();
+    const uint32_t trigger_timeout_ms = 8000U; /* 8 s max wait for trigger */
+    bool triggered = false;
 
-    while ((HAL_GetTick() - wait_start_ms) < CAL_TRIGGER_TIMEOUT_MS) {
+    while ((HAL_GetTick() - trigger_start) < trigger_timeout_ms) {
         HAL_IWDG_Refresh(&hiwdg); /* keep the watchdog alive while blocking */
 
-        /* Pedal is active-low (external pull-up): RESET == pressed. */
-        if (HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN) == GPIO_PIN_RESET) {
-            by_pedal = true;
-            uartSend("CAL_STATUS=PEDAL_PRESSED");
+        if (contactDetected()) {  /* reuse existing weld trigger logic */
+            triggered = true;
+            uartSend("CAL_STATUS=TRIGGER_DETECTED");
             break;
         }
 
-        /* Reuse the exact debounced contact detector the weld path uses. */
-        if (contactDetected()) {
-            by_contact = true;
-            uartSend("CAL_STATUS=CONTACT_DETECTED");
-            break;
-        }
-
-        HAL_Delay(10);
+        HAL_Delay(10); /* check every 10 ms */
     }
 
-    if (!by_contact && !by_pedal) {
+    if (!triggered) {
         uartSend("CAL_ERROR=TIMEOUT_NO_TRIGGER");
         return;
-    }
-
-    /* Contact path: give the operator a moment to establish a firm grip
-     * before discharging.  Pedal path fires immediately (no extra delay). */
-    if (by_contact) {
-        uartSend("CAL_STATUS=WAITING_2SEC");
-        uint32_t grip_start_ms = HAL_GetTick();
-        while ((HAL_GetTick() - grip_start_ms) < CAL_GRIP_MS) {
-            HAL_IWDG_Refresh(&hiwdg);
-            HAL_Delay(10);
-        }
     }
 
     uartSend("CAL_STATUS=MEASURING");
