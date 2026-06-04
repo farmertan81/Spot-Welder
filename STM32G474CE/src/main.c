@@ -3189,17 +3189,51 @@ static void performLeadCalibration(void) {
      * MUST refresh the IWDG (~800 ms timeout) or the MCU will reset. */
     uartSend("CAL_STATUS=WAITING_FOR_TRIGGER");
 
-    uint32_t trigger_start = HAL_GetTick();
+    uint32_t trigger_timeout_start = HAL_GetTick();
     const uint32_t trigger_timeout_ms = 8000U; /* 8 s max wait for trigger */
+
+    /* Mirror pollContactTrigger(): contact mode requires the tips to stay
+     * shorted for (contact_hold_steps * 500 ms) before firing, so a brief
+     * accidental touch will not start a calibration pulse.  Pedal mode fires
+     * as soon as the pedal is pressed. */
+    bool contact_hold_active_local = false;
+    uint32_t contact_hold_start_local = 0;
+    const uint32_t hold_ms_required = (uint32_t)contact_hold_steps * 500U;
+
     bool triggered = false;
 
-    while ((HAL_GetTick() - trigger_start) < trigger_timeout_ms) {
+    while ((HAL_GetTick() - trigger_timeout_start) < trigger_timeout_ms) {
         HAL_IWDG_Refresh(&hiwdg); /* keep the watchdog alive while blocking */
 
-        if (contactDetected()) {  /* reuse existing weld trigger logic */
-            triggered = true;
-            uartSend("CAL_STATUS=TRIGGER_DETECTED");
-            break;
+        uint32_t now = HAL_GetTick();
+
+        if (trigger_mode == 1) {
+            /* Pedal mode: active-low (external pull-up), RESET == pressed.
+             * Fire immediately, matching the weld pedal path. */
+            if (HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN) == GPIO_PIN_RESET) {
+                uartSend("CAL_STATUS=TRIGGER_DETECTED");
+                triggered = true;
+                break;
+            }
+        } else {
+            /* Contact mode: require a sustained hold like pollContactTrigger(). */
+            bool contact_now = contactDetected();
+
+            if (!contact_now) {
+                /* Contact released before the hold completed: reset timer. */
+                contact_hold_active_local = false;
+                contact_hold_start_local = 0;
+            } else if (!contact_hold_active_local) {
+                /* First detection: start the hold timer. */
+                contact_hold_active_local = true;
+                contact_hold_start_local = now;
+                uartSend("CAL_STATUS=CONTACT_DETECTED_HOLDING");
+            } else if ((now - contact_hold_start_local) >= hold_ms_required) {
+                /* Held long enough: fire. */
+                uartSend("CAL_STATUS=TRIGGER_DETECTED");
+                triggered = true;
+                break;
+            }
         }
 
         HAL_Delay(10); /* check every 10 ms */
