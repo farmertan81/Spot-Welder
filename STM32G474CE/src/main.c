@@ -3208,24 +3208,11 @@ static void performLeadCalibration(void) {
     }
 
     bool triggered = false;
-    uint32_t last_debug_ms = HAL_GetTick();
 
     while ((HAL_GetTick() - trigger_timeout_start) < trigger_timeout_ms) {
         HAL_IWDG_Refresh(&hiwdg); /* keep the watchdog alive while blocking */
 
         uint32_t now = HAL_GetTick();
-        
-        // Debug output every 500ms to see what's happening
-        if ((now - last_debug_ms) >= 500) {
-            char dbg[128];
-            GPIO_PinState pedal_gpio = HAL_GPIO_ReadPin(PEDAL_PORT, PEDAL_PIN);
-            float vcap_test = readCapVoltage();
-            bool contact_test = contactDetected();
-            snprintf(dbg, sizeof(dbg), "DBG,CAL_WAIT,trig=%u,need_c=%d,pedal=%d,vcap=%.2f,contact=%d",
-                     (unsigned)trigger_mode, need_contact, pedal_gpio, vcap_test, contact_test);
-            uartSend(dbg);
-            last_debug_ms = now;
-        }
 
         if (trigger_mode == 1) {
             /* ---- Pedal mode ---- active-low (external pull-up): RESET == pressed. */
