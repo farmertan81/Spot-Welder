@@ -1199,6 +1199,13 @@ void pollStm32Uart() {
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
+                } else if (stmLine.startsWith("CAL_")) {
+                    // Lead-resistance auto-calibration responses
+                    // (CAL_STATUS / CAL_RESULT / CAL_ERROR). Forward
+                    // transparently so the Pi/Flask calibration waiter and the
+                    // web UI receive progress and the final measurement.
+                    sendToPi(stmLine);
+
                 } else if (stmLine.startsWith("ACK,") ||
                            stmLine.startsWith("DENY,")) {
                     // Forward any ACK/DENY packet even if this firmware
