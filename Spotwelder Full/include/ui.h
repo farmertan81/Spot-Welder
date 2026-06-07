@@ -191,4 +191,12 @@ void ui_mark_settings_applied();
 // redraw churn from competing with LVGL's touch input processing.
 void ui_set_touch_active(bool active);
 
+// Feed a raw STM32 lead-resistance calibration line (one of:
+//   CAL_STATUS=<state>, CAL_RESULT=<ohms>, CAL_ERROR=<reason>)
+// into the UI so the CONFIG tab's calibration status line reflects live
+// progress and terminates on success/error/timeout instead of being stuck
+// on "Calibrating... keep leads shorted".  Safe to call from loop()/UART
+// poll (same task as lv_timer_handler).
+void ui_notify_cal_message(const char* line);
+
 #endif // UI_H

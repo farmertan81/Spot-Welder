@@ -1294,6 +1294,14 @@ void pollStm32Uart() {
                     // (CAL_STATUS / CAL_RESULT / CAL_ERROR). Forward
                     // transparently so the Pi/Flask calibration waiter and the
                     // web UI receive progress and the final measurement.
+                    //
+                    // Debug trace: every CAL_ line is logged so we can see
+                    // exactly where the routine is (waiting for trigger,
+                    // measuring, result, error/timeout) when diagnosing a
+                    // "calibration never completes" report.
+                    Serial.print("[Cal] STM32 -> ");
+                    Serial.println(stmLine);
+
                     if (stmLine.startsWith("CAL_RESULT")) {
                         // Successful calibration this session: latch freshness
                         // so the CONFIG tab can show a relative age (no RTC).
@@ -1303,6 +1311,15 @@ void pollStm32Uart() {
                         if (extractFloatField(stmLine, "CAL_RESULT=", cal_ohm))
                             lead_resistance_ohms = cal_ohm;
                     }
+
+                    // Drive the on-device touch UI calibration status line so
+                    // it reflects live progress and leaves the "Calibrating..."
+                    // state on a terminal CAL_RESULT / CAL_ERROR (incl. the
+                    // STM32's 8 s TIMEOUT_NO_TRIGGER) instead of hanging on
+                    // "keep leads shorted" forever. (Same task as
+                    // lv_timer_handler() -> safe to touch LVGL directly.)
+                    ui_notify_cal_message(stmLine.c_str());
+
                     sendToPi(stmLine);
 
                 } else if (stmLine.startsWith("ACK,") ||

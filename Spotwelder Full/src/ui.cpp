@@ -51,7 +51,8 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <math.h>
-#include <stdio.h>  // for standard snprintf (supports %f)
+#include <stdio.h>   // for standard snprintf/sscanf (supports %f)
+#include <string.h>  // for strncmp (calibration message parsing)
 
 // ============================================================
 // COLORS  (dark-theme, matching web UI)
@@ -260,7 +261,6 @@ static lv_obj_t* lbl_ichg = nullptr;
 static lv_obj_t* lbl_cell1 = nullptr;
 static lv_obj_t* lbl_cell2 = nullptr;
 static lv_obj_t* lbl_cell3 = nullptr;
-static lv_obj_t* lbl_health = nullptr;  // overall health/state line
 
 // System-info box labels (Status dashboard)
 static lv_obj_t* lbl_dash_arm = nullptr;      // ARM status line
@@ -812,15 +812,28 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_center(lbl_arm);
 
     // ---------------------------------------------------------
-    // ROW 2 (y=160..264): Power monitoring – PACK / CELLS / HEALTH
+    // ROW 2 (y=160..264): Power monitoring – 4 columns
+    //   PACK | CELLS | TEMPERATURE | CHARGING
+    // Four panels tuned to fit the 780px content width without
+    // horizontal scrolling.  CELLS is intentionally narrow/compact;
+    // the charge current now lives in its own CHARGING column instead
+    // of being crammed under PACK.
     // ---------------------------------------------------------
     const int PWR_Y = 160;
     const int PWR_H = 104;
-    const int pcol_w = (CONTENT_W - 2 * GAP) / 3;  // ~253
+    // 4 columns, 3 gaps (=30px) inside CONTENT_W (780) -> 750px of panels.
+    const int PACK_W = 195;
+    const int CELLS_W = 150;  // narrower / compact
+    const int TEMP_W = 195;
+    const int CHG_W = 210;
+    const int PACK_X = 0;
+    const int CELLS_X = PACK_X + PACK_W + GAP;   // 205
+    const int TEMP_X = CELLS_X + CELLS_W + GAP;  // 365
+    const int CHG_X = TEMP_X + TEMP_W + GAP;     // 570 (ends at 780)
 
-    // PACK column
+    // PACK column – voltage only (charge current moved to CHARGING)
     {
-        lv_obj_t* p = make_panel(tab, 0, PWR_Y, pcol_w, PWR_H);
+        lv_obj_t* p = make_panel(tab, PACK_X, PWR_Y, PACK_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
         lv_label_set_text(t, "PACK");
         lv_obj_set_style_text_color(t, C_GREY, 0);
@@ -831,18 +844,12 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_pack_v, "-- V");
         lv_obj_set_style_text_color(lbl_pack_v, C_GREEN, 0);
         lv_obj_set_style_text_font(lbl_pack_v, &lv_font_montserrat_24, 0);
-        lv_obj_align(lbl_pack_v, LV_ALIGN_CENTER, 0, -2);
-
-        lbl_ichg = lv_label_create(p);
-        lv_label_set_text(lbl_ichg, "Chg: -- A");
-        lv_obj_set_style_text_color(lbl_ichg, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_ichg, &lv_font_montserrat_14, 0);
-        lv_obj_align(lbl_ichg, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_align(lbl_pack_v, LV_ALIGN_CENTER, 0, 4);
     }
 
-    // CELLS column
+    // CELLS column – compact C1/C2/C3 (narrow panel)
     {
-        lv_obj_t* p = make_panel(tab, pcol_w + GAP, PWR_Y, pcol_w, PWR_H);
+        lv_obj_t* p = make_panel(tab, CELLS_X, PWR_Y, CELLS_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
         lv_label_set_text(t, "CELLS");
         lv_obj_set_style_text_color(t, C_GREY, 0);
@@ -853,26 +860,26 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_cell1, "C1: -- V");
         lv_obj_set_style_text_color(lbl_cell1, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell1, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell1, LV_ALIGN_LEFT_MID, 16, 2);
+        lv_obj_align(lbl_cell1, LV_ALIGN_LEFT_MID, 10, 2);
 
         lbl_cell2 = lv_label_create(p);
         lv_label_set_text(lbl_cell2, "C2: -- V");
         lv_obj_set_style_text_color(lbl_cell2, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell2, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell2, LV_ALIGN_LEFT_MID, 16, 24);
+        lv_obj_align(lbl_cell2, LV_ALIGN_LEFT_MID, 10, 24);
 
         lbl_cell3 = lv_label_create(p);
         lv_label_set_text(lbl_cell3, "C3: -- V");
         lv_obj_set_style_text_color(lbl_cell3, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell3, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell3, LV_ALIGN_LEFT_MID, 16, -20);
+        lv_obj_align(lbl_cell3, LV_ALIGN_LEFT_MID, 10, -20);
     }
 
-    // HEALTH column
+    // TEMPERATURE column – value only (was "HEALTH"; status text removed)
     {
-        lv_obj_t* p = make_panel(tab, 2 * (pcol_w + GAP), PWR_Y, pcol_w, PWR_H);
+        lv_obj_t* p = make_panel(tab, TEMP_X, PWR_Y, TEMP_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
-        lv_label_set_text(t, "HEALTH");
+        lv_label_set_text(t, "TEMPERATURE");
         lv_obj_set_style_text_color(t, C_GREY, 0);
         lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
         lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
@@ -881,13 +888,27 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_temp, "-- \xC2\xB0\x43");
         lv_obj_set_style_text_color(lbl_temp, C_GREEN, 0);
         lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_24, 0);
-        lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, -2);
+        lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, 4);
 
-        lbl_health = lv_label_create(p);
-        lv_label_set_text(lbl_health, "IDLE");
-        lv_obj_set_style_text_color(lbl_health, C_GREEN, 0);
-        lv_obj_set_style_text_font(lbl_health, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_health, LV_ALIGN_BOTTOM_MID, 0, -8);
+        // lbl_health intentionally not created here anymore: the DISARMED/
+        // IDLE/CHARGING status line was removed from this column.  The
+        // pointer stays nullptr so ui_update()'s guarded writes are no-ops.
+    }
+
+    // CHARGING column – charge current (moved out of the PACK column)
+    {
+        lv_obj_t* p = make_panel(tab, CHG_X, PWR_Y, CHG_W, PWR_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "CHARGING");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+        lbl_ichg = lv_label_create(p);
+        lv_label_set_text(lbl_ichg, "Chg: -- A");
+        lv_obj_set_style_text_color(lbl_ichg, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_ichg, &lv_font_montserrat_24, 0);
+        lv_obj_align(lbl_ichg, LV_ALIGN_CENTER, 0, 4);
     }
 
     // ---------------------------------------------------------
@@ -1989,8 +2010,12 @@ static void on_cfg_hold_time_inc(lv_event_t* e) {
 // ============================================================
 static void on_cfg_calibrate(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (lbl_cfg_cal_status)
-        lv_label_set_text(lbl_cfg_cal_status, "Calibrating... keep leads shorted");
+    if (lbl_cfg_cal_status) {
+        // Initial hint only; the live status is driven by ui_notify_cal_message()
+        // as CAL_STATUS/CAL_RESULT/CAL_ERROR lines arrive from the STM32.
+        lv_label_set_text(lbl_cfg_cal_status, "Starting calibration...");
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_ACCENT, LV_PART_MAIN);
+    }
     if (_calibrate_cb) _calibrate_cb();
 }
 
@@ -2642,11 +2667,10 @@ void ui_update(const WelderDisplayState& st) {
             }
             lv_label_set_text(lbl_state, txt);
             lv_obj_set_style_text_color(lbl_state, col, LV_PART_MAIN);
-            // Mirror to the dashboard HEALTH column status line
-            if (lbl_health) {
-                lv_label_set_text(lbl_health, txt);
-                lv_obj_set_style_text_color(lbl_health, col, LV_PART_MAIN);
-            }
+            // NOTE: the old dashboard "HEALTH" column status line (lbl_health)
+            // was removed when ROW 2 was reorganised into 4 columns
+            // (PACK/CELLS/TEMPERATURE/CHARGING).  ARM/WELDING/CHARGING state is
+            // still shown by the big ARM button + System Info box above.
         }
         prev_welding = st.welding;
         prev_charging = st.charging;
@@ -2796,6 +2820,95 @@ void ui_set_weld_count_reset_cb(weld_count_reset_cb_t cb) {
 void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb) { _cwp_cb = cb; }
 
 void ui_set_calibrate_cb(calibrate_cb_t cb) { _calibrate_cb = cb; }
+
+// ----------------------------------------------------------------------------
+// Calibration progress feedback (CONFIG tab status line)
+//
+// main.cpp's UART poll forwards every STM32 "CAL_*" line here so the touch UI
+// stops being stuck on "Calibrating... keep leads shorted".  The STM32
+// protocol (see performLeadCalibration() in STM32G474CE/src/main.c) emits:
+//
+//   CAL_STATUS=WAITING_FOR_TRIGGER        -> waiting for pedal press / contact
+//   CAL_STATUS=CONTACT_DETECTED_HOLDING   -> tips touching, hold to fire
+//   CAL_STATUS=TRIGGER_DETECTED           -> trigger seen
+//   CAL_STATUS=MEASURING                  -> firing test pulse
+//   CAL_RESULT=<ohms>                     -> SUCCESS (terminal)
+//   CAL_ERROR=<reason>[,...]              -> FAILURE (terminal)
+//
+// The key UX fix: WAITING_FOR_TRIGGER means the operator must actually fire
+// the configured trigger (press the pedal, or hold the tips shorted in
+// contact mode) — simply shorting the leads is not enough in pedal mode.  We
+// surface that instruction instead of the misleading static "keep leads
+// shorted" text, and we always leave the in-progress state on a terminal
+// CAL_RESULT / CAL_ERROR (or the STM32's 8 s TIMEOUT_NO_TRIGGER).
+void ui_notify_cal_message(const char* line) {
+    if (!line || !lbl_cfg_cal_status) return;
+
+    const char* msg = nullptr;
+    lv_color_t col = C_GREY;
+
+    if (strncmp(line, "CAL_RESULT=", 11) == 0) {
+        // Success: STM32 reports resistance in ohms.  Show it in mΩ.
+        float ohms = 0.0f;
+        char buf[48];
+        if (sscanf(line + 11, "%f", &ohms) == 1) {
+            snprintf(buf, sizeof(buf), "Done: %.2f m\xCE\xA9 \xE2\x9C\x93",
+                     (double)(ohms * 1000.0f));
+        } else {
+            snprintf(buf, sizeof(buf), "Calibration complete \xE2\x9C\x93");
+        }
+        lv_label_set_text(lbl_cfg_cal_status, buf);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_GREEN, LV_PART_MAIN);
+        return;
+    }
+
+    if (strncmp(line, "CAL_ERROR=", 10) == 0) {
+        const char* reason = line + 10;
+        char buf[64];
+        // Friendly text for the common terminal errors.
+        if (strncmp(reason, "TIMEOUT_NO_TRIGGER", 18) == 0) {
+            msg = "Timed out: no trigger. Press pedal / short tips, retry.";
+        } else if (strncmp(reason, "TIPS_NOT_SHORTED", 16) == 0) {
+            msg = "Tips not shorted - clamp leads together, then retry.";
+        } else if (strncmp(reason, "VOLTAGE_LOW", 11) == 0) {
+            msg = "Pack voltage low - charge, then retry.";
+        } else if (strncmp(reason, "NOT_READY", 9) == 0) {
+            msg = "Not ready - wait for READY, then retry.";
+        } else if (strncmp(reason, "BUSY", 4) == 0) {
+            msg = "Busy - finish current action, then retry.";
+        } else if (strncmp(reason, "OVERHEAT", 8) == 0 ||
+                   strncmp(reason, "COOLDOWN", 8) == 0) {
+            msg = "Too hot - let it cool, then retry.";
+        } else {
+            snprintf(buf, sizeof(buf), "Calibration failed: %s", reason);
+            msg = buf;
+        }
+        lv_label_set_text(lbl_cfg_cal_status, msg);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_RED, LV_PART_MAIN);
+        return;
+    }
+
+    if (strncmp(line, "CAL_STATUS=", 11) == 0) {
+        const char* state = line + 11;
+        col = C_ACCENT;
+        if (strncmp(state, "WAITING_FOR_TRIGGER", 19) == 0) {
+            msg = "Now fire the trigger: press pedal (or hold tips shorted)";
+            col = C_YELLOW;
+        } else if (strncmp(state, "CONTACT_DETECTED_HOLDING", 24) == 0) {
+            msg = "Contact detected - keep tips held...";
+            col = C_YELLOW;
+        } else if (strncmp(state, "TRIGGER_DETECTED", 16) == 0) {
+            msg = "Trigger detected - measuring...";
+        } else if (strncmp(state, "MEASURING", 9) == 0) {
+            msg = "Measuring lead resistance...";
+        } else {
+            msg = "Calibrating...";
+        }
+        lv_label_set_text(lbl_cfg_cal_status, msg);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, col, LV_PART_MAIN);
+        return;
+    }
+}
 
 void ui_set_joule_apply_cb(joule_apply_cb_t cb) { _joule_apply_cb = cb; }
 
