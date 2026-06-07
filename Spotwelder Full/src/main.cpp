@@ -220,6 +220,7 @@ static float    last_weld_energy_j = 0.0f;
 static float    last_weld_accuracy_pct = 0.0f;
 static uint32_t last_weld_duration_ms = 0;
 static float    last_weld_peak_a = 0.0f;
+static float    last_weld_avg_a = 0.0f;
 static float    last_weld_lead_loss_j = 0.0f;
 
 bool welding_now = false;
@@ -478,6 +479,8 @@ String buildStatus();
 static void save_recipe_to_nvs();
 static void save_lead_resistance_to_nvs();
 static void load_lead_resistance_from_nvs();
+static void save_weld_count_to_nvs();
+static void load_weld_count_from_nvs();
 static void sendLeadResistanceToStm32(float ohms);
 
 // =========================
@@ -694,6 +697,7 @@ void updateScreenDisplay() {
     ds.last_weld_accuracy_pct = last_weld_accuracy_pct;
     ds.last_weld_duration_ms  = last_weld_duration_ms;
     ds.last_weld_peak_a       = last_weld_peak_a;
+    ds.last_weld_avg_a        = last_weld_avg_a;
     ds.last_weld_lead_loss_j  = last_weld_lead_loss_j;
 
     ui_update(ds);
@@ -1187,6 +1191,7 @@ void pollStm32Uart() {
                     welding_now = false;
                     last_weld_time = millis();
                     weld_count++;
+                    save_weld_count_to_nvs();  // persist across power cycles
 
                     float fv_done = NAN;
                     // New energy fields (Phase 1A/1B)
@@ -1238,6 +1243,8 @@ void pollStm32Uart() {
                             last_weld_duration_ms = (uint32_t)iv_done;
                         if (extractFloatField(stmLine, "peak_a=", fv_done))
                             last_weld_peak_a = fv_done;
+                        if (extractFloatField(stmLine, "avg_a=", fv_done))
+                            last_weld_avg_a = fv_done;
 
                         extractFloatField(stmLine, "joule_workpiece_j=", jw);
                         extractFloatField(stmLine, "joule_loss_j=", jl);
@@ -1543,6 +1550,7 @@ void processCommand(String cmd) {
 
     if (cmd == "RESET_WELD_COUNT") {
         weld_count = 0;
+        save_weld_count_to_nvs();  // persist the reset across power cycles
         Serial.println("[Weld] Counter reset to 0");
         sendToPi(buildStatus());
         return;
@@ -1865,6 +1873,22 @@ static void load_recipe_from_nvs() {
     preheat_gap_ms = prefs.getUShort("phGap", preheat_gap_ms);
     prefs.end();
     Serial.println("[Config] Recipe loaded from NVS");
+}
+
+// ---- Weld counter persistence (survives power cycles) ----
+// Stored in its own NVS namespace so it is independent of recipe/config.
+static void save_weld_count_to_nvs() {
+    prefs.begin("weldstats", false);
+    prefs.putULong("weldCount", weld_count);
+    prefs.end();
+}
+
+static void load_weld_count_from_nvs() {
+    prefs.begin("weldstats", true);  // read-only
+    weld_count = prefs.getULong("weldCount", 0UL);
+    prefs.end();
+    Serial.printf("[Weld] Counter restored from NVS: %lu\n",
+                  (unsigned long)weld_count);
 }
 
 // =========================
@@ -2243,6 +2267,7 @@ void setup() {
         trigger_mode = TRIGGER_MODE_PEDAL;  // MANUAL/PEDAL
         contact_with_pedal = true;          // require pedal gating
         load_lead_resistance_from_nvs();
+        load_weld_count_from_nvs();  // restore lifetime weld counter
 
         // Push loaded config to UI widgets (display-side only)
         ui_set_config_cb(onConfigChange);

@@ -269,10 +269,11 @@ static lv_obj_t* lbl_dash_trigger = nullptr;  // trigger line text
 static lv_obj_t* lbl_dash_leadr = nullptr;    // lead R + cal age line
 
 // Last-weld result labels (Status dashboard)
-static lv_obj_t* lbl_lw_target = nullptr;
-static lv_obj_t* lbl_lw_actual = nullptr;
+// Layout: Duration | Peak | Avg | Joules
 static lv_obj_t* lbl_lw_duration = nullptr;
 static lv_obj_t* lbl_lw_peak = nullptr;
+static lv_obj_t* lbl_lw_avg = nullptr;     // average current (A)
+static lv_obj_t* lbl_lw_joules = nullptr;  // workpiece energy (J) – moved here from Joule tab
 
 static lv_obj_t* btn_arm = nullptr;
 static lv_obj_t* lbl_arm = nullptr;
@@ -543,10 +544,14 @@ static const char* trigger_mode_name(uint8_t mode) {
 static void paint_dash_trigger(bool holding) {
     if (lbl_dash_trigger) {
         char buf[64];
-        // Contact delay (seconds) shown when relevant.
-        float delay_s = 0.5f * (float)_dash_contact_steps;
-        snprintf(buf, sizeof(buf), "%s  (%.1fs)",
-                 trigger_mode_name(_trigger_mode), (double)delay_s);
+        // Pedal mode: show just "Pedal" (delay is not used).
+        // Contact mode: show "Contact X.Xs" with the contact/probe delay.
+        if (_trigger_mode == 2) {
+            float delay_s = 0.5f * (float)_dash_contact_steps;
+            snprintf(buf, sizeof(buf), "Contact %.1fs", (double)delay_s);
+        } else {
+            snprintf(buf, sizeof(buf), "Pedal");
+        }
         lv_label_set_text(lbl_dash_trigger, buf);
         lv_obj_set_style_text_color(
             lbl_dash_trigger,
@@ -743,7 +748,7 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
 
         lbl_dash_trigger = lv_label_create(btn_dash_trigger);
-        lv_label_set_text(lbl_dash_trigger, "Pedal  (1.0s)");
+        lv_label_set_text(lbl_dash_trigger, "Pedal");
         lv_obj_set_style_text_color(lbl_dash_trigger, C_ACCENT, 0);
         lv_obj_set_style_text_font(lbl_dash_trigger, &lv_font_montserrat_18, 0);
         lv_obj_align(lbl_dash_trigger, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -954,16 +959,16 @@ static void build_status_tab(lv_obj_t* tab) {
         const int cell_gap = (CONTENT_W - 4 * cell_w) / 5;  // even spacing
         int cx = cell_gap;
 
-        make_stat_cell(box, "Target", &lbl_lw_target, cx, cell_y, cell_w,
-                       cell_h, &lv_font_montserrat_24);
-        cx += cell_w + cell_gap;
-        make_stat_cell(box, "Actual", &lbl_lw_actual, cx, cell_y, cell_w,
-                       cell_h, &lv_font_montserrat_24);
-        cx += cell_w + cell_gap;
         make_stat_cell(box, "Duration", &lbl_lw_duration, cx, cell_y, cell_w,
                        cell_h, &lv_font_montserrat_24);
         cx += cell_w + cell_gap;
-        make_stat_cell(box, "Peak Current", &lbl_lw_peak, cx, cell_y, cell_w,
+        make_stat_cell(box, "Peak", &lbl_lw_peak, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Avg", &lbl_lw_avg, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Joules", &lbl_lw_joules, cx, cell_y, cell_w,
                        cell_h, &lv_font_montserrat_24);
     }
 
@@ -2607,36 +2612,25 @@ void ui_update(const WelderDisplayState& st) {
         }
     }
 
-    // ---- Last Weld results ----
+    // ---- Last Weld results: Duration | Peak | Avg | Joules ----
     {
-        static bool prev_lw_valid = false;
-        static float prev_lw_acc = -999.0f;
+        static bool  prev_lw_valid = false;
+        static float prev_lw_energy = -999.0f;
+        static float prev_lw_peak = -999.0f;
+        static float prev_lw_avg = -999.0f;
+        static uint32_t prev_lw_dur = 0xFFFFFFFF;
         bool changed = first_run || st.last_weld_valid != prev_lw_valid ||
-                       fabsf(st.last_weld_accuracy_pct - prev_lw_acc) >= 0.1f;
+                       fabsf(st.last_weld_energy_j - prev_lw_energy) >= 0.05f ||
+                       fabsf(st.last_weld_peak_a - prev_lw_peak) >= 1.0f ||
+                       fabsf(st.last_weld_avg_a - prev_lw_avg) >= 1.0f ||
+                       st.last_weld_duration_ms != prev_lw_dur;
         if (changed) {
             if (!st.last_weld_valid) {
-                if (lbl_lw_target) lv_label_set_text(lbl_lw_target, "--");
-                if (lbl_lw_actual) lv_label_set_text(lbl_lw_actual, "--");
                 if (lbl_lw_duration) lv_label_set_text(lbl_lw_duration, "--");
                 if (lbl_lw_peak) lv_label_set_text(lbl_lw_peak, "--");
+                if (lbl_lw_avg) lv_label_set_text(lbl_lw_avg, "--");
+                if (lbl_lw_joules) lv_label_set_text(lbl_lw_joules, "--");
             } else {
-                // Target: joule setpoint when the weld ran in joule mode,
-                // otherwise there is no energy target (time-based weld).
-                if (lbl_lw_target) {
-                    if (st.last_weld_was_joule && st.last_weld_target_j > 0.0f) {
-                        snprintf(buf, sizeof(buf), "%.0f J",
-                                 (double)st.last_weld_target_j);
-                    } else {
-                        snprintf(buf, sizeof(buf), "--");
-                    }
-                    lv_label_set_text(lbl_lw_target, buf);
-                }
-                // Actual: measured energy delivered.
-                if (lbl_lw_actual) {
-                    snprintf(buf, sizeof(buf), "%.1f J",
-                             (double)st.last_weld_energy_j);
-                    lv_label_set_text(lbl_lw_actual, buf);
-                }
                 if (lbl_lw_duration) {
                     snprintf(buf, sizeof(buf), "%u ms",
                              (unsigned)st.last_weld_duration_ms);
@@ -2647,9 +2641,23 @@ void ui_update(const WelderDisplayState& st) {
                              (double)st.last_weld_peak_a);
                     lv_label_set_text(lbl_lw_peak, buf);
                 }
+                if (lbl_lw_avg) {
+                    snprintf(buf, sizeof(buf), "%.0f A",
+                             (double)st.last_weld_avg_a);
+                    lv_label_set_text(lbl_lw_avg, buf);
+                }
+                // Joules: measured workpiece energy delivered (moved from Joule tab).
+                if (lbl_lw_joules) {
+                    snprintf(buf, sizeof(buf), "%.1f J",
+                             (double)st.last_weld_energy_j);
+                    lv_label_set_text(lbl_lw_joules, buf);
+                }
             }
             prev_lw_valid = st.last_weld_valid;
-            prev_lw_acc = st.last_weld_accuracy_pct;
+            prev_lw_energy = st.last_weld_energy_j;
+            prev_lw_peak = st.last_weld_peak_a;
+            prev_lw_avg = st.last_weld_avg_a;
+            prev_lw_dur = st.last_weld_duration_ms;
         }
     }
 

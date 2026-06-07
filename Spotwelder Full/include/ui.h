@@ -64,6 +64,7 @@ struct WelderDisplayState {
     float    last_weld_accuracy_pct; // 100 * energy / target (joule mode)
     uint32_t last_weld_duration_ms;  // total pulse duration (ms)
     float    last_weld_peak_a;    // peak current (A)
+    float    last_weld_avg_a;     // average current during pulse (A)
     float    last_weld_lead_loss_j;  // energy lost in leads (J)
 };
 
