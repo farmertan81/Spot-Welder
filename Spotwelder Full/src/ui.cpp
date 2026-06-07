@@ -263,17 +263,16 @@ static lv_obj_t* lbl_cell2 = nullptr;
 static lv_obj_t* lbl_cell3 = nullptr;
 
 // System-info box labels (Status dashboard)
-static lv_obj_t* lbl_dash_arm = nullptr;      // ARM status line
 static lv_obj_t* lbl_dash_mode = nullptr;     // control mode line
 static lv_obj_t* btn_dash_trigger = nullptr;  // trigger line (long-press swap)
 static lv_obj_t* lbl_dash_trigger = nullptr;  // trigger line text
 static lv_obj_t* lbl_dash_leadr = nullptr;    // lead R + cal age line
 
 // Last-weld result labels (Status dashboard)
-static lv_obj_t* lbl_lw_accuracy = nullptr;
+static lv_obj_t* lbl_lw_target = nullptr;
+static lv_obj_t* lbl_lw_actual = nullptr;
 static lv_obj_t* lbl_lw_duration = nullptr;
 static lv_obj_t* lbl_lw_peak = nullptr;
-static lv_obj_t* lbl_lw_loss = nullptr;
 
 static lv_obj_t* btn_arm = nullptr;
 static lv_obj_t* lbl_arm = nullptr;
@@ -522,11 +521,6 @@ static void paint_arm_button(bool armed) {
         lv_label_set_text(lbl_arm, armed ? "ARMED  (tap to disarm)"
                                          : "DISARMED  (tap to arm)");
     }
-    if (lbl_dash_arm) {
-        lv_label_set_text(lbl_dash_arm, armed ? "ARM: ARMED" : "ARM: DISARMED");
-        lv_obj_set_style_text_color(lbl_dash_arm, armed ? C_GREEN : C_RED,
-                                    LV_PART_MAIN);
-    }
 }
 
 // ============================================================
@@ -550,7 +544,7 @@ static void paint_dash_trigger(bool holding) {
         char buf[64];
         // Contact delay (seconds) shown when relevant.
         float delay_s = 0.5f * (float)_dash_contact_steps;
-        snprintf(buf, sizeof(buf), "Trigger: %s  (%.1fs)",
+        snprintf(buf, sizeof(buf), "%s  (%.1fs)",
                  trigger_mode_name(_trigger_mode), (double)delay_s);
         lv_label_set_text(lbl_dash_trigger, buf);
         lv_obj_set_style_text_color(
@@ -686,37 +680,50 @@ static void build_status_tab(lv_obj_t* tab) {
     const int GAP = 10;
 
     // ---------------------------------------------------------
-    // ROW 1 (y=0..150): System Info box (left) + Weld counter & ARM (right)
+    // ROW 1 (y=0..58): compact info strip
+    //   MODE | TRIGGER (clickable) | LEAD R | WELDS (tap to reset)
+    // Each box has a small grey title (top) and a value (bottom).
     // ---------------------------------------------------------
-    const int INFO_W = 372;
-    const int INFO_H = 150;
+    const int R1_Y = 0;
+    const int R1_H = 58;
+    const int MODE_W = 150;
+    const int TRIG_W = 280;
+    const int LEADR_W = 200;
+    const int WELDS_W = 120;
+    const int MODE_X = 0;
+    const int TRIG_X = MODE_X + MODE_W + GAP;     // 160
+    const int LEADR_X = TRIG_X + TRIG_W + GAP;    // 450
+    const int WELDS_X = LEADR_X + LEADR_W + GAP;  // 660 (ends at 780)
 
-    // ---- System Info box ----
+    // ---- MODE box ----
     {
-        lv_obj_t* box = make_panel(tab, 0, 0, INFO_W, INFO_H);
+        lv_obj_t* p = make_panel(tab, MODE_X, R1_Y, MODE_W, R1_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "MODE");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
 
-        lbl_dash_arm = lv_label_create(box);
-        lv_label_set_text(lbl_dash_arm, "ARM: DISARMED");
-        lv_obj_set_style_text_color(lbl_dash_arm, C_RED, 0);
-        lv_obj_set_style_text_font(lbl_dash_arm, &lv_font_montserrat_20, 0);
-        lv_obj_set_pos(lbl_dash_arm, 12, 8);
-
-        lbl_dash_mode = lv_label_create(box);
-        lv_label_set_text(lbl_dash_mode, "Mode: TIME");
+        lbl_dash_mode = lv_label_create(p);
+        lv_label_set_text(lbl_dash_mode, "TIME");
         lv_obj_set_style_text_color(lbl_dash_mode, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_dash_mode, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl_dash_mode, 12, 44);
+        lv_obj_set_style_text_font(lbl_dash_mode, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_mode, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
 
-        // Trigger line – clickable; long-press toggles Pedal<->Contact
-        btn_dash_trigger = lv_obj_create(box);
+    // ---- TRIGGER box (clickable; long-press toggles Pedal<->Contact) ----
+    {
+        btn_dash_trigger = lv_obj_create(tab);
         lv_obj_remove_style_all(btn_dash_trigger);
         lv_obj_add_flag(btn_dash_trigger, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(btn_dash_trigger, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(btn_dash_trigger, INFO_W - 16, 34);
-        lv_obj_set_pos(btn_dash_trigger, 4, 74);
+        lv_obj_set_size(btn_dash_trigger, TRIG_W, R1_H);
+        lv_obj_set_pos(btn_dash_trigger, TRIG_X, R1_Y);
         lv_obj_set_style_bg_color(btn_dash_trigger, C_CARD, 0);
         lv_obj_set_style_bg_opa(btn_dash_trigger, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(btn_dash_trigger, 6, 0);
+        lv_obj_set_style_radius(btn_dash_trigger, 10, 0);
+        lv_obj_set_style_border_color(btn_dash_trigger, C_DARK_GREY, 0);
+        lv_obj_set_style_border_width(btn_dash_trigger, 1, 0);
         lv_obj_set_scrollbar_mode(btn_dash_trigger, LV_SCROLLBAR_MODE_OFF);
         lv_obj_add_event_cb(btn_dash_trigger, on_dash_trigger_event,
                             LV_EVENT_PRESSED, nullptr);
@@ -728,38 +735,43 @@ static void build_status_tab(lv_obj_t* tab) {
                             LV_EVENT_PRESS_LOST, nullptr);
         make_interaction_safe(btn_dash_trigger);
 
+        lv_obj_t* t = lv_label_create(btn_dash_trigger);
+        lv_label_set_text(t, "TRIGGER");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
+
         lbl_dash_trigger = lv_label_create(btn_dash_trigger);
-        lv_label_set_text(lbl_dash_trigger, "Trigger: Pedal  (1.0s)");
+        lv_label_set_text(lbl_dash_trigger, "Pedal  (1.0s)");
         lv_obj_set_style_text_color(lbl_dash_trigger, C_ACCENT, 0);
-        lv_obj_set_style_text_font(lbl_dash_trigger, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_dash_trigger, LV_ALIGN_LEFT_MID, 8, 0);
-
-        // Hint
-        lv_obj_t* hint = lv_label_create(box);
-        lv_label_set_text(hint, LV_SYMBOL_LOOP " hold to swap");
-        lv_obj_set_style_text_color(hint, C_GREY, 0);
-        lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
-        lv_obj_align(hint, LV_ALIGN_TOP_RIGHT, -10, 78);
-
-        lbl_dash_leadr = lv_label_create(box);
-        lv_label_set_text(lbl_dash_leadr, "Lead R: -- m\xCE\xA9");
-        lv_obj_set_style_text_color(lbl_dash_leadr, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_dash_leadr, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl_dash_leadr, 12, 118);
+        lv_obj_set_style_text_font(lbl_dash_trigger, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_trigger, LV_ALIGN_BOTTOM_MID, 0, -6);
     }
 
-    // ---- Right column: weld counter (tap reset) + big ARM/DISARM ----
-    const int RX = INFO_W + GAP;        // 382
-    const int RW = CONTENT_W - RX;      // 398
+    // ---- LEAD R box ----
+    {
+        lv_obj_t* p = make_panel(tab, LEADR_X, R1_Y, LEADR_W, R1_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "LEAD R");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
 
-    // Weld Counter – clickable card (tap to reset)
+        lbl_dash_leadr = lv_label_create(p);
+        lv_label_set_text(lbl_dash_leadr, "-- m\xCE\xA9");
+        lv_obj_set_style_text_color(lbl_dash_leadr, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_dash_leadr, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_leadr, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // ---- WELDS box (clickable; tap to reset counter) ----
     {
         btn_weld_cnt = lv_obj_create(tab);
         lv_obj_remove_style_all(btn_weld_cnt);
         lv_obj_add_flag(btn_weld_cnt, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(btn_weld_cnt, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(btn_weld_cnt, RW, 46);
-        lv_obj_set_pos(btn_weld_cnt, RX, 0);
+        lv_obj_set_size(btn_weld_cnt, WELDS_W, R1_H);
+        lv_obj_set_pos(btn_weld_cnt, WELDS_X, R1_Y);
         lv_obj_set_style_bg_color(btn_weld_cnt, C_CARD, 0);
         lv_obj_set_style_bg_opa(btn_weld_cnt, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn_weld_cnt, 10, 0);
@@ -771,18 +783,18 @@ static void build_status_tab(lv_obj_t* tab) {
         make_interaction_safe(btn_weld_cnt);
 
         lv_obj_t* lbl_title = lv_label_create(btn_weld_cnt);
-        lv_label_set_text(lbl_title, "Weld Count " LV_SYMBOL_REFRESH);
+        lv_label_set_text(lbl_title, "WELDS " LV_SYMBOL_REFRESH);
         lv_obj_set_style_text_color(lbl_title, C_GREY, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_16,
+        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14,
                                    LV_PART_MAIN);
-        lv_obj_align(lbl_title, LV_ALIGN_LEFT_MID, 12, 0);
+        lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 5);
 
         lbl_weld_cnt = lv_label_create(btn_weld_cnt);
         lv_label_set_text(lbl_weld_cnt, "0");
         lv_obj_set_style_text_color(lbl_weld_cnt, C_GREEN, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_24,
+        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_20,
                                    LV_PART_MAIN);
-        lv_obj_align(lbl_weld_cnt, LV_ALIGN_RIGHT_MID, -16, 0);
+        lv_obj_align(lbl_weld_cnt, LV_ALIGN_BOTTOM_MID, 0, -6);
     }
 
     // hidden state handle (kept for ui_update internal state tracking)
@@ -790,38 +802,12 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_label_set_text(lbl_state, "DISARMED");
     lv_obj_add_flag(lbl_state, LV_OBJ_FLAG_HIDDEN);
 
-    // ARM/DISARM button – large, Widget A pattern (NO lv_button!)
-    btn_arm = lv_obj_create(tab);
-    lv_obj_remove_style_all(btn_arm);
-    lv_obj_add_flag(btn_arm, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_clear_flag(btn_arm, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(btn_arm, RW, 94);
-    lv_obj_set_pos(btn_arm, RX, 56);
-    lv_obj_set_style_bg_color(btn_arm, C_RED, 0);
-    lv_obj_set_style_bg_opa(btn_arm, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(btn_arm, 12, 0);
-    lv_obj_set_scrollbar_mode(btn_arm, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_add_event_cb(btn_arm, arm_btn_event, LV_EVENT_CLICKED, nullptr);
-    make_interaction_safe(btn_arm);
-
-    lbl_arm = lv_label_create(btn_arm);
-    lv_label_set_text(lbl_arm, "DISARMED\n(tap to arm)");
-    lv_obj_set_style_text_align(lbl_arm, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(lbl_arm, C_WHITE, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_arm, &lv_font_montserrat_20, LV_PART_MAIN);
-    lv_obj_center(lbl_arm);
-
     // ---------------------------------------------------------
-    // ROW 2 (y=160..264): Power monitoring – 4 columns
+    // ROW 2 (y=68..160): Power monitoring – 4 columns
     //   PACK | CELLS | TEMPERATURE | CHARGING
-    // Four panels tuned to fit the 780px content width without
-    // horizontal scrolling.  CELLS is intentionally narrow/compact;
-    // the charge current now lives in its own CHARGING column instead
-    // of being crammed under PACK.
     // ---------------------------------------------------------
-    const int PWR_Y = 160;
-    const int PWR_H = 104;
-    // 4 columns, 3 gaps (=30px) inside CONTENT_W (780) -> 750px of panels.
+    const int PWR_Y = 68;
+    const int PWR_H = 92;
     const int PACK_W = 195;
     const int CELLS_W = 150;  // narrower / compact
     const int TEMP_W = 195;
@@ -844,10 +830,11 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_pack_v, "-- V");
         lv_obj_set_style_text_color(lbl_pack_v, C_GREEN, 0);
         lv_obj_set_style_text_font(lbl_pack_v, &lv_font_montserrat_24, 0);
-        lv_obj_align(lbl_pack_v, LV_ALIGN_CENTER, 0, 4);
+        lv_obj_align(lbl_pack_v, LV_ALIGN_CENTER, 0, 8);
     }
 
     // CELLS column – compact C1/C2/C3 (narrow panel)
+    //   Order top->bottom is C1, C2, C3 (LEFT_MID y-offsets: -20, +2, +24).
     {
         lv_obj_t* p = make_panel(tab, CELLS_X, PWR_Y, CELLS_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
@@ -860,22 +847,22 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_cell1, "C1: -- V");
         lv_obj_set_style_text_color(lbl_cell1, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell1, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell1, LV_ALIGN_LEFT_MID, 10, 2);
+        lv_obj_align(lbl_cell1, LV_ALIGN_LEFT_MID, 10, -20);
 
         lbl_cell2 = lv_label_create(p);
         lv_label_set_text(lbl_cell2, "C2: -- V");
         lv_obj_set_style_text_color(lbl_cell2, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell2, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell2, LV_ALIGN_LEFT_MID, 10, 24);
+        lv_obj_align(lbl_cell2, LV_ALIGN_LEFT_MID, 10, 2);
 
         lbl_cell3 = lv_label_create(p);
         lv_label_set_text(lbl_cell3, "C3: -- V");
         lv_obj_set_style_text_color(lbl_cell3, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_cell3, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell3, LV_ALIGN_LEFT_MID, 10, -20);
+        lv_obj_align(lbl_cell3, LV_ALIGN_LEFT_MID, 10, 24);
     }
 
-    // TEMPERATURE column – value only (was "HEALTH"; status text removed)
+    // TEMPERATURE column – value only
     {
         lv_obj_t* p = make_panel(tab, TEMP_X, PWR_Y, TEMP_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
@@ -888,14 +875,13 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_label_set_text(lbl_temp, "-- \xC2\xB0\x43");
         lv_obj_set_style_text_color(lbl_temp, C_GREEN, 0);
         lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_24, 0);
-        lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, 4);
+        lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, 8);
 
-        // lbl_health intentionally not created here anymore: the DISARMED/
-        // IDLE/CHARGING status line was removed from this column.  The
-        // pointer stays nullptr so ui_update()'s guarded writes are no-ops.
+        // lbl_health intentionally not created: status line removed.
+        // The pointer stays nullptr so ui_update()'s guarded writes no-op.
     }
 
-    // CHARGING column – charge current (moved out of the PACK column)
+    // CHARGING column – charge current value only (no "Chg:" prefix)
     {
         lv_obj_t* p = make_panel(tab, CHG_X, PWR_Y, CHG_W, PWR_H);
         lv_obj_t* t = lv_label_create(p);
@@ -905,24 +891,53 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
 
         lbl_ichg = lv_label_create(p);
-        lv_label_set_text(lbl_ichg, "Chg: -- A");
+        lv_label_set_text(lbl_ichg, "-- A");
         lv_obj_set_style_text_color(lbl_ichg, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_ichg, &lv_font_montserrat_24, 0);
-        lv_obj_align(lbl_ichg, LV_ALIGN_CENTER, 0, 4);
+        lv_obj_align(lbl_ichg, LV_ALIGN_CENTER, 0, 8);
     }
 
     // ---------------------------------------------------------
-    // ROW 3 (y=266..382): Last Weld results
+    // ROW 3 (y=170..236): ARM/DISARM button – prominent but compact.
+    // Centred horizontally; ~44% smaller than the previous 398x94 button.
+    // ---------------------------------------------------------
+    const int ARM_W = 320;
+    const int ARM_H = 66;
+    const int ARM_Y = 170;
+    const int ARM_X = (CONTENT_W - ARM_W) / 2;  // 230 (centred)
+
+    btn_arm = lv_obj_create(tab);
+    lv_obj_remove_style_all(btn_arm);
+    lv_obj_add_flag(btn_arm, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(btn_arm, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(btn_arm, ARM_W, ARM_H);
+    lv_obj_set_pos(btn_arm, ARM_X, ARM_Y);
+    lv_obj_set_style_bg_color(btn_arm, C_RED, 0);
+    lv_obj_set_style_bg_opa(btn_arm, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn_arm, 12, 0);
+    lv_obj_set_scrollbar_mode(btn_arm, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_add_event_cb(btn_arm, arm_btn_event, LV_EVENT_CLICKED, nullptr);
+    make_interaction_safe(btn_arm);
+
+    lbl_arm = lv_label_create(btn_arm);
+    lv_label_set_text(lbl_arm, "DISARMED  (tap to arm)");
+    lv_obj_set_style_text_align(lbl_arm, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(lbl_arm, C_WHITE, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_arm, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_center(lbl_arm);
+
+    // ---------------------------------------------------------
+    // ROW 4 (y=246..374): Last Weld results
+    //   Target | Actual | Duration | Peak Current
     // ---------------------------------------------------------
     // IMPORTANT (display safety margin):
     //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
     //   at the very bottom of this board are prone to a DMA/PSRAM timing
-    //   glitch ("scrambled line at the bottom"). The previous UI happened to
-    //   leave ~120px of empty background there, which masked it. We keep a
-    //   generous bottom margin (~46px) so no real content is drawn into the
-    //   glitchy region. Do NOT extend content below child-y ~390.
-    const int LW_Y = 266;
-    const int LW_H = 116;
+    //   glitch ("scrambled line at the bottom"). We keep a generous bottom
+    //   margin so no real content is drawn into the glitchy region. Do NOT
+    //   extend content below child-y ~390.
+    const int LW_Y = 246;
+    const int LW_H = 128;
     {
         lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
 
@@ -932,22 +947,22 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(t, 12, 6);
 
-        const int cell_y = 28;
-        const int cell_h = 80;
+        const int cell_y = 30;
+        const int cell_h = 88;
         const int cell_w = 180;
         const int cell_gap = (CONTENT_W - 4 * cell_w) / 5;  // even spacing
         int cx = cell_gap;
 
-        make_stat_cell(box, "Joule Accuracy", &lbl_lw_accuracy, cx, cell_y,
-                       cell_w, cell_h, &lv_font_montserrat_24);
+        make_stat_cell(box, "Target", &lbl_lw_target, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Actual", &lbl_lw_actual, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
         cx += cell_w + cell_gap;
         make_stat_cell(box, "Duration", &lbl_lw_duration, cx, cell_y, cell_w,
                        cell_h, &lv_font_montserrat_24);
         cx += cell_w + cell_gap;
         make_stat_cell(box, "Peak Current", &lbl_lw_peak, cx, cell_y, cell_w,
-                       cell_h, &lv_font_montserrat_24);
-        cx += cell_w + cell_gap;
-        make_stat_cell(box, "Lead Loss", &lbl_lw_loss, cx, cell_y, cell_w,
                        cell_h, &lv_font_montserrat_24);
     }
 
@@ -2040,9 +2055,16 @@ static void build_config_tab(lv_obj_t* tab) {
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_scroll_snap_y(tab, LV_SCROLL_SNAP_NONE);
 
-    // Scrollable inner container for all settings
+    // Inner container for all settings. This is a *plain* container – the
+    // scrolling is owned exclusively by the parent `tab`. Previously this
+    // container kept its default LV_OBJ_FLAG_SCROLLABLE flag, which created a
+    // nested scrollable inside the scrollable tab. The two scroll areas then
+    // fought over each touch (scroll chaining), producing the slow / sticky
+    // feel. Clearing the flag here makes the Config page scroll as one smooth
+    // surface.
     lv_obj_t* cont = lv_obj_create(tab);
     lv_obj_remove_style_all(cont);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(cont, 780);
     lv_obj_set_style_bg_color(cont, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
@@ -2358,7 +2380,20 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     lv_obj_clear_flag(tab_joule, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_joule, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
+    // Config tab keeps vertical scrolling but is tuned for a smooth feel:
+    //  - GESTURE_BUBBLE off  : touch gestures don't bubble up to the tabview.
+    //  - SCROLL_CHAIN off    : no scroll chaining to parent (the inner
+    //                          container is now non-scrollable, so the only
+    //                          scroller is this tab – keep it self-contained).
+    //  - SCROLL_MOMENTUM on  : flick/throw scrolling continues with inertia
+    //                          instead of stopping dead, which is what made
+    //                          the page feel slow and sticky.
+    //  - SCROLL_ELASTIC off  : remove the rubber-band drag-back that adds a
+    //                          laggy, fighting sensation on a resistive panel.
     lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(tab_config, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -2491,7 +2526,7 @@ void ui_update(const WelderDisplayState& st) {
     // ---- Charger Current ----
     if (lbl_ichg &&
         (first_run || fabsf(st.charger_current - prev_ichg) >= 0.01f)) {
-        snprintf(buf, sizeof(buf), "Chg: %.2f A", (double)st.charger_current);
+        snprintf(buf, sizeof(buf), "%.2f A", (double)st.charger_current);
         lv_label_set_text(lbl_ichg, buf);
         prev_ichg = st.charger_current;
     }
@@ -2517,9 +2552,8 @@ void ui_update(const WelderDisplayState& st) {
     {
         static uint8_t prev_mode = 0xFF;
         if (lbl_dash_mode && (first_run || st.control_mode != prev_mode)) {
-            lv_label_set_text(lbl_dash_mode, st.control_mode == 1
-                                                 ? "Mode: JOULE"
-                                                 : "Mode: TIME");
+            lv_label_set_text(lbl_dash_mode,
+                              st.control_mode == 1 ? "JOULE" : "TIME");
             prev_mode = st.control_mode;
         }
     }
@@ -2529,7 +2563,7 @@ void ui_update(const WelderDisplayState& st) {
         static float prev_leadr = -999.0f;
         if (first_run || fabsf(st.lead_resistance_mohm - prev_leadr) >= 0.005f) {
             if (lbl_dash_leadr) {
-                snprintf(buf, sizeof(buf), "Lead R: %.2f m\xCE\xA9",
+                snprintf(buf, sizeof(buf), "%.2f m\xCE\xA9",
                          (double)st.lead_resistance_mohm);
                 lv_label_set_text(lbl_dash_leadr, buf);
             }
@@ -2575,20 +2609,27 @@ void ui_update(const WelderDisplayState& st) {
                        fabsf(st.last_weld_accuracy_pct - prev_lw_acc) >= 0.1f;
         if (changed) {
             if (!st.last_weld_valid) {
-                if (lbl_lw_accuracy) lv_label_set_text(lbl_lw_accuracy, "--");
+                if (lbl_lw_target) lv_label_set_text(lbl_lw_target, "--");
+                if (lbl_lw_actual) lv_label_set_text(lbl_lw_actual, "--");
                 if (lbl_lw_duration) lv_label_set_text(lbl_lw_duration, "--");
                 if (lbl_lw_peak) lv_label_set_text(lbl_lw_peak, "--");
-                if (lbl_lw_loss) lv_label_set_text(lbl_lw_loss, "--");
             } else {
-                if (lbl_lw_accuracy) {
-                    if (st.last_weld_was_joule) {
-                        snprintf(buf, sizeof(buf), "%.0f%%",
-                                 (double)st.last_weld_accuracy_pct);
+                // Target: joule setpoint when the weld ran in joule mode,
+                // otherwise there is no energy target (time-based weld).
+                if (lbl_lw_target) {
+                    if (st.last_weld_was_joule && st.last_weld_target_j > 0.0f) {
+                        snprintf(buf, sizeof(buf), "%.0f J",
+                                 (double)st.last_weld_target_j);
                     } else {
-                        snprintf(buf, sizeof(buf), "%.1f J",
-                                 (double)st.last_weld_energy_j);
+                        snprintf(buf, sizeof(buf), "--");
                     }
-                    lv_label_set_text(lbl_lw_accuracy, buf);
+                    lv_label_set_text(lbl_lw_target, buf);
+                }
+                // Actual: measured energy delivered.
+                if (lbl_lw_actual) {
+                    snprintf(buf, sizeof(buf), "%.1f J",
+                             (double)st.last_weld_energy_j);
+                    lv_label_set_text(lbl_lw_actual, buf);
                 }
                 if (lbl_lw_duration) {
                     snprintf(buf, sizeof(buf), "%u ms",
@@ -2599,11 +2640,6 @@ void ui_update(const WelderDisplayState& st) {
                     snprintf(buf, sizeof(buf), "%.0f A",
                              (double)st.last_weld_peak_a);
                     lv_label_set_text(lbl_lw_peak, buf);
-                }
-                if (lbl_lw_loss) {
-                    snprintf(buf, sizeof(buf), "%.1f J",
-                             (double)st.last_weld_lead_loss_j);
-                    lv_label_set_text(lbl_lw_loss, buf);
                 }
             }
             prev_lw_valid = st.last_weld_valid;

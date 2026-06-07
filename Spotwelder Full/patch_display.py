@@ -22,7 +22,7 @@ Import("env")
 # every `pio run`), we cannot edit it durably by hand. This script re-applies
 # the two fixes on every build, idempotently, after the dependency is fetched.
 #
-# Fix 1 (bounce buffer)  -> add  .bounce_buffer_size_px = 10 * DISPLAY_WIDTH
+# Fix 1 (bounce buffer)  -> add  .bounce_buffer_size_px = 20 * DISPLAY_WIDTH
 # Fix 2 (full refresh)   -> LV_DISPLAY_RENDER_MODE_PARTIAL -> ..._FULL
 #
 # IMPORTANT IDF-VERSION NOTE
@@ -57,9 +57,14 @@ BOUNCE_BLOCK = (
     "        // [patched] Fix 1: bounce buffer stages pixels through internal SRAM\n"
     "        // instead of streaming the framebuffer straight out of PSRAM, which\n"
     "        // is the root cause of the scrambled/torn display. IDF 5.0+ only.\n"
-    "        .bounce_buffer_size_px = 10 * DISPLAY_WIDTH,\n"
+    "        .bounce_buffer_size_px = 20 * DISPLAY_WIDTH,\n"
     "#endif\n"
 )
+# A larger bounce buffer gives the LCD peripheral more headroom before it has
+# to fetch the next chunk from PSRAM, which further reduces the intermittent
+# scrambled lines seen in the top-left corner. Bumped 10 -> 20 lines.
+BOUNCE_OLD_VALUE = ".bounce_buffer_size_px = 10 * DISPLAY_WIDTH,"
+BOUNCE_NEW_VALUE = ".bounce_buffer_size_px = 20 * DISPLAY_WIDTH,"
 CLK_SRC_LINE = "        .clk_src = ST7262_PANEL_CONFIG_CLK_SRC,\n"
 PARTIAL = "LV_DISPLAY_RENDER_MODE_PARTIAL"
 FULL = "LV_DISPLAY_RENDER_MODE_FULL"
@@ -123,11 +128,16 @@ def patch_panel(*args, **kwargs):
     if "bounce_buffer_size_px" not in src:
         if CLK_SRC_LINE in src:
             src = src.replace(CLK_SRC_LINE, CLK_SRC_LINE + BOUNCE_BLOCK, 1)
-            changed.append("Fix1 bounce_buffer_size_px = 10 * DISPLAY_WIDTH (guarded #if IDF>=5.0; no-op on current IDF 4.4)")
+            changed.append("Fix1 bounce_buffer_size_px = 20 * DISPLAY_WIDTH (guarded #if IDF>=5.0; no-op on current IDF 4.4)")
         else:
             print("[patch_display] WARNING: could not find clk_src anchor for bounce buffer insertion")
+    elif BOUNCE_OLD_VALUE in src:
+        # Library was patched by a previous build with the old 10-line buffer.
+        # The .pio/libdeps copy persists between builds, so upgrade it in place.
+        src = src.replace(BOUNCE_OLD_VALUE, BOUNCE_NEW_VALUE)
+        changed.append("Fix1 bounce buffer upgraded 10 -> 20 * DISPLAY_WIDTH")
     else:
-        changed.append("Fix1 bounce buffer already present (skipped)")
+        changed.append("Fix1 bounce buffer already present at 20 * DISPLAY_WIDTH (skipped)")
 
     # --- Fix 2: full refresh --------------------------------------------------
     if PARTIAL in src:
