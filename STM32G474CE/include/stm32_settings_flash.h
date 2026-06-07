@@ -20,7 +20,7 @@
 
 /* Magic number for settings validity check */
 #define SETTINGS_MAGIC 0x53504F54UL /* "SPOT" in ASCII */
-#define SETTINGS_VERSION 3U
+#define SETTINGS_VERSION 4U
 
 /**
  * Persistent settings structure.
@@ -51,6 +51,8 @@ typedef struct __attribute__((packed)) {
 
     uint8_t control_mode;  // 0=time, 1=joule
     float joule_target_j;  // 0..300 J target
+
+    uint32_t joule_max_ms;  // Joule-mode max pulse duration safety limit (ms)
 
     uint32_t crc32;  // Keep at end
 } PersistentSettings;
