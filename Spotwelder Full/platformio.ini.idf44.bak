@@ -17,14 +17,7 @@
 default_envs = esp32-8048S043C
 
 [env]
-; ===== ESP-IDF 5.x UPGRADE (enables the RGB-panel bounce buffer) =====
-; The stock PlatformIO `espressif32` platform is frozen at Arduino core 2.0.x /
-; ESP-IDF 4.4.7, whose esp_lcd_rgb_panel_config_t has NO bounce_buffer_size_px
-; field. The community pioarduino fork ships Arduino core 3.x / ESP-IDF 5.x,
-; which adds that field, allowing patch_display.py to enable the bounce buffer
-; (the proven fix for the scrambled display). Version 55.03.39 = Arduino 3.3.9 /
-; ESP-IDF 5.5.4. To revert, restore platformio.ini.idf44.bak (platform = espressif32).
-platform = https://github.com/pioarduino/platform-espressif32/releases/download/55.03.39/platform-espressif32.zip
+platform = espressif32
 framework = arduino
 monitor_speed = 115200
 monitor_rts = 0
@@ -37,9 +30,6 @@ build_flags =
     -Wall
     '-D CORE_DEBUG_LEVEL=ARDUHAL_LOG_LEVEL_INFO'
     -D LV_CONF_INCLUDE_SIMPLE
-    ; pioarduino/IDF 5.x LDF no longer auto-adds the project include/ dir when
-    ; compiling the lvgl library, so point LVGL straight at our lv_conf.h.
-    -I include
 
 lib_deps = 
     rzeldent/esp32_smartdisplay@^2.0.0
