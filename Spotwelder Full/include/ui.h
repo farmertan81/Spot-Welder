@@ -46,24 +46,6 @@ struct WelderDisplayState {
 
     uint8_t trigger_mode;       // 1=pedal, 2=contact
     uint8_t contact_hold_steps;
-
-    // ---- Dashboard / Joule-mode telemetry (set by main.cpp) ----
-    uint8_t  control_mode;        // 0=TIME, 1=JOULE
-    float    joule_target_j;      // configured target energy (J)
-    uint16_t joule_max_ms;        // configured max-duration safety limit (ms)
-    float    lead_resistance_mohm;// active lead resistance (mΩ)
-    bool     cal_valid;           // true if a calibration has occurred this session
-    uint32_t cal_age_sec;         // seconds since last calibration (this session)
-
-    // ---- Last-weld results (latched on EVENT,WELD_DONE) ----
-    bool     last_weld_valid;     // true once at least one weld has completed
-    bool     last_weld_was_joule; // control_mode at the time of the weld
-    float    last_weld_target_j;  // joule target at the time of the weld
-    float    last_weld_energy_j;  // workpiece energy delivered (J)
-    float    last_weld_accuracy_pct; // 100 * energy / target (joule mode)
-    uint32_t last_weld_duration_ms;  // total pulse duration (ms)
-    float    last_weld_peak_a;    // peak current (A)
-    float    last_weld_lead_loss_j;  // energy lost in leads (J)
 };
 
 // ============================================================
@@ -117,18 +99,6 @@ typedef void (*weld_count_reset_cb_t)(void);
 // Callback type for contact-with-pedal toggle changes from Config tab
 typedef void (*contact_with_pedal_cb_t)(bool enabled);
 
-// Callback type for AUTO CALIBRATE button (Config tab calibration section)
-typedef void (*calibrate_cb_t)(void);
-
-// Callback type for Joule-tab APPLY: target energy (J) + max-duration (ms).
-// mode_joule selects control mode (true=JOULE, false=TIME).
-typedef void (*joule_apply_cb_t)(bool mode_joule, float target_j,
-                                 uint16_t max_ms);
-
-// Callback type for contact/probe delay change from Config tab (+/-).
-// steps: 1-10, each step = 0.5 s.
-typedef void (*contact_delay_cb_t)(uint8_t steps);
-
 // Phase 1B shared telemetry globals (defined in src/main.cpp)
 // Kept here so ui.cpp and other modules can read the live parser outputs.
 extern float weld_v;
@@ -163,15 +133,6 @@ void ui_set_weld_count_reset_cb(weld_count_reset_cb_t cb);
 
 // Set callback for contact-with-pedal toggle (call before or after ui_init)
 void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb);
-
-// Set callback for the AUTO CALIBRATE button (call before or after ui_init)
-void ui_set_calibrate_cb(calibrate_cb_t cb);
-
-// Set callback for the Joule-tab APPLY button (call before or after ui_init)
-void ui_set_joule_apply_cb(joule_apply_cb_t cb);
-
-// Set callback for the Config-tab contact/probe delay +/- (call before/after ui_init)
-void ui_set_contact_delay_cb(contact_delay_cb_t cb);
 
 // Push latest data into the UI.  Call from loop() at ~20 Hz.
 void ui_update(const WelderDisplayState& st);

@@ -202,25 +202,6 @@ bool contact_with_pedal =
 
 uint32_t weld_count = 0;  // running weld counter (incremented on WELD_DONE)
 
-// ---- Dashboard / Joule-mode mirrored state (from STM32 STATUS) ----
-static uint8_t  control_mode = 0;        // 0=TIME, 1=JOULE
-static float    joule_target_j = 50.0f;  // configured target energy (J)
-static uint16_t joule_max_ms = 40;       // configured max-duration safety (ms)
-
-// Session-based calibration age (ESP32 has no RTC/wall clock).
-static bool     cal_done_this_session = false;
-static uint32_t last_cal_ms = 0;
-
-// ---- Last-weld latched results (from EVENT,WELD_DONE) ----
-static bool     last_weld_valid = false;
-static bool     last_weld_was_joule = false;
-static float    last_weld_target_j = 0.0f;
-static float    last_weld_energy_j = 0.0f;
-static float    last_weld_accuracy_pct = 0.0f;
-static uint32_t last_weld_duration_ms = 0;
-static float    last_weld_peak_a = 0.0f;
-static float    last_weld_lead_loss_j = 0.0f;
-
 bool welding_now = false;
 unsigned long last_weld_time = 0;
 const unsigned long WELD_COOLDOWN = 500;
@@ -671,29 +652,6 @@ void updateScreenDisplay() {
     ds.preheat_gap_ms = preheat_gap_ms;
     ds.trigger_mode = trigger_mode;
     ds.contact_hold_steps = contact_hold_steps;
-
-    // ---- Dashboard / Joule-mode mirrored state ----
-    ds.control_mode        = control_mode;
-    ds.joule_target_j      = joule_target_j;
-    ds.joule_max_ms        = joule_max_ms;
-    ds.lead_resistance_mohm = lead_resistance_ohms * 1000.0f;
-
-    // Calibration freshness is session-based (ESP32 has no RTC).
-    ds.cal_valid   = cal_done_this_session;
-    ds.cal_age_sec = cal_done_this_session
-                         ? (uint32_t)((millis() - last_cal_ms) / 1000UL)
-                         : 0U;
-
-    // ---- Last-weld latched results ----
-    ds.last_weld_valid        = last_weld_valid;
-    ds.last_weld_was_joule    = last_weld_was_joule;
-    ds.last_weld_target_j     = last_weld_target_j;
-    ds.last_weld_energy_j     = last_weld_energy_j;
-    ds.last_weld_accuracy_pct = last_weld_accuracy_pct;
-    ds.last_weld_duration_ms  = last_weld_duration_ms;
-    ds.last_weld_peak_a       = last_weld_peak_a;
-    ds.last_weld_lead_loss_j  = last_weld_lead_loss_j;
-
     ui_update(ds);
 }
 
@@ -1044,14 +1002,6 @@ void pollStm32Uart() {
                     if (extractFloatField(stmLine, "energy_loss_j=", fv))
                         energy_loss_j = fv;
 
-                    // ---- Dashboard / Joule-mode mirror (display state) ----
-                    if (extractIntField(stmLine, "control_mode=", iv))
-                        control_mode = (uint8_t)iv;
-                    if (extractFloatField(stmLine, "joule_target_j=", fv))
-                        joule_target_j = fv;
-                    if (extractIntField(stmLine, "joule_max_ms=", iv))
-                        joule_max_ms = (uint16_t)iv;
-
                     // ====
                     // RECIPE SYNC FROM STM32 STATUS
                     // ====
@@ -1219,46 +1169,6 @@ void pollStm32Uart() {
                     if (extractFloatField(stmLine, "cap_v=", fv_done))
                         cap_v = fv_done;
 
-                    // ---- Latch last-weld results for the STATUS dashboard ----
-                    {
-                        int   iv_done = 0;
-                        float jw = NAN;   // joule workpiece energy
-                        float jl = NAN;   // joule lead loss
-                        float ew = NAN;   // time-mode weld energy
-                        float el = NAN;   // measured lead-loss energy
-
-                        if (extractIntField(stmLine, "total_ms=", iv_done))
-                            last_weld_duration_ms = (uint32_t)iv_done;
-                        if (extractFloatField(stmLine, "peak_a=", fv_done))
-                            last_weld_peak_a = fv_done;
-
-                        extractFloatField(stmLine, "joule_workpiece_j=", jw);
-                        extractFloatField(stmLine, "joule_loss_j=", jl);
-                        extractFloatField(stmLine, "energy_weld_j=", ew);
-                        extractFloatField(stmLine, "energy_lead_j=", el);
-
-                        last_weld_was_joule = (control_mode == 1U);
-                        last_weld_target_j  = joule_target_j;
-
-                        if (last_weld_was_joule && !isnan(jw)) {
-                            last_weld_energy_j = jw;
-                        } else if (!isnan(ew)) {
-                            last_weld_energy_j = ew;
-                        }
-                        if (last_weld_was_joule && !isnan(jl)) {
-                            last_weld_lead_loss_j = jl;
-                        } else if (!isnan(el)) {
-                            last_weld_lead_loss_j = el;
-                        }
-
-                        last_weld_accuracy_pct =
-                            (last_weld_target_j > 0.0f)
-                                ? (100.0f * last_weld_energy_j /
-                                   last_weld_target_j)
-                                : 0.0f;
-                        last_weld_valid = true;
-                    }
-
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -1294,15 +1204,6 @@ void pollStm32Uart() {
                     // (CAL_STATUS / CAL_RESULT / CAL_ERROR). Forward
                     // transparently so the Pi/Flask calibration waiter and the
                     // web UI receive progress and the final measurement.
-                    if (stmLine.startsWith("CAL_RESULT")) {
-                        // Successful calibration this session: latch freshness
-                        // so the CONFIG tab can show a relative age (no RTC).
-                        cal_done_this_session = true;
-                        last_cal_ms = millis();
-                        float cal_ohm = NAN;
-                        if (extractFloatField(stmLine, "CAL_RESULT=", cal_ohm))
-                            lead_resistance_ohms = cal_ohm;
-                    }
                     sendToPi(stmLine);
 
                 } else if (stmLine.startsWith("ACK,") ||
@@ -2093,47 +1994,6 @@ static void onContactWithPedalChange(bool enabled) {
                   enabled ? "ON" : "OFF");
 }
 
-// Callback from UI (CONFIG tab) when AUTO CALIBRATE is pressed.
-// Triggers the STM32 lead-resistance auto-calibration routine.
-static void onCalibrate() {
-    processCommand("CAL_LEAD_START");
-    Serial.println("[Cal] Lead-resistance auto-calibration started via touch UI");
-}
-
-// Callback from UI (JOULE tab) when APPLY is pressed.
-//   mode_joule = true -> JOULE control mode, false -> TIME control mode
-//   target_j   = target energy (J), max_ms = max-duration safety limit (ms)
-static void onJouleApply(bool mode_joule, float target_j, uint16_t max_ms) {
-    char buf[48];
-
-    // 1) Control mode (SET_MODE,<0=time|1=joule>)
-    snprintf(buf, sizeof(buf), "SET_MODE,%d", mode_joule ? 1 : 0);
-    processCommand(String(buf));
-    control_mode = mode_joule ? 1 : 0;
-
-    // 2) Target energy
-    snprintf(buf, sizeof(buf), "SET_JOULE_TARGET,%.1f", (double)target_j);
-    processCommand(String(buf));
-    joule_target_j = target_j;
-
-    // 3) Max-duration safety limit
-    snprintf(buf, sizeof(buf), "SET_JOULE_MAX,%u", (unsigned)max_ms);
-    processCommand(String(buf));
-    joule_max_ms = max_ms;
-
-    Serial.printf("[Joule] Applied mode=%s target=%.1fJ max=%ums via touch UI\n",
-                  mode_joule ? "JOULE" : "TIME", (double)target_j,
-                  (unsigned)max_ms);
-}
-
-// Callback from UI (CONFIG tab) when contact delay steps change.
-// SET_CONTACT_HOLD is already forwarded by onConfigChange (driven by the same
-// stepper), so this only logs to avoid a duplicate command / flash write.
-static void onContactDelayChange(uint8_t steps) {
-    Serial.printf("[Config] Contact delay set to %d step(s) via touch UI\n",
-                  (int)steps);
-}
-
 // =========================
 // Setup
 // =========================
@@ -2252,12 +2112,7 @@ void setup() {
     ui_set_trigger_source_cb(onTriggerSourceChange);
     ui_set_weld_count_reset_cb(onWeldCountReset);
     ui_set_contact_with_pedal_cb(onContactWithPedalChange);
-
-    // --- New dashboard / Joule / Calibration callbacks ---
-    ui_set_calibrate_cb(onCalibrate);
-    ui_set_joule_apply_cb(onJouleApply);
-    ui_set_contact_delay_cb(onContactDelayChange);
-    Serial.println("[Boot] UI callbacks registered");
+    Serial.println("[Boot] 3/4 UI callbacks registered");
 
     // ==========================================================
     // WiFi  (non-blocking – removed blocking wait)
