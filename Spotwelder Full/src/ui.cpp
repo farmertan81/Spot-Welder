@@ -297,6 +297,7 @@ static lv_obj_t* btn_joule_mode_time = nullptr;
 static lv_obj_t* btn_joule_mode_joule = nullptr;
 static lv_obj_t* lbl_joule_target = nullptr;
 static lv_obj_t* lbl_joule_maxdur = nullptr;
+static lv_obj_t* lbl_joule_actual = nullptr;  // live workpiece energy readout (J)
 static lv_obj_t* btn_joule_apply = nullptr;
 static lv_obj_t* lbl_joule_apply = nullptr;
 
@@ -1732,6 +1733,11 @@ static void build_joule_tab(lv_obj_t* tab) {
     lv_obj_add_event_cb(btn_joule_apply, on_joule_apply, LV_EVENT_CLICKED,
                         nullptr);
 
+    // ---- Live energy readout (3rd block): actual workpiece Joules ----
+    // Shows the live/last measured energy reported by the STM32 in JOULE mode.
+    make_stat_cell(tab, "Joules", &lbl_joule_actual, LABEL_X + 266, y, 200, 56,
+                   &lv_font_montserrat_24);
+
     // ---- Note (right side) ----
     {
         lv_obj_t* note = lv_label_create(tab);
@@ -2644,6 +2650,18 @@ void ui_update(const WelderDisplayState& st) {
             }
             prev_lw_valid = st.last_weld_valid;
             prev_lw_acc = st.last_weld_accuracy_pct;
+        }
+    }
+
+    // ---- Joule tab: live workpiece-energy readout ----
+    {
+        static float prev_joule_actual = -999.0f;
+        if (lbl_joule_actual &&
+            (first_run || fabsf(st.joule_actual_j - prev_joule_actual) >= 0.05f)) {
+            char jbuf[24];
+            snprintf(jbuf, sizeof(jbuf), "%.1f J", (double)st.joule_actual_j);
+            lv_label_set_text(lbl_joule_actual, jbuf);
+            prev_joule_actual = st.joule_actual_j;
         }
     }
 

@@ -51,6 +51,7 @@ struct WelderDisplayState {
     uint8_t  control_mode;        // 0=TIME, 1=JOULE
     float    joule_target_j;      // configured target energy (J)
     uint16_t joule_max_ms;        // configured max-duration safety limit (ms)
+    float    joule_actual_j;      // live/last workpiece energy delivered (J)
     float    lead_resistance_mohm;// active lead resistance (mΩ)
     bool     cal_valid;           // true if a calibration has occurred this session
     uint32_t cal_age_sec;         // seconds since last calibration (this session)

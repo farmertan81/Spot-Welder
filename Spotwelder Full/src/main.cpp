@@ -206,6 +206,7 @@ uint32_t weld_count = 0;  // running weld counter (incremented on WELD_DONE)
 static uint8_t  control_mode = 0;        // 0=TIME, 1=JOULE
 static float    joule_target_j = 50.0f;  // configured target energy (J)
 static uint16_t joule_max_ms = 40;       // configured max-duration safety (ms)
+static float    joule_actual_j = 0.0f;   // live workpiece energy from STATUS (J)
 
 // Session-based calibration age (ESP32 has no RTC/wall clock).
 static bool     cal_done_this_session = false;
@@ -676,6 +677,7 @@ void updateScreenDisplay() {
     ds.control_mode        = control_mode;
     ds.joule_target_j      = joule_target_j;
     ds.joule_max_ms        = joule_max_ms;
+    ds.joule_actual_j      = joule_actual_j;
     ds.lead_resistance_mohm = lead_resistance_ohms * 1000.0f;
 
     // Calibration freshness is session-based (ESP32 has no RTC).
@@ -1051,6 +1053,11 @@ void pollStm32Uart() {
                         joule_target_j = fv;
                     if (extractIntField(stmLine, "joule_max_ms=", iv))
                         joule_max_ms = (uint16_t)iv;
+                    // Live workpiece energy (lead-compensated control variable).
+                    // Present only in JOULE-mode STATUS frames; holds the last
+                    // weld's final energy between welds.
+                    if (extractFloatField(stmLine, "joule_actual=", fv))
+                        joule_actual_j = fv;
 
                     // ====
                     // RECIPE SYNC FROM STM32 STATUS
