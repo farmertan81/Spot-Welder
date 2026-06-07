@@ -891,10 +891,17 @@ static void build_status_tab(lv_obj_t* tab) {
     }
 
     // ---------------------------------------------------------
-    // ROW 3 (y=272..416): Last Weld results
+    // ROW 3 (y=266..382): Last Weld results
     // ---------------------------------------------------------
-    const int LW_Y = 272;
-    const int LW_H = 144;
+    // IMPORTANT (display safety margin):
+    //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
+    //   at the very bottom of this board are prone to a DMA/PSRAM timing
+    //   glitch ("scrambled line at the bottom"). The previous UI happened to
+    //   leave ~120px of empty background there, which masked it. We keep a
+    //   generous bottom margin (~46px) so no real content is drawn into the
+    //   glitchy region. Do NOT extend content below child-y ~390.
+    const int LW_Y = 266;
+    const int LW_H = 116;
     {
         lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
 
@@ -904,8 +911,8 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(t, 12, 6);
 
-        const int cell_y = 34;
-        const int cell_h = 98;
+        const int cell_y = 28;
+        const int cell_h = 80;
         const int cell_w = 180;
         const int cell_gap = (CONTENT_W - 4 * cell_w) / 5;  // even spacing
         int cx = cell_gap;
