@@ -298,7 +298,6 @@ static lv_obj_t* btn_joule_mode_time = nullptr;
 static lv_obj_t* btn_joule_mode_joule = nullptr;
 static lv_obj_t* lbl_joule_target = nullptr;
 static lv_obj_t* lbl_joule_maxdur = nullptr;
-static lv_obj_t* lbl_joule_actual = nullptr;  // live workpiece energy readout (J)
 static lv_obj_t* btn_joule_apply = nullptr;
 static lv_obj_t* lbl_joule_apply = nullptr;
 
@@ -840,32 +839,28 @@ static void build_status_tab(lv_obj_t* tab) {
     }
 
     // CELLS column – compact C1/C2/C3 (narrow panel)
-    //   Order top->bottom is C1, C2, C3 (LEFT_MID y-offsets: -20, +2, +24).
+    //   No "CELLS" title: the three cell voltages are bumped up one font size
+    //   (16->18) and centred as a group inside the panel (offsets -26/0/+26).
     {
         lv_obj_t* p = make_panel(tab, CELLS_X, PWR_Y, CELLS_W, PWR_H);
-        lv_obj_t* t = lv_label_create(p);
-        lv_label_set_text(t, "CELLS");
-        lv_obj_set_style_text_color(t, C_GREY, 0);
-        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
-        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
 
         lbl_cell1 = lv_label_create(p);
         lv_label_set_text(lbl_cell1, "C1: -- V");
         lv_obj_set_style_text_color(lbl_cell1, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_cell1, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell1, LV_ALIGN_LEFT_MID, 10, -20);
+        lv_obj_set_style_text_font(lbl_cell1, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell1, LV_ALIGN_CENTER, 0, -26);
 
         lbl_cell2 = lv_label_create(p);
         lv_label_set_text(lbl_cell2, "C2: -- V");
         lv_obj_set_style_text_color(lbl_cell2, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_cell2, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell2, LV_ALIGN_LEFT_MID, 10, 2);
+        lv_obj_set_style_text_font(lbl_cell2, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell2, LV_ALIGN_CENTER, 0, 0);
 
         lbl_cell3 = lv_label_create(p);
         lv_label_set_text(lbl_cell3, "C3: -- V");
         lv_obj_set_style_text_color(lbl_cell3, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl_cell3, &lv_font_montserrat_16, 0);
-        lv_obj_align(lbl_cell3, LV_ALIGN_LEFT_MID, 10, 24);
+        lv_obj_set_style_text_font(lbl_cell3, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell3, LV_ALIGN_CENTER, 0, 26);
     }
 
     // TEMPERATURE column – value only
@@ -904,12 +899,14 @@ static void build_status_tab(lv_obj_t* tab) {
     }
 
     // ---------------------------------------------------------
-    // ROW 3 (y=170..236): ARM/DISARM button – prominent but compact.
-    // Centred horizontally; ~44% smaller than the previous 398x94 button.
+    // ROW 3 (y=175..241): ARM/DISARM button – prominent but compact.
+    // Centred horizontally; also centred VERTICALLY in the gap between ROW 2
+    // (ends y=160) and the Last Weld bar (top y=256): gap=96, button=66, so
+    // ARM_Y = 160 + (96-66)/2 = 175 (equal ~15px above & below).
     // ---------------------------------------------------------
     const int ARM_W = 320;
     const int ARM_H = 66;
-    const int ARM_Y = 170;
+    const int ARM_Y = 175;
     const int ARM_X = (CONTENT_W - ARM_W) / 2;  // 230 (centred)
 
     btn_arm = lv_obj_create(tab);
@@ -933,16 +930,16 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_center(lbl_arm);
 
     // ---------------------------------------------------------
-    // ROW 4 (y=246..374): Last Weld results
-    //   Target | Actual | Duration | Peak Current
+    // ROW 4 (y=256..384): Last Weld results – pushed to the bottom
+    //   Duration | Peak | Avg | Joules
     // ---------------------------------------------------------
     // IMPORTANT (display safety margin):
     //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
     //   at the very bottom of this board are prone to a DMA/PSRAM timing
     //   glitch ("scrambled line at the bottom"). We keep a generous bottom
     //   margin so no real content is drawn into the glitchy region. Do NOT
-    //   extend content below child-y ~390.
-    const int LW_Y = 246;
+    //   extend content below child-y ~390. (Bottom here = 256+128 = 384.)
+    const int LW_Y = 256;
     const int LW_H = 128;
     {
         lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
@@ -1738,10 +1735,9 @@ static void build_joule_tab(lv_obj_t* tab) {
     lv_obj_add_event_cb(btn_joule_apply, on_joule_apply, LV_EVENT_CLICKED,
                         nullptr);
 
-    // ---- Live energy readout (3rd block): actual workpiece Joules ----
-    // Shows the live/last measured energy reported by the STM32 in JOULE mode.
-    make_stat_cell(tab, "Joules", &lbl_joule_actual, LABEL_X + 266, y, 200, 56,
-                   &lv_font_montserrat_24);
+    // NOTE: the live workpiece-Joules readout was intentionally removed from
+    // this tab. The measured energy is shown on the STATUS tab's "Last Weld"
+    // section (Duration | Peak | Avg | Joules) instead.
 
     // ---- Note (right side) ----
     {
@@ -2661,17 +2657,6 @@ void ui_update(const WelderDisplayState& st) {
         }
     }
 
-    // ---- Joule tab: live workpiece-energy readout ----
-    {
-        static float prev_joule_actual = -999.0f;
-        if (lbl_joule_actual &&
-            (first_run || fabsf(st.joule_actual_j - prev_joule_actual) >= 0.05f)) {
-            char jbuf[24];
-            snprintf(jbuf, sizeof(jbuf), "%.1f J", (double)st.joule_actual_j);
-            lv_label_set_text(lbl_joule_actual, jbuf);
-            prev_joule_actual = st.joule_actual_j;
-        }
-    }
 
     // ---- Weld Counter ----
     {
