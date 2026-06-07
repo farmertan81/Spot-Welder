@@ -606,7 +606,7 @@ static void sendStatusPacket(void) {
                  "control_mode=%u,joule_target_j=%.1f,joule_target=%.1f,joule_"
                  "actual=%.1f,"
                  "joule_total=%.1f,joule_lead_loss=%.1f,"
-                 "joule_duration_ms=%lu,joule_status=%s",
+                 "joule_duration_ms=%lu,joule_status=%s,joule_max_ms=%lu",
                  armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
                  temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
                  (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
@@ -619,7 +619,7 @@ static void sendStatusPacket(void) {
                  joule_target_j, joule_accumulated, joule_total_accumulated,
                  joule_lead_loss_accumulated,
                  (unsigned long)(joule_actual_duration_us / 1000U),
-                 joule_status);
+                 joule_status, (unsigned long)joule_max_ms);
     } else {
         snprintf(buf, sizeof(buf),
                  "STATUS,armed=%d,ready=%d,welding=%d,vcap=%.2f,"
@@ -627,7 +627,7 @@ static void sendStatusPacket(void) {
                  "power=%.2f,preheat_en=%d,preheat_ms=%u,preheat_pct=%u,"
                  "preheat_gap_ms=%u,trigger_mode=%u,contact_hold_steps=%u,"
                  "contact_with_pedal=%u,vdda=%.3f,lead_r_ohm=%.6f,"
-                 "control_mode=%u,joule_target_j=%.1f",
+                 "control_mode=%u,joule_target_j=%.1f,joule_max_ms=%lu",
                  armed ? 1 : 0, system_ready ? 1 : 0, welding_now ? 1 : 0, vcap,
                  temp_filtered_c, (int)weld_mode, (unsigned)weld_d1_ms,
                  (unsigned)weld_gap1_ms, (unsigned)weld_d2_ms,
@@ -636,7 +636,8 @@ static void sendStatusPacket(void) {
                  (unsigned)preheat_pct, (unsigned)preheat_gap_ms,
                  (unsigned)trigger_mode, (unsigned)contact_hold_steps,
                  (unsigned)contact_with_pedal, measured_vdda,
-                 lead_resistance_ohms, (unsigned)control_mode, joule_target_j);
+                 lead_resistance_ohms, (unsigned)control_mode, joule_target_j,
+                 (unsigned long)joule_max_ms);
     }
     uartSend(buf);
 
@@ -1993,6 +1994,7 @@ static void persistent_defaults(PersistentSettings* out) {
     out->preheat_gap_ms = 3;
     out->control_mode = 0;
     out->joule_target_j = 50.0f;
+    out->joule_max_ms = 40;
 }
 
 static void persistent_from_runtime(PersistentSettings* out) {
@@ -2014,6 +2016,7 @@ static void persistent_from_runtime(PersistentSettings* out) {
     out->preheat_gap_ms = preheat_gap_ms;
     out->control_mode = control_mode;
     out->joule_target_j = joule_target_j;
+    out->joule_max_ms = joule_max_ms;
 }
 
 static void apply_loaded_settings(const PersistentSettings* in) {
@@ -2036,6 +2039,7 @@ static void apply_loaded_settings(const PersistentSettings* in) {
     preheat_gap_ms = in->preheat_gap_ms;
     control_mode = in->control_mode;
     joule_target_j = in->joule_target_j;
+    joule_max_ms = in->joule_max_ms;
 
     clampParams();
 
@@ -2073,6 +2077,10 @@ static void clampParams(void) {
     if (!isfinite(joule_target_j)) joule_target_j = 50.0f;
     if (joule_target_j < 0.0f) joule_target_j = 0.0f;
     if (joule_target_j > 300.0f) joule_target_j = 300.0f;
+
+    /* Joule-mode max-duration safety limit (ms). */
+    if (joule_max_ms < 5U) joule_max_ms = 5U;
+    if (joule_max_ms > 500U) joule_max_ms = 500U;
 }
 
 static void applyArmTimeout(void) {
@@ -4090,6 +4098,26 @@ static void parseCommand(char* line) {
             sendStatusPacket();
         } else {
             uartSend("DENY,SET_JOULE_TARGET,RANGE");
+        }
+        return;
+    }
+
+    if (strncmp(line, "SET_JOULE_MAX,", 14) == 0) {
+        int new_max_i = atoi(line + 14);
+        if (new_max_i >= 5 && new_max_i <= 500) {
+            joule_max_ms = (uint32_t)new_max_i;
+            clampParams();
+            persistent_from_runtime(&g_persistent_settings);
+            if (!flash_settings_save(&g_persistent_settings)) {
+                uartSend("DENY,SET_JOULE_MAX,FLASH_SAVE_FAILED");
+                return;
+            }
+            snprintf(response, sizeof(response), "ACK,SET_JOULE_MAX,ms=%lu",
+                     (unsigned long)joule_max_ms);
+            uartSend(response);
+            sendStatusPacket();
+        } else {
+            uartSend("DENY,SET_JOULE_MAX,RANGE");
         }
         return;
     }
