@@ -179,6 +179,12 @@ uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
 static float lead_resistance_ohms = 0.00200f;  // configurable, persisted
+// Lead resistance is synced from the STM32 STATUS stream exactly once at boot
+// (first valid, non-zero value). After that it is updated ONLY by calibration
+// (CAL_RESULT) or an explicit SET_LEAD_R round-trip (ACK,LEAD_R). This prevents
+// a stray "lead_r_ohm=0" in a periodic STATUS message from making the on-screen
+// reading flash to "00".
+static bool lead_r_synced_from_status = false;
 static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f;
 static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f;
 
@@ -972,6 +978,9 @@ void pollStm32Uart() {
                         isfinite(fv)) {
                         lead_resistance_ohms = fv;
                         save_lead_resistance_to_nvs();
+                        // Authoritative SET_LEAD_R round-trip (ESP32 UI or
+                        // Flask): lock out later STATUS-driven overwrites.
+                        lead_r_synced_from_status = true;
                     }
                     lead_r_update_inflight = false;
                     pending_lead_r_ohms = NAN;
@@ -1103,10 +1112,17 @@ void pollStm32Uart() {
                                 weld_power_pct = (uint8_t)fv;
                             }
 
-                            // Configurable lead resistance (runtime sync from
-                            // STM32)
-                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                            // Configurable lead resistance: sync from STM32
+                            // STATUS only once at boot, and only for a valid
+                            // non-zero value. Afterwards lead_r changes solely
+                            // via calibration / SET_LEAD_R, so a stray
+                            // lead_r_ohm=0 can't flash the on-screen reading.
+                            if (!lead_r_synced_from_status &&
+                                extractFloatField(stmLine, "lead_r_ohm=", fv) &&
+                                isfinite(fv) && fv > 0.0f) {
                                 lead_resistance_ohms = fv;
+                                lead_r_synced_from_status = true;
+                            }
 
                             // Preheat
                             if (extractIntField(stmLine, "preheat_en=", iv))
@@ -1133,8 +1149,13 @@ void pollStm32Uart() {
                             // overwrite recipe globals
                             if (extractFloatField(stmLine, "power=", fv))
                                 stm_power = fv;
-                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                            // Boot-only, non-zero lead_r sync (see note above).
+                            if (!lead_r_synced_from_status &&
+                                extractFloatField(stmLine, "lead_r_ohm=", fv) &&
+                                isfinite(fv) && fv > 0.0f) {
                                 lead_resistance_ohms = fv;
+                                lead_r_synced_from_status = true;
+                            }
                             Serial.println(
                                 "[SYNC] Recipe sync suppressed (boot grace "
                                 "period)");
@@ -1322,8 +1343,11 @@ void pollStm32Uart() {
                         cal_done_this_session = true;
                         last_cal_ms = millis();
                         float cal_ohm = NAN;
-                        if (extractFloatField(stmLine, "CAL_RESULT=", cal_ohm))
+                        if (extractFloatField(stmLine, "CAL_RESULT=", cal_ohm)) {
                             lead_resistance_ohms = cal_ohm;
+                            // Authoritative: don't let a later STATUS overwrite.
+                            lead_r_synced_from_status = true;
+                        }
                     }
 
                     // Drive the on-device touch UI calibration status line so

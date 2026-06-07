@@ -763,7 +763,7 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
 
         lbl_dash_leadr = lv_label_create(p);
-        lv_label_set_text(lbl_dash_leadr, "-- m\xCE\xA9");
+        lv_label_set_text(lbl_dash_leadr, "-- m");
         lv_obj_set_style_text_color(lbl_dash_leadr, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl_dash_leadr, &lv_font_montserrat_18, 0);
         lv_obj_align(lbl_dash_leadr, LV_ALIGN_BOTTOM_MID, 0, -6);
@@ -1930,7 +1930,7 @@ static void update_cfg_cwp_label() {
 static void update_cfg_cal_labels() {
     if (lbl_cfg_cal_leadr) {
         char text[32];
-        snprintf(text, sizeof(text), "%.2f m\xCE\xA9",
+        snprintf(text, sizeof(text), "%.1fm",
                  (double)_cfg.lead_resistance_mohm);
         lv_label_set_text(lbl_cfg_cal_leadr, text);
     }
@@ -2106,7 +2106,7 @@ static void build_config_tab(lv_obj_t* tab) {
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
     lbl_cfg_cal_leadr = lv_label_create(cont);
-    lv_label_set_text(lbl_cfg_cal_leadr, "-- m\xCE\xA9");
+    lv_label_set_text(lbl_cfg_cal_leadr, "-- m");
     lv_obj_set_style_text_color(lbl_cfg_cal_leadr, C_ACCENT, 0);
     lv_obj_set_style_text_font(lbl_cfg_cal_leadr, &lv_font_montserrat_20, 0);
     lv_obj_set_pos(lbl_cfg_cal_leadr, BTN_X, y + 10);
@@ -2567,10 +2567,15 @@ void ui_update(const WelderDisplayState& st) {
 
     // ---- Dashboard: Lead resistance + Config calibration labels ----
     {
+        // main.cpp latches lead_r so it only changes on boot / calibration /
+        // SET_LEAD_R (never from periodic STATUS), so this change-detector now
+        // effectively fires only on those events. Ignore non-positive values
+        // so a transient 0 can never paint a "0.0m" reading.
         static float prev_leadr = -999.0f;
-        if (first_run || fabsf(st.lead_resistance_mohm - prev_leadr) >= 0.005f) {
+        if (st.lead_resistance_mohm > 0.0001f &&
+            (first_run || fabsf(st.lead_resistance_mohm - prev_leadr) >= 0.005f)) {
             if (lbl_dash_leadr) {
-                snprintf(buf, sizeof(buf), "%.2f m\xCE\xA9",
+                snprintf(buf, sizeof(buf), "%.1fm",
                          (double)st.lead_resistance_mohm);
                 lv_label_set_text(lbl_dash_leadr, buf);
             }
@@ -2899,7 +2904,7 @@ void ui_notify_cal_message(const char* line) {
         float ohms = 0.0f;
         char buf[48];
         if (sscanf(line + 11, "%f", &ohms) == 1) {
-            snprintf(buf, sizeof(buf), "Done: %.2f m\xCE\xA9 \xE2\x9C\x93",
+            snprintf(buf, sizeof(buf), "Done: %.1fm \xE2\x9C\x93",
                      (double)(ohms * 1000.0f));
         } else {
             snprintf(buf, sizeof(buf), "Calibration complete \xE2\x9C\x93");
