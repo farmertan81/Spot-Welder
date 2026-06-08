@@ -899,14 +899,14 @@ static void build_status_tab(lv_obj_t* tab) {
     }
 
     // ---------------------------------------------------------
-    // ROW 3 (y=186..252): ARM/DISARM button – prominent but compact.
+    // ROW 3 (y=191..257): ARM/DISARM button – prominent but compact.
     // Centred horizontally; also centred VERTICALLY in the gap between ROW 2
-    // (ends y=160) and the Last Weld bar (top y=278): gap=118, button=66, so
-    // ARM_Y = 160 + (118-66)/2 = 186 (equal ~26px above & below).
+    // (ends y=160) and the Last Weld bar (top y=288): gap=128, button=66, so
+    // ARM_Y = 160 + (128-66)/2 = 191 (equal ~31px above & below).
     // ---------------------------------------------------------
     const int ARM_W = 320;
     const int ARM_H = 66;
-    const int ARM_Y = 186;
+    const int ARM_Y = 191;
     const int ARM_X = (CONTENT_W - ARM_W) / 2;  // 230 (centred)
 
     btn_arm = lv_obj_create(tab);
@@ -930,18 +930,22 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_center(lbl_arm);
 
     // ---------------------------------------------------------
-    // ROW 4 (y=278..406): Last Weld results – pushed to the bottom
+    // ROW 4 (y=288..416): Last Weld results – pushed to the very bottom.
     //   Duration | Peak | Avg | Joules
     // ---------------------------------------------------------
-    // IMPORTANT (display safety margin):
+    // IMPORTANT (display geometry + safety margin):
     //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
     //   at the very bottom of this board are prone to a DMA/PSRAM timing
-    //   glitch ("scrambled line at the bottom"). The usable tab content height
-    //   is 418px (480 - 42px tab bar - 2*10px pad). We push Last Weld to the
-    //   bottom while keeping its bottom edge at 406 (~12px clear of the 418
-    //   limit) so no content lands in the glitchy region. Do NOT extend
-    //   content below child-y ~410. (Bottom here = 278+128 = 406.)
-    const int LW_Y = 278;
+    //   glitch ("scrambled line at the bottom").
+    //   Coordinate math: a STATUS-tab child at child-y Y sits at absolute
+    //   screen-y = 42 (top tab bar) + 10 (tab pad_top) + Y. The tab's usable
+    //   content height is 418px (480 - 42 tab bar - 2*10 pad), so child-y
+    //   ranges 0..418. We push Last Weld to child-y 288 (bottom child-y 416,
+    //   absolute screen-y 468) — that's the practical maximum: it leaves a
+    //   ~12px clear band above the screen bottom (480) so nothing lands in the
+    //   glitchy scanlines. Do NOT push LW_Y past ~290 / bottom child-y past
+    //   ~418. (Bottom here = 288+128 = 416 -> screen-y 468.)
+    const int LW_Y = 288;
     const int LW_H = 128;
     {
         lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
