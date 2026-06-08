@@ -179,6 +179,12 @@ uint8_t preheat_pct = 30;
 uint16_t preheat_gap_ms = 3;
 
 static float lead_resistance_ohms = 0.00200f;  // configurable, persisted
+// Lead resistance is synced from the STM32 STATUS stream exactly once at boot
+// (first valid, non-zero value). After that it is updated ONLY by calibration
+// (CAL_RESULT) or an explicit SET_LEAD_R round-trip (ACK,LEAD_R). This prevents
+// a stray "lead_r_ohm=0" in a periodic STATUS message from making the on-screen
+// reading flash to "00".
+static bool lead_r_synced_from_status = false;
 static const float LEAD_RESISTANCE_MIN_OHMS = 0.0001f;
 static const float LEAD_RESISTANCE_MAX_OHMS = 0.0100f;
 
@@ -201,6 +207,27 @@ bool contact_with_pedal =
     false;  // require contact detection when pedal trigger
 
 uint32_t weld_count = 0;  // running weld counter (incremented on WELD_DONE)
+
+// ---- Dashboard / Joule-mode mirrored state (from STM32 STATUS) ----
+static uint8_t  control_mode = 0;        // 0=TIME, 1=JOULE
+static float    joule_target_j = 50.0f;  // configured target energy (J)
+static uint16_t joule_max_ms = 40;       // configured max-duration safety (ms)
+static float    joule_actual_j = 0.0f;   // live workpiece energy from STATUS (J)
+
+// Session-based calibration age (ESP32 has no RTC/wall clock).
+static bool     cal_done_this_session = false;
+static uint32_t last_cal_ms = 0;
+
+// ---- Last-weld latched results (from EVENT,WELD_DONE) ----
+static bool     last_weld_valid = false;
+static bool     last_weld_was_joule = false;
+static float    last_weld_target_j = 0.0f;
+static float    last_weld_energy_j = 0.0f;
+static float    last_weld_accuracy_pct = 0.0f;
+static uint32_t last_weld_duration_ms = 0;
+static float    last_weld_peak_a = 0.0f;
+static float    last_weld_avg_a = 0.0f;
+static float    last_weld_lead_loss_j = 0.0f;
 
 bool welding_now = false;
 unsigned long last_weld_time = 0;
@@ -458,6 +485,8 @@ String buildStatus();
 static void save_recipe_to_nvs();
 static void save_lead_resistance_to_nvs();
 static void load_lead_resistance_from_nvs();
+static void save_weld_count_to_nvs();
+static void load_weld_count_from_nvs();
 static void sendLeadResistanceToStm32(float ohms);
 
 // =========================
@@ -652,6 +681,31 @@ void updateScreenDisplay() {
     ds.preheat_gap_ms = preheat_gap_ms;
     ds.trigger_mode = trigger_mode;
     ds.contact_hold_steps = contact_hold_steps;
+
+    // ---- Dashboard / Joule-mode mirrored state ----
+    ds.control_mode        = control_mode;
+    ds.joule_target_j      = joule_target_j;
+    ds.joule_max_ms        = joule_max_ms;
+    ds.joule_actual_j      = joule_actual_j;
+    ds.lead_resistance_mohm = lead_resistance_ohms * 1000.0f;
+
+    // Calibration freshness is session-based (ESP32 has no RTC).
+    ds.cal_valid   = cal_done_this_session;
+    ds.cal_age_sec = cal_done_this_session
+                         ? (uint32_t)((millis() - last_cal_ms) / 1000UL)
+                         : 0U;
+
+    // ---- Last-weld latched results ----
+    ds.last_weld_valid        = last_weld_valid;
+    ds.last_weld_was_joule    = last_weld_was_joule;
+    ds.last_weld_target_j     = last_weld_target_j;
+    ds.last_weld_energy_j     = last_weld_energy_j;
+    ds.last_weld_accuracy_pct = last_weld_accuracy_pct;
+    ds.last_weld_duration_ms  = last_weld_duration_ms;
+    ds.last_weld_peak_a       = last_weld_peak_a;
+    ds.last_weld_avg_a        = last_weld_avg_a;
+    ds.last_weld_lead_loss_j  = last_weld_lead_loss_j;
+
     ui_update(ds);
 }
 
@@ -924,6 +978,9 @@ void pollStm32Uart() {
                         isfinite(fv)) {
                         lead_resistance_ohms = fv;
                         save_lead_resistance_to_nvs();
+                        // Authoritative SET_LEAD_R round-trip (ESP32 UI or
+                        // Flask): lock out later STATUS-driven overwrites.
+                        lead_r_synced_from_status = true;
                     }
                     lead_r_update_inflight = false;
                     pending_lead_r_ohms = NAN;
@@ -1002,6 +1059,19 @@ void pollStm32Uart() {
                     if (extractFloatField(stmLine, "energy_loss_j=", fv))
                         energy_loss_j = fv;
 
+                    // ---- Dashboard / Joule-mode mirror (display state) ----
+                    if (extractIntField(stmLine, "control_mode=", iv))
+                        control_mode = (uint8_t)iv;
+                    if (extractFloatField(stmLine, "joule_target_j=", fv))
+                        joule_target_j = fv;
+                    if (extractIntField(stmLine, "joule_max_ms=", iv))
+                        joule_max_ms = (uint16_t)iv;
+                    // Live workpiece energy (lead-compensated control variable).
+                    // Present only in JOULE-mode STATUS frames; holds the last
+                    // weld's final energy between welds.
+                    if (extractFloatField(stmLine, "joule_actual=", fv))
+                        joule_actual_j = fv;
+
                     // ====
                     // RECIPE SYNC FROM STM32 STATUS
                     // ====
@@ -1042,10 +1112,17 @@ void pollStm32Uart() {
                                 weld_power_pct = (uint8_t)fv;
                             }
 
-                            // Configurable lead resistance (runtime sync from
-                            // STM32)
-                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                            // Configurable lead resistance: sync from STM32
+                            // STATUS only once at boot, and only for a valid
+                            // non-zero value. Afterwards lead_r changes solely
+                            // via calibration / SET_LEAD_R, so a stray
+                            // lead_r_ohm=0 can't flash the on-screen reading.
+                            if (!lead_r_synced_from_status &&
+                                extractFloatField(stmLine, "lead_r_ohm=", fv) &&
+                                isfinite(fv) && fv > 0.0f) {
                                 lead_resistance_ohms = fv;
+                                lead_r_synced_from_status = true;
+                            }
 
                             // Preheat
                             if (extractIntField(stmLine, "preheat_en=", iv))
@@ -1072,8 +1149,13 @@ void pollStm32Uart() {
                             // overwrite recipe globals
                             if (extractFloatField(stmLine, "power=", fv))
                                 stm_power = fv;
-                            if (extractFloatField(stmLine, "lead_r_ohm=", fv))
+                            // Boot-only, non-zero lead_r sync (see note above).
+                            if (!lead_r_synced_from_status &&
+                                extractFloatField(stmLine, "lead_r_ohm=", fv) &&
+                                isfinite(fv) && fv > 0.0f) {
                                 lead_resistance_ohms = fv;
+                                lead_r_synced_from_status = true;
+                            }
                             Serial.println(
                                 "[SYNC] Recipe sync suppressed (boot grace "
                                 "period)");
@@ -1130,6 +1212,7 @@ void pollStm32Uart() {
                     welding_now = false;
                     last_weld_time = millis();
                     weld_count++;
+                    save_weld_count_to_nvs();  // persist across power cycles
 
                     float fv_done = NAN;
                     // New energy fields (Phase 1A/1B)
@@ -1169,6 +1252,48 @@ void pollStm32Uart() {
                     if (extractFloatField(stmLine, "cap_v=", fv_done))
                         cap_v = fv_done;
 
+                    // ---- Latch last-weld results for the STATUS dashboard ----
+                    {
+                        int   iv_done = 0;
+                        float jw = NAN;   // joule workpiece energy
+                        float jl = NAN;   // joule lead loss
+                        float ew = NAN;   // time-mode weld energy
+                        float el = NAN;   // measured lead-loss energy
+
+                        if (extractIntField(stmLine, "total_ms=", iv_done))
+                            last_weld_duration_ms = (uint32_t)iv_done;
+                        if (extractFloatField(stmLine, "peak_a=", fv_done))
+                            last_weld_peak_a = fv_done;
+                        if (extractFloatField(stmLine, "avg_a=", fv_done))
+                            last_weld_avg_a = fv_done;
+
+                        extractFloatField(stmLine, "joule_workpiece_j=", jw);
+                        extractFloatField(stmLine, "joule_loss_j=", jl);
+                        extractFloatField(stmLine, "energy_weld_j=", ew);
+                        extractFloatField(stmLine, "energy_lead_j=", el);
+
+                        last_weld_was_joule = (control_mode == 1U);
+                        last_weld_target_j  = joule_target_j;
+
+                        if (last_weld_was_joule && !isnan(jw)) {
+                            last_weld_energy_j = jw;
+                        } else if (!isnan(ew)) {
+                            last_weld_energy_j = ew;
+                        }
+                        if (last_weld_was_joule && !isnan(jl)) {
+                            last_weld_lead_loss_j = jl;
+                        } else if (!isnan(el)) {
+                            last_weld_lead_loss_j = el;
+                        }
+
+                        last_weld_accuracy_pct =
+                            (last_weld_target_j > 0.0f)
+                                ? (100.0f * last_weld_energy_j /
+                                   last_weld_target_j)
+                                : 0.0f;
+                        last_weld_valid = true;
+                    }
+
                     sendToPi(stmLine);
                     sendToPi(buildStatus());
 
@@ -1204,6 +1329,35 @@ void pollStm32Uart() {
                     // (CAL_STATUS / CAL_RESULT / CAL_ERROR). Forward
                     // transparently so the Pi/Flask calibration waiter and the
                     // web UI receive progress and the final measurement.
+                    //
+                    // Debug trace: every CAL_ line is logged so we can see
+                    // exactly where the routine is (waiting for trigger,
+                    // measuring, result, error/timeout) when diagnosing a
+                    // "calibration never completes" report.
+                    Serial.print("[Cal] STM32 -> ");
+                    Serial.println(stmLine);
+
+                    if (stmLine.startsWith("CAL_RESULT")) {
+                        // Successful calibration this session: latch freshness
+                        // so the CONFIG tab can show a relative age (no RTC).
+                        cal_done_this_session = true;
+                        last_cal_ms = millis();
+                        float cal_ohm = NAN;
+                        if (extractFloatField(stmLine, "CAL_RESULT=", cal_ohm)) {
+                            lead_resistance_ohms = cal_ohm;
+                            // Authoritative: don't let a later STATUS overwrite.
+                            lead_r_synced_from_status = true;
+                        }
+                    }
+
+                    // Drive the on-device touch UI calibration status line so
+                    // it reflects live progress and leaves the "Calibrating..."
+                    // state on a terminal CAL_RESULT / CAL_ERROR (incl. the
+                    // STM32's 8 s TIMEOUT_NO_TRIGGER) instead of hanging on
+                    // "keep leads shorted" forever. (Same task as
+                    // lv_timer_handler() -> safe to touch LVGL directly.)
+                    ui_notify_cal_message(stmLine.c_str());
+
                     sendToPi(stmLine);
 
                 } else if (stmLine.startsWith("ACK,") ||
@@ -1420,6 +1574,7 @@ void processCommand(String cmd) {
 
     if (cmd == "RESET_WELD_COUNT") {
         weld_count = 0;
+        save_weld_count_to_nvs();  // persist the reset across power cycles
         Serial.println("[Weld] Counter reset to 0");
         sendToPi(buildStatus());
         return;
@@ -1744,6 +1899,22 @@ static void load_recipe_from_nvs() {
     Serial.println("[Config] Recipe loaded from NVS");
 }
 
+// ---- Weld counter persistence (survives power cycles) ----
+// Stored in its own NVS namespace so it is independent of recipe/config.
+static void save_weld_count_to_nvs() {
+    prefs.begin("weldstats", false);
+    prefs.putULong("weldCount", weld_count);
+    prefs.end();
+}
+
+static void load_weld_count_from_nvs() {
+    prefs.begin("weldstats", true);  // read-only
+    weld_count = prefs.getULong("weldCount", 0UL);
+    prefs.end();
+    Serial.printf("[Weld] Counter restored from NVS: %lu\n",
+                  (unsigned long)weld_count);
+}
+
 // =========================
 // Phase 1: Deferred boot config – sends all NVS-loaded settings to STM32
 // Called when BOOT message received OR after fallback timeout.
@@ -1994,6 +2165,47 @@ static void onContactWithPedalChange(bool enabled) {
                   enabled ? "ON" : "OFF");
 }
 
+// Callback from UI (CONFIG tab) when AUTO CALIBRATE is pressed.
+// Triggers the STM32 lead-resistance auto-calibration routine.
+static void onCalibrate() {
+    processCommand("CAL_LEAD_START");
+    Serial.println("[Cal] Lead-resistance auto-calibration started via touch UI");
+}
+
+// Callback from UI (JOULE tab) when APPLY is pressed.
+//   mode_joule = true -> JOULE control mode, false -> TIME control mode
+//   target_j   = target energy (J), max_ms = max-duration safety limit (ms)
+static void onJouleApply(bool mode_joule, float target_j, uint16_t max_ms) {
+    char buf[48];
+
+    // 1) Control mode (SET_MODE,<0=time|1=joule>)
+    snprintf(buf, sizeof(buf), "SET_MODE,%d", mode_joule ? 1 : 0);
+    processCommand(String(buf));
+    control_mode = mode_joule ? 1 : 0;
+
+    // 2) Target energy
+    snprintf(buf, sizeof(buf), "SET_JOULE_TARGET,%.1f", (double)target_j);
+    processCommand(String(buf));
+    joule_target_j = target_j;
+
+    // 3) Max-duration safety limit
+    snprintf(buf, sizeof(buf), "SET_JOULE_MAX,%u", (unsigned)max_ms);
+    processCommand(String(buf));
+    joule_max_ms = max_ms;
+
+    Serial.printf("[Joule] Applied mode=%s target=%.1fJ max=%ums via touch UI\n",
+                  mode_joule ? "JOULE" : "TIME", (double)target_j,
+                  (unsigned)max_ms);
+}
+
+// Callback from UI (CONFIG tab) when contact delay steps change.
+// SET_CONTACT_HOLD is already forwarded by onConfigChange (driven by the same
+// stepper), so this only logs to avoid a duplicate command / flash write.
+static void onContactDelayChange(uint8_t steps) {
+    Serial.printf("[Config] Contact delay set to %d step(s) via touch UI\n",
+                  (int)steps);
+}
+
 // =========================
 // Setup
 // =========================
@@ -2079,6 +2291,7 @@ void setup() {
         trigger_mode = TRIGGER_MODE_PEDAL;  // MANUAL/PEDAL
         contact_with_pedal = true;          // require pedal gating
         load_lead_resistance_from_nvs();
+        load_weld_count_from_nvs();  // restore lifetime weld counter
 
         // Push loaded config to UI widgets (display-side only)
         ui_set_config_cb(onConfigChange);
@@ -2112,7 +2325,12 @@ void setup() {
     ui_set_trigger_source_cb(onTriggerSourceChange);
     ui_set_weld_count_reset_cb(onWeldCountReset);
     ui_set_contact_with_pedal_cb(onContactWithPedalChange);
-    Serial.println("[Boot] 3/4 UI callbacks registered");
+
+    // --- New dashboard / Joule / Calibration callbacks ---
+    ui_set_calibrate_cb(onCalibrate);
+    ui_set_joule_apply_cb(onJouleApply);
+    ui_set_contact_delay_cb(onContactDelayChange);
+    Serial.println("[Boot] UI callbacks registered");
 
     // ==========================================================
     // WiFi  (non-blocking – removed blocking wait)

@@ -51,7 +51,8 @@
 #include <Arduino.h>
 #include <lvgl.h>
 #include <math.h>
-#include <stdio.h>  // for standard snprintf (supports %f)
+#include <stdio.h>   // for standard snprintf/sscanf (supports %f)
+#include <string.h>  // for strncmp (calibration message parsing)
 
 // ============================================================
 // COLORS  (dark-theme, matching web UI)
@@ -66,10 +67,6 @@
 #define C_GREY lv_color_hex(0x888888)
 #define C_DARK_GREY lv_color_hex(0x333355)
 
-static const float CFG_LEAD_R_MIN_MOHM = 0.5f;
-static const float CFG_LEAD_R_MAX_MOHM = 5.0f;
-static const int   CFG_LEAD_R_SCALE = 10;  // 0.1 mΩ slider resolution
-
 // ============================================================
 // CALLBACKS
 // ============================================================
@@ -79,6 +76,9 @@ static config_change_cb_t _config_cb = nullptr;
 static trigger_source_cb_t _trigger_cb = nullptr;
 static weld_count_reset_cb_t _weld_reset_cb = nullptr;
 static contact_with_pedal_cb_t _cwp_cb = nullptr;
+static calibrate_cb_t _calibrate_cb = nullptr;
+static joule_apply_cb_t _joule_apply_cb = nullptr;
+static contact_delay_cb_t _contact_delay_cb = nullptr;
 
 // ============================================================
 // GLOBAL CONFIG STATE (Config tab v1)
@@ -238,41 +238,80 @@ static lv_obj_t* lbl_cfg_load_last = nullptr;
 static lv_obj_t* btn_cfg_load_last = nullptr;
 static lv_obj_t* lbl_cfg_brightness = nullptr;
 static lv_obj_t* btn_cfg_brightness = nullptr;
-static lv_obj_t* lbl_cfg_hold_time = nullptr;
-static lv_obj_t* btn_cfg_hold_time = nullptr;
+static lv_obj_t* lbl_cfg_hold_time = nullptr;     // contact delay value label
+static lv_obj_t* btn_cfg_hold_time_dec = nullptr; // contact delay [-]
+static lv_obj_t* btn_cfg_hold_time_inc = nullptr; // contact delay [+]
 static lv_obj_t* lbl_cfg_cwp = nullptr;  // Contact With Pedal label
 static lv_obj_t* btn_cfg_cwp = nullptr;  // Contact With Pedal button
-static lv_obj_t* slider_cfg_lead_r = nullptr;
-static lv_obj_t* lbl_cfg_lead_r = nullptr;
+
+// Config: Calibration section handles
+static lv_obj_t* lbl_cfg_cal_leadr = nullptr;   // read-only lead R value
+static lv_obj_t* lbl_cfg_cal_age = nullptr;     // calibration age
+static lv_obj_t* btn_cfg_calibrate = nullptr;   // AUTO CALIBRATE button
+static lv_obj_t* lbl_cfg_calibrate = nullptr;   // button label
+static lv_obj_t* lbl_cfg_cal_status = nullptr;  // status / hint line
 
 // ============================================================
 // STATIC UI HANDLES  (Status tab)
 // ============================================================
+// Power-monitoring value labels (Status dashboard)
 static lv_obj_t* lbl_pack_v = nullptr;
 static lv_obj_t* lbl_temp = nullptr;
 static lv_obj_t* lbl_ichg = nullptr;
 static lv_obj_t* lbl_cell1 = nullptr;
 static lv_obj_t* lbl_cell2 = nullptr;
 static lv_obj_t* lbl_cell3 = nullptr;
-static lv_obj_t* lbl_weld_v = nullptr;
-static lv_obj_t* lbl_weld_drop = nullptr;
-static lv_obj_t* lbl_cap_drop = nullptr;
-static lv_obj_t* lbl_energy_cap = nullptr;
-static lv_obj_t* lbl_energy_weld = nullptr;
-static lv_obj_t* lbl_energy_loss = nullptr;
+
+// System-info box labels (Status dashboard)
+static lv_obj_t* lbl_dash_mode = nullptr;     // control mode line
+static lv_obj_t* btn_dash_trigger = nullptr;  // trigger line (long-press swap)
+static lv_obj_t* lbl_dash_trigger = nullptr;  // trigger line text
+static lv_obj_t* lbl_dash_leadr = nullptr;    // lead R + cal age line
+
+// Last-weld result labels (Status dashboard)
+// Layout: Duration | Peak | Avg | Joules
+static lv_obj_t* lbl_lw_duration = nullptr;
+static lv_obj_t* lbl_lw_peak = nullptr;
+static lv_obj_t* lbl_lw_avg = nullptr;     // average current (A)
+static lv_obj_t* lbl_lw_joules = nullptr;  // workpiece energy (J) – moved here from Joule tab
+
 static lv_obj_t* btn_arm = nullptr;
 static lv_obj_t* lbl_arm = nullptr;
 static lv_obj_t* lbl_state = nullptr;
 static lv_obj_t* lbl_weld_cnt = nullptr;  // Weld Counter value label
 static lv_obj_t* btn_weld_cnt =
     nullptr;  // Weld Counter clickable area (for reset)
-static lv_obj_t* btn_trigger_pedal = nullptr;  // Pedal trigger button
-static lv_obj_t* btn_trigger_probe = nullptr;  // Probe trigger button
-static lv_obj_t* lbl_trigger_pedal = nullptr;  // Pedal button label
-static lv_obj_t* lbl_trigger_probe = nullptr;  // Probe button label
 
 static bool _last_armed = false;
 static uint8_t _trigger_mode = 1;  // 1=Pedal, 2=Probe Contact
+static uint8_t _dash_contact_steps = 2;  // for trigger-line delay text
+
+// Long-press tracking for the dashboard trigger line (swap Pedal<->Contact)
+static const uint32_t TRIGGER_LONGPRESS_MS = 600;
+static uint32_t _trig_press_start = 0;
+static bool _trig_longpress_fired = false;
+
+// ============================================================
+// STATIC UI HANDLES  (Joule tab)
+// ============================================================
+static lv_obj_t* btn_joule_mode_time = nullptr;
+static lv_obj_t* btn_joule_mode_joule = nullptr;
+static lv_obj_t* lbl_joule_target = nullptr;
+static lv_obj_t* lbl_joule_maxdur = nullptr;
+static lv_obj_t* btn_joule_apply = nullptr;
+static lv_obj_t* lbl_joule_apply = nullptr;
+
+// Joule-tab draft state (edited locally; committed on APPLY)
+static bool     _joule_draft_mode = false;   // false=TIME, true=JOULE
+static float    _joule_draft_target = 50.0f; // J
+static uint16_t _joule_draft_maxms = 40;     // ms
+static bool     _joule_draft_init = false;   // synced from state once
+static const float    JOULE_TARGET_MIN = 1.0f;
+static const float    JOULE_TARGET_MAX = 300.0f;
+static const float    JOULE_TARGET_STEP = 1.0f;
+static const uint16_t JOULE_MAXMS_MIN = 10;
+static const uint16_t JOULE_MAXMS_MAX = 200;
+static const uint16_t JOULE_MAXMS_STEP = 5;
 
 // ============================================================
 // TAB OBJECT HANDLES  (file-scope so ui_init and ui_mark_settings_applied share
@@ -280,7 +319,7 @@ static uint8_t _trigger_mode = 1;  // 1=Pedal, 2=Probe Contact
 // ============================================================
 static lv_obj_t* tab_status = nullptr;
 static lv_obj_t* tab_pulse = nullptr;
-static lv_obj_t* tab_telemetry = nullptr;
+static lv_obj_t* tab_joule = nullptr;
 static lv_obj_t* tab_config = nullptr;
 static lv_obj_t* tab_logs = nullptr;
 
@@ -494,33 +533,55 @@ static void on_weld_count_reset(lv_event_t* e) {
 }
 
 // ============================================================
-// TRIGGER SOURCE BUTTON EVENTS (2 separate buttons)
+// DASHBOARD TRIGGER LINE – long-press to swap Pedal <-> Contact
 // ============================================================
-static void paint_trigger_buttons(uint8_t mode) {
-    if (btn_trigger_pedal) {
-        lv_obj_set_style_bg_color(btn_trigger_pedal,
-                                  mode == 1 ? C_ACCENT : C_DARK_GREY, 0);
+static const char* trigger_mode_name(uint8_t mode) {
+    return (mode == 2) ? "Contact" : "Pedal";
+}
+
+// Repaint the trigger line text + color. Highlight while a long-press is held.
+static void paint_dash_trigger(bool holding) {
+    if (lbl_dash_trigger) {
+        char buf[64];
+        // Pedal mode: show just "Pedal" (delay is not used).
+        // Contact mode: show "Contact X.Xs" with the contact/probe delay.
+        if (_trigger_mode == 2) {
+            float delay_s = 0.5f * (float)_dash_contact_steps;
+            snprintf(buf, sizeof(buf), "Contact %.1fs", (double)delay_s);
+        } else {
+            snprintf(buf, sizeof(buf), "Pedal");
+        }
+        lv_label_set_text(lbl_dash_trigger, buf);
+        lv_obj_set_style_text_color(
+            lbl_dash_trigger,
+            holding ? C_YELLOW : (_trigger_mode == 2 ? C_GREEN : C_ACCENT),
+            LV_PART_MAIN);
     }
-    if (btn_trigger_probe) {
-        lv_obj_set_style_bg_color(btn_trigger_probe,
-                                  mode == 2 ? C_GREEN : C_DARK_GREY, 0);
+    if (btn_dash_trigger) {
+        lv_obj_set_style_bg_color(btn_dash_trigger,
+                                  holding ? C_DARK_GREY : C_CARD, 0);
     }
 }
 
-static void on_trigger_pedal(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (_trigger_mode == 1) return;  // already selected
-    _trigger_mode = 1;
-    paint_trigger_buttons(1);
-    if (_trigger_cb) _trigger_cb(1);
-}
-
-static void on_trigger_probe(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (_trigger_mode == 2) return;  // already selected
-    _trigger_mode = 2;
-    paint_trigger_buttons(2);
-    if (_trigger_cb) _trigger_cb(2);
+// Long-press handler on the trigger line: hold ~600ms to toggle source.
+static void on_dash_trigger_event(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        _trig_press_start = millis();
+        _trig_longpress_fired = false;
+        paint_dash_trigger(true);  // visual feedback: holding
+    } else if (code == LV_EVENT_PRESSING) {
+        if (!_trig_longpress_fired &&
+            (millis() - _trig_press_start) >= TRIGGER_LONGPRESS_MS) {
+            _trig_longpress_fired = true;
+            // Swap Pedal <-> Contact
+            _trigger_mode = (_trigger_mode == 1) ? 2 : 1;
+            paint_dash_trigger(false);
+            if (_trigger_cb) _trigger_cb(_trigger_mode);
+        }
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        paint_dash_trigger(false);
+    }
 }
 
 // ============================================================
@@ -529,6 +590,8 @@ static void on_trigger_probe(lv_event_t* e) {
 static void arm_btn_event(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
 
+    // Suppress the click that ends a long-press swap gesture on the
+    // trigger line (defensive – they are separate widgets, but keep safe).
     bool requested = !_last_armed;
     if (_arm_cb) {
         _arm_cb(requested);
@@ -568,7 +631,49 @@ static lv_obj_t* make_card(lv_obj_t* parent, const char* title,
 }
 
 // ============================================================
-// STATUS TAB BUILDER
+// STATUS TAB HELPERS – dashboard panels and stat cells
+// ============================================================
+
+// Create a bare panel (Widget-A safe, non-clickable container) for grouping.
+static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
+    lv_obj_t* p = lv_obj_create(parent);
+    lv_obj_remove_style_all(p);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(p, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(p, w, h);
+    lv_obj_set_pos(p, x, y);
+    lv_obj_set_style_bg_color(p, C_CARD, 0);
+    lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(p, 10, 0);
+    lv_obj_set_style_border_color(p, C_DARK_GREY, 0);
+    lv_obj_set_style_border_width(p, 1, 0);
+    lv_obj_set_scrollbar_mode(p, LV_SCROLLBAR_MODE_OFF);
+    return p;
+}
+
+// Create a small "title + value" stat cell inside a parent panel.
+static void make_stat_cell(lv_obj_t* parent, const char* title,
+                           lv_obj_t** out_val, int x, int y, int w, int h,
+                           const lv_font_t* val_font) {
+    lv_obj_t* cell = make_panel(parent, x, y, w, h);
+    lv_obj_set_style_bg_color(cell, C_BG, 0);
+
+    lv_obj_t* t = lv_label_create(cell);
+    lv_label_set_text(t, title);
+    lv_obj_set_style_text_color(t, C_GREY, 0);
+    lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+    lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+    lv_obj_t* v = lv_label_create(cell);
+    lv_label_set_text(v, "--");
+    lv_obj_set_style_text_color(v, C_WHITE, 0);
+    lv_obj_set_style_text_font(v, val_font, 0);
+    lv_obj_align(v, LV_ALIGN_BOTTOM_MID, 0, -8);
+    if (out_val) *out_val = v;
+}
+
+// ============================================================
+// STATUS TAB BUILDER – Dashboard layout
 // ============================================================
 static void build_status_tab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
@@ -579,17 +684,99 @@ static void build_status_tab(lv_obj_t* tab) {
     const int CONTENT_W = 780;
     const int GAP = 10;
 
-    // --- Top row under tabs: Weld Counter (left), Trigger Source (right) ---
-    const int TOP_ROW_Y = 0;
+    // ---------------------------------------------------------
+    // ROW 1 (y=0..58): compact info strip
+    //   MODE | TRIGGER (clickable) | LEAD R | WELDS (tap to reset)
+    // Each box has a small grey title (top) and a value (bottom).
+    // ---------------------------------------------------------
+    const int R1_Y = 0;
+    const int R1_H = 58;
+    const int MODE_W = 150;
+    const int TRIG_W = 280;
+    const int LEADR_W = 200;
+    const int WELDS_W = 120;
+    const int MODE_X = 0;
+    const int TRIG_X = MODE_X + MODE_W + GAP;     // 160
+    const int LEADR_X = TRIG_X + TRIG_W + GAP;    // 450
+    const int WELDS_X = LEADR_X + LEADR_W + GAP;  // 660 (ends at 780)
 
-    // Weld Counter – enlarged clickable card (tap to reset)
+    // ---- MODE box ----
+    {
+        lv_obj_t* p = make_panel(tab, MODE_X, R1_Y, MODE_W, R1_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "MODE");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
+
+        lbl_dash_mode = lv_label_create(p);
+        lv_label_set_text(lbl_dash_mode, "TIME");
+        lv_obj_set_style_text_color(lbl_dash_mode, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_dash_mode, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_mode, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // ---- TRIGGER box (clickable; long-press toggles Pedal<->Contact) ----
+    {
+        btn_dash_trigger = lv_obj_create(tab);
+        lv_obj_remove_style_all(btn_dash_trigger);
+        lv_obj_add_flag(btn_dash_trigger, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(btn_dash_trigger, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(btn_dash_trigger, TRIG_W, R1_H);
+        lv_obj_set_pos(btn_dash_trigger, TRIG_X, R1_Y);
+        lv_obj_set_style_bg_color(btn_dash_trigger, C_CARD, 0);
+        lv_obj_set_style_bg_opa(btn_dash_trigger, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(btn_dash_trigger, 10, 0);
+        lv_obj_set_style_border_color(btn_dash_trigger, C_DARK_GREY, 0);
+        lv_obj_set_style_border_width(btn_dash_trigger, 1, 0);
+        lv_obj_set_scrollbar_mode(btn_dash_trigger, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_add_event_cb(btn_dash_trigger, on_dash_trigger_event,
+                            LV_EVENT_PRESSED, nullptr);
+        lv_obj_add_event_cb(btn_dash_trigger, on_dash_trigger_event,
+                            LV_EVENT_PRESSING, nullptr);
+        lv_obj_add_event_cb(btn_dash_trigger, on_dash_trigger_event,
+                            LV_EVENT_RELEASED, nullptr);
+        lv_obj_add_event_cb(btn_dash_trigger, on_dash_trigger_event,
+                            LV_EVENT_PRESS_LOST, nullptr);
+        make_interaction_safe(btn_dash_trigger);
+
+        lv_obj_t* t = lv_label_create(btn_dash_trigger);
+        lv_label_set_text(t, "TRIGGER");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
+
+        lbl_dash_trigger = lv_label_create(btn_dash_trigger);
+        lv_label_set_text(lbl_dash_trigger, "Pedal");
+        lv_obj_set_style_text_color(lbl_dash_trigger, C_ACCENT, 0);
+        lv_obj_set_style_text_font(lbl_dash_trigger, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_trigger, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // ---- LEAD R box ----
+    {
+        lv_obj_t* p = make_panel(tab, LEADR_X, R1_Y, LEADR_W, R1_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "LEAD R");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
+
+        lbl_dash_leadr = lv_label_create(p);
+        lv_label_set_text(lbl_dash_leadr, "-- m");
+        lv_obj_set_style_text_color(lbl_dash_leadr, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_dash_leadr, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_dash_leadr, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // ---- WELDS box (clickable; tap to reset counter) ----
     {
         btn_weld_cnt = lv_obj_create(tab);
         lv_obj_remove_style_all(btn_weld_cnt);
         lv_obj_add_flag(btn_weld_cnt, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_clear_flag(btn_weld_cnt, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(btn_weld_cnt, 200, 52);
-        lv_obj_set_pos(btn_weld_cnt, 4, TOP_ROW_Y);
+        lv_obj_set_size(btn_weld_cnt, WELDS_W, R1_H);
+        lv_obj_set_pos(btn_weld_cnt, WELDS_X, R1_Y);
         lv_obj_set_style_bg_color(btn_weld_cnt, C_CARD, 0);
         lv_obj_set_style_bg_opa(btn_weld_cnt, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(btn_weld_cnt, 10, 0);
@@ -601,127 +788,133 @@ static void build_status_tab(lv_obj_t* tab) {
         make_interaction_safe(btn_weld_cnt);
 
         lv_obj_t* lbl_title = lv_label_create(btn_weld_cnt);
-        lv_label_set_text(lbl_title, "Weld Count " LV_SYMBOL_REFRESH);
+        lv_label_set_text(lbl_title, "WELDS " LV_SYMBOL_REFRESH);
         lv_obj_set_style_text_color(lbl_title, C_GREY, LV_PART_MAIN);
         lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14,
                                    LV_PART_MAIN);
-        lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 2);
+        lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, 5);
 
         lbl_weld_cnt = lv_label_create(btn_weld_cnt);
         lv_label_set_text(lbl_weld_cnt, "0");
         lv_obj_set_style_text_color(lbl_weld_cnt, C_GREEN, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_24,
+        lv_obj_set_style_text_font(lbl_weld_cnt, &lv_font_montserrat_20,
                                    LV_PART_MAIN);
-        lv_obj_align(lbl_weld_cnt, LV_ALIGN_BOTTOM_MID, 0, -2);
+        lv_obj_align(lbl_weld_cnt, LV_ALIGN_BOTTOM_MID, 0, -6);
     }
 
-    // Trigger Source – 2 separate buttons: Pedal and Probe
-    {
-        lv_obj_t* lbl_title = lv_label_create(tab);
-        lv_label_set_text(lbl_title, "Trigger:");
-        lv_obj_set_style_text_color(lbl_title, C_GREY, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_14,
-                                   LV_PART_MAIN);
-        lv_obj_set_pos(lbl_title, CONTENT_W - 310, TOP_ROW_Y + 16);
-
-        const int TRIG_BTN_W = 120;
-        const int TRIG_BTN_H = 44;
-        const int TRIG_GAP = 8;
-        const int TRIG_X = CONTENT_W - 260;
-
-        // Pedal button
-        btn_trigger_pedal = lv_obj_create(tab);
-        lv_obj_remove_style_all(btn_trigger_pedal);
-        lv_obj_add_flag(btn_trigger_pedal, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_clear_flag(btn_trigger_pedal, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(btn_trigger_pedal, TRIG_BTN_W, TRIG_BTN_H);
-        lv_obj_set_pos(btn_trigger_pedal, TRIG_X, TOP_ROW_Y + 4);
-        lv_obj_set_style_bg_color(btn_trigger_pedal, C_ACCENT,
-                                  0);  // default active
-        lv_obj_set_style_bg_opa(btn_trigger_pedal, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(btn_trigger_pedal, 8, 0);
-        lv_obj_set_scrollbar_mode(btn_trigger_pedal, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_add_event_cb(btn_trigger_pedal, on_trigger_pedal,
-                            LV_EVENT_CLICKED, nullptr);
-        make_interaction_safe(btn_trigger_pedal);
-
-        lbl_trigger_pedal = lv_label_create(btn_trigger_pedal);
-        lv_label_set_text(lbl_trigger_pedal, "Pedal");
-        lv_obj_set_style_text_color(lbl_trigger_pedal, C_WHITE, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_trigger_pedal, &lv_font_montserrat_16,
-                                   LV_PART_MAIN);
-        lv_obj_center(lbl_trigger_pedal);
-
-        // Probe button
-        btn_trigger_probe = lv_obj_create(tab);
-        lv_obj_remove_style_all(btn_trigger_probe);
-        lv_obj_add_flag(btn_trigger_probe, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_clear_flag(btn_trigger_probe, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_size(btn_trigger_probe, TRIG_BTN_W, TRIG_BTN_H);
-        lv_obj_set_pos(btn_trigger_probe, TRIG_X + TRIG_BTN_W + TRIG_GAP,
-                       TOP_ROW_Y + 4);
-        lv_obj_set_style_bg_color(btn_trigger_probe, C_DARK_GREY,
-                                  0);  // default inactive
-        lv_obj_set_style_bg_opa(btn_trigger_probe, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(btn_trigger_probe, 8, 0);
-        lv_obj_set_scrollbar_mode(btn_trigger_probe, LV_SCROLLBAR_MODE_OFF);
-        lv_obj_add_event_cb(btn_trigger_probe, on_trigger_probe,
-                            LV_EVENT_CLICKED, nullptr);
-        make_interaction_safe(btn_trigger_probe);
-
-        lbl_trigger_probe = lv_label_create(btn_trigger_probe);
-        lv_label_set_text(lbl_trigger_probe, "Probe");
-        lv_obj_set_style_text_color(lbl_trigger_probe, C_WHITE, LV_PART_MAIN);
-        lv_obj_set_style_text_font(lbl_trigger_probe, &lv_font_montserrat_16,
-                                   LV_PART_MAIN);
-        lv_obj_center(lbl_trigger_probe);
-    }
-
-    // --- DISARMED label removed (redundant – ARM button shows state) ---
-    // lbl_state kept as a hidden handle for ui_update state tracking
+    // hidden state handle (kept for ui_update internal state tracking)
     lbl_state = lv_label_create(tab);
     lv_label_set_text(lbl_state, "DISARMED");
     lv_obj_add_flag(lbl_state, LV_OBJ_FLAG_HIDDEN);
 
-    // --- Status cards – moved lower for better spacing ---
-    const int card_w = (CONTENT_W - 2 * GAP) / 3;
-    const int card_h = 90;
-    const int y_row1 = 58;  // pushed down to accommodate enlarged top row
-    int x = (CONTENT_W - (card_w * 3 + GAP * 2)) / 2;
+    // ---------------------------------------------------------
+    // ROW 2 (y=68..160): Power monitoring – 4 columns
+    //   PACK | CELLS | TEMPERATURE | CHARGING
+    // ---------------------------------------------------------
+    const int PWR_Y = 68;
+    const int PWR_H = 92;
+    const int PACK_W = 195;
+    const int CELLS_W = 150;  // narrower / compact
+    const int TEMP_W = 195;
+    const int CHG_W = 210;
+    const int PACK_X = 0;
+    const int CELLS_X = PACK_X + PACK_W + GAP;   // 205
+    const int TEMP_X = CELLS_X + CELLS_W + GAP;  // 365
+    const int CHG_X = TEMP_X + TEMP_W + GAP;     // 570 (ends at 780)
 
-    lv_obj_t* c1 = make_card(tab, "Pack Voltage", &lbl_pack_v, card_w, card_h);
-    lv_obj_set_pos(c1, x, y_row1);
-    lv_obj_t* c2 = make_card(tab, "Temperature", &lbl_temp, card_w, card_h);
-    lv_obj_set_pos(c2, x + card_w + GAP, y_row1);
-    lv_obj_t* c3 = make_card(tab, "Charger Current", &lbl_ichg, card_w, card_h);
-    lv_obj_set_pos(c3, x + 2 * (card_w + GAP), y_row1);
+    // PACK column – voltage only (charge current moved to CHARGING)
+    {
+        lv_obj_t* p = make_panel(tab, PACK_X, PWR_Y, PACK_W, PWR_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "PACK");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
 
-    const int y_row2 = y_row1 + card_h + GAP;
-    const int cell_w = (CONTENT_W - 2 * GAP) / 3;
-    const int cell_h = 80;
-    int cx = (CONTENT_W - (cell_w * 3 + GAP * 2)) / 2;
+        lbl_pack_v = lv_label_create(p);
+        lv_label_set_text(lbl_pack_v, "-- V");
+        lv_obj_set_style_text_color(lbl_pack_v, C_GREEN, 0);
+        lv_obj_set_style_text_font(lbl_pack_v, &lv_font_montserrat_24, 0);
+        lv_obj_align(lbl_pack_v, LV_ALIGN_CENTER, 0, 8);
+    }
 
-    lv_obj_t* cc1 = make_card(tab, "Cell 1", &lbl_cell1, cell_w, cell_h,
-                              &lv_font_montserrat_14);
-    lv_obj_set_pos(cc1, cx, y_row2);
-    lv_obj_t* cc2 = make_card(tab, "Cell 2", &lbl_cell2, cell_w, cell_h,
-                              &lv_font_montserrat_14);
-    lv_obj_set_pos(cc2, cx + cell_w + GAP, y_row2);
-    lv_obj_t* cc3 = make_card(tab, "Cell 3", &lbl_cell3, cell_w, cell_h,
-                              &lv_font_montserrat_14);
-    lv_obj_set_pos(cc3, cx + 2 * (cell_w + GAP), y_row2);
+    // CELLS column – compact C1/C2/C3 (narrow panel)
+    //   No "CELLS" title: the three cell voltages are bumped up one font size
+    //   (16->18) and centred as a group inside the panel (offsets -26/0/+26).
+    {
+        lv_obj_t* p = make_panel(tab, CELLS_X, PWR_Y, CELLS_W, PWR_H);
 
-    // Telemetry diagnostics moved to dedicated Telemetry tab to keep
-    // the Arm/Disarm control fully visible on the safety-critical Status tab.
+        lbl_cell1 = lv_label_create(p);
+        lv_label_set_text(lbl_cell1, "C1: -- V");
+        lv_obj_set_style_text_color(lbl_cell1, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_cell1, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell1, LV_ALIGN_CENTER, 0, -26);
 
-    // ARM button – plain lv_obj (Widget A pattern – NO lv_button!)
-    const int y_arm = y_row2 + cell_h + GAP + 4;
+        lbl_cell2 = lv_label_create(p);
+        lv_label_set_text(lbl_cell2, "C2: -- V");
+        lv_obj_set_style_text_color(lbl_cell2, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_cell2, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell2, LV_ALIGN_CENTER, 0, 0);
+
+        lbl_cell3 = lv_label_create(p);
+        lv_label_set_text(lbl_cell3, "C3: -- V");
+        lv_obj_set_style_text_color(lbl_cell3, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_cell3, &lv_font_montserrat_18, 0);
+        lv_obj_align(lbl_cell3, LV_ALIGN_CENTER, 0, 26);
+    }
+
+    // TEMPERATURE column – value only
+    {
+        lv_obj_t* p = make_panel(tab, TEMP_X, PWR_Y, TEMP_W, PWR_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "TEMPERATURE");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+        lbl_temp = lv_label_create(p);
+        lv_label_set_text(lbl_temp, "-- \xC2\xB0\x43");
+        lv_obj_set_style_text_color(lbl_temp, C_GREEN, 0);
+        lv_obj_set_style_text_font(lbl_temp, &lv_font_montserrat_24, 0);
+        lv_obj_align(lbl_temp, LV_ALIGN_CENTER, 0, 8);
+
+        // lbl_health intentionally not created: status line removed.
+        // The pointer stays nullptr so ui_update()'s guarded writes no-op.
+    }
+
+    // CHARGING column – charge current value only (no "Chg:" prefix)
+    {
+        lv_obj_t* p = make_panel(tab, CHG_X, PWR_Y, CHG_W, PWR_H);
+        lv_obj_t* t = lv_label_create(p);
+        lv_label_set_text(t, "CHARGING");
+        lv_obj_set_style_text_color(t, C_GREY, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
+        lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 6);
+
+        lbl_ichg = lv_label_create(p);
+        lv_label_set_text(lbl_ichg, "-- A");
+        lv_obj_set_style_text_color(lbl_ichg, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_ichg, &lv_font_montserrat_24, 0);
+        lv_obj_align(lbl_ichg, LV_ALIGN_CENTER, 0, 8);
+    }
+
+    // ---------------------------------------------------------
+    // ROW 3 (y=191..257): ARM/DISARM button – prominent but compact.
+    // Centred horizontally; also centred VERTICALLY in the gap between ROW 2
+    // (ends y=160) and the Last Weld bar (top y=288): gap=128, button=66, so
+    // ARM_Y = 160 + (128-66)/2 = 191 (equal ~31px above & below).
+    // ---------------------------------------------------------
+    const int ARM_W = 320;
+    const int ARM_H = 66;
+    const int ARM_Y = 191;
+    const int ARM_X = (CONTENT_W - ARM_W) / 2;  // 230 (centred)
+
     btn_arm = lv_obj_create(tab);
     lv_obj_remove_style_all(btn_arm);
     lv_obj_add_flag(btn_arm, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_clear_flag(btn_arm, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(btn_arm, 260, 56);
-    lv_obj_align(btn_arm, LV_ALIGN_TOP_MID, 0, y_arm);
+    lv_obj_set_size(btn_arm, ARM_W, ARM_H);
+    lv_obj_set_pos(btn_arm, ARM_X, ARM_Y);
     lv_obj_set_style_bg_color(btn_arm, C_RED, 0);
     lv_obj_set_style_bg_opa(btn_arm, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_arm, 12, 0);
@@ -731,9 +924,59 @@ static void build_status_tab(lv_obj_t* tab) {
 
     lbl_arm = lv_label_create(btn_arm);
     lv_label_set_text(lbl_arm, "DISARMED  (tap to arm)");
+    lv_obj_set_style_text_align(lbl_arm, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(lbl_arm, C_WHITE, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_arm, &lv_font_montserrat_14, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lbl_arm, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_center(lbl_arm);
+
+    // ---------------------------------------------------------
+    // ROW 4 (y=288..416): Last Weld results – pushed to the very bottom.
+    //   Duration | Peak | Avg | Joules
+    // ---------------------------------------------------------
+    // IMPORTANT (display geometry + safety margin):
+    //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
+    //   at the very bottom of this board are prone to a DMA/PSRAM timing
+    //   glitch ("scrambled line at the bottom").
+    //   Coordinate math: a STATUS-tab child at child-y Y sits at absolute
+    //   screen-y = 42 (top tab bar) + 10 (tab pad_top) + Y. The tab's usable
+    //   content height is 418px (480 - 42 tab bar - 2*10 pad), so child-y
+    //   ranges 0..418. We push Last Weld to child-y 288 (bottom child-y 416,
+    //   absolute screen-y 468) — that's the practical maximum: it leaves a
+    //   ~12px clear band above the screen bottom (480) so nothing lands in the
+    //   glitchy scanlines. Do NOT push LW_Y past ~290 / bottom child-y past
+    //   ~418. (Bottom here = 288+128 = 416 -> screen-y 468.)
+    const int LW_Y = 288;
+    const int LW_H = 128;
+    {
+        lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
+
+        lv_obj_t* t = lv_label_create(box);
+        lv_label_set_text(t, "LAST WELD");
+        lv_obj_set_style_text_color(t, C_ACCENT, 0);
+        lv_obj_set_style_text_font(t, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(t, 12, 6);
+
+        const int cell_y = 30;
+        const int cell_h = 88;
+        const int cell_w = 180;
+        const int cell_gap = (CONTENT_W - 4 * cell_w) / 5;  // even spacing
+        int cx = cell_gap;
+
+        make_stat_cell(box, "Duration", &lbl_lw_duration, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Peak", &lbl_lw_peak, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Avg", &lbl_lw_avg, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+        cx += cell_w + cell_gap;
+        make_stat_cell(box, "Joules", &lbl_lw_joules, cx, cell_y, cell_w,
+                       cell_h, &lv_font_montserrat_24);
+    }
+
+    // Initialise trigger-line text
+    paint_dash_trigger(false);
 }
 
 // ============================================================
@@ -1288,45 +1531,236 @@ static void build_pulse_tab(lv_obj_t* tab) {
     lv_obj_add_flag(lbl_pending, LV_OBJ_FLAG_HIDDEN);
 }
 
+// Forward declaration (defined with the Config tab helpers below)
+static lv_obj_t* make_cfg_button(lv_obj_t* parent, const char* text,
+                                 lv_obj_t** out_label, int x, int y, int w,
+                                 int h, lv_color_t bg_color);
+
 // ============================================================
-// TELEMETRY TAB BUILDER (Phase 1B diagnostics moved off Status tab)
+// JOULE TAB: draft clamping + label refresh
 // ============================================================
-static void build_telemetry_tab(lv_obj_t* tab) {
+static void clamp_joule_draft() {
+    if (!isfinite(_joule_draft_target)) _joule_draft_target = 50.0f;
+    if (_joule_draft_target < JOULE_TARGET_MIN)
+        _joule_draft_target = JOULE_TARGET_MIN;
+    if (_joule_draft_target > JOULE_TARGET_MAX)
+        _joule_draft_target = JOULE_TARGET_MAX;
+    if (_joule_draft_maxms < JOULE_MAXMS_MIN)
+        _joule_draft_maxms = JOULE_MAXMS_MIN;
+    if (_joule_draft_maxms > JOULE_MAXMS_MAX)
+        _joule_draft_maxms = JOULE_MAXMS_MAX;
+}
+
+static void paint_joule_tab() {
+    clamp_joule_draft();
+
+    // Mode selector colors
+    if (btn_joule_mode_time)
+        lv_obj_set_style_bg_color(
+            btn_joule_mode_time, _joule_draft_mode ? C_DARK_GREY : C_ACCENT, 0);
+    if (btn_joule_mode_joule)
+        lv_obj_set_style_bg_color(
+            btn_joule_mode_joule, _joule_draft_mode ? C_GREEN : C_DARK_GREY, 0);
+
+    if (lbl_joule_target) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%.0f J", (double)_joule_draft_target);
+        lv_label_set_text(lbl_joule_target, buf);
+    }
+    if (lbl_joule_maxdur) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u ms", (unsigned)_joule_draft_maxms);
+        lv_label_set_text(lbl_joule_maxdur, buf);
+    }
+}
+
+// ============================================================
+// JOULE TAB: event handlers
+// ============================================================
+static void on_joule_mode_time(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _joule_draft_mode = false;
+    paint_joule_tab();
+}
+
+static void on_joule_mode_joule(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _joule_draft_mode = true;
+    paint_joule_tab();
+}
+
+static void on_joule_target_dec(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _joule_draft_target -= JOULE_TARGET_STEP;
+    paint_joule_tab();
+}
+
+static void on_joule_target_inc(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _joule_draft_target += JOULE_TARGET_STEP;
+    paint_joule_tab();
+}
+
+static void on_joule_maxdur_dec(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (_joule_draft_maxms >= JOULE_MAXMS_MIN + JOULE_MAXMS_STEP)
+        _joule_draft_maxms -= JOULE_MAXMS_STEP;
+    else
+        _joule_draft_maxms = JOULE_MAXMS_MIN;
+    paint_joule_tab();
+}
+
+static void on_joule_maxdur_inc(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    _joule_draft_maxms += JOULE_MAXMS_STEP;
+    paint_joule_tab();
+}
+
+static void on_joule_apply(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    clamp_joule_draft();
+    if (_joule_apply_cb)
+        _joule_apply_cb(_joule_draft_mode, _joule_draft_target,
+                        _joule_draft_maxms);
+    if (lbl_joule_apply) lv_label_set_text(lbl_joule_apply, "APPLIED");
+}
+
+// ============================================================
+// JOULE TAB BUILDER (replaces Telemetry): energy target + safety limit
+// ============================================================
+static void build_joule_tab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
     lv_obj_set_style_pad_all(tab, 10, LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
-    const int CONTENT_W = 780;
-    const int GAP = 10;
-    const int card_w = (CONTENT_W - GAP) / 2;
-    const int card_h = 106;
-    const int x0 = (CONTENT_W - (2 * card_w + GAP)) / 2;
-    const int y0 = 6;
+    const int LABEL_X = 14;
+    int y = 6;
 
-    lv_obj_t* m1 = make_card(tab, "Weld Voltage", &lbl_weld_v, card_w, card_h,
-                             &lv_font_montserrat_14);
-    lv_obj_set_pos(m1, x0, y0);
+    // ---- Mode selector ----
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Welding Mode");
+        lv_obj_set_style_text_color(lbl, C_GREY, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y);
+    }
+    y += 28;
+    {
+        lv_obj_t* l1 = nullptr;
+        btn_joule_mode_time = make_cfg_button(tab, "TIME (ms)", &l1, LABEL_X, y,
+                                              250, 56, C_DARK_GREY);
+        lv_obj_set_style_text_font(l1, &lv_font_montserrat_20, 0);
+        lv_obj_add_event_cb(btn_joule_mode_time, on_joule_mode_time,
+                            LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t* m2 = make_card(tab, "Weld V Drop", &lbl_weld_drop, card_w, card_h,
-                             &lv_font_montserrat_14);
-    lv_obj_set_pos(m2, x0 + card_w + GAP, y0);
+        lv_obj_t* l2 = nullptr;
+        btn_joule_mode_joule = make_cfg_button(tab, "JOULE (energy)", &l2,
+                                               LABEL_X + 266, y, 250, 56,
+                                               C_DARK_GREY);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_20, 0);
+        lv_obj_add_event_cb(btn_joule_mode_joule, on_joule_mode_joule,
+                            LV_EVENT_CLICKED, nullptr);
+    }
+    y += 56 + 22;
 
-    lv_obj_t* m3 = make_card(tab, "Cap V Drop", &lbl_cap_drop, card_w, card_h,
-                             &lv_font_montserrat_14);
-    lv_obj_set_pos(m3, x0, y0 + card_h + GAP);
+    // ---- Target Energy stepper ----
+    const int STEP_W = 70;
+    const int VAL_W = 180;
+    const int DEC_X = LABEL_X;
+    const int VAL_X = DEC_X + STEP_W + 10;
+    const int INC_X = VAL_X + VAL_W + 10;
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Target Energy");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y);
+    }
+    y += 26;
+    {
+        lv_obj_t* l = nullptr;
+        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 60,
+                                      C_DARK_GREY);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(d, on_joule_target_dec, LV_EVENT_CLICKED, nullptr);
 
-    lv_obj_t* e1 = make_card(tab, "E Cap (J)", &lbl_energy_cap, card_w, card_h,
-                             &lv_font_montserrat_14);
-    lv_obj_set_pos(e1, x0 + card_w + GAP, y0 + card_h + GAP);
+        lbl_joule_target = lv_label_create(tab);
+        lv_label_set_text(lbl_joule_target, "50 J");
+        lv_obj_set_style_text_color(lbl_joule_target, C_ACCENT, 0);
+        lv_obj_set_style_text_font(lbl_joule_target, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_align(lbl_joule_target, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(lbl_joule_target, VAL_W);
+        lv_obj_set_pos(lbl_joule_target, VAL_X, y + 8);
 
-    lv_obj_t* e2 = make_card(tab, "E Weld (J)", &lbl_energy_weld, card_w,
-                             card_h, &lv_font_montserrat_14);
-    lv_obj_set_pos(e2, x0, y0 + 2 * (card_h + GAP));
+        lv_obj_t* l2 = nullptr;
+        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 60,
+                                      C_DARK_GREY);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(i, on_joule_target_inc, LV_EVENT_CLICKED, nullptr);
+    }
+    y += 60 + 18;
 
-    lv_obj_t* e3 = make_card(tab, "E Loss (J)", &lbl_energy_loss, card_w,
-                             card_h, &lv_font_montserrat_14);
-    lv_obj_set_pos(e3, x0 + card_w + GAP, y0 + 2 * (card_h + GAP));
+    // ---- Max Duration (safety limit) stepper ----
+    {
+        lv_obj_t* lbl = lv_label_create(tab);
+        lv_label_set_text(lbl, "Max Duration (safety limit)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y);
+    }
+    y += 26;
+    {
+        lv_obj_t* l = nullptr;
+        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 56,
+                                      C_DARK_GREY);
+        lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(d, on_joule_maxdur_dec, LV_EVENT_CLICKED, nullptr);
+
+        lbl_joule_maxdur = lv_label_create(tab);
+        lv_label_set_text(lbl_joule_maxdur, "40 ms");
+        lv_obj_set_style_text_color(lbl_joule_maxdur, C_YELLOW, 0);
+        lv_obj_set_style_text_font(lbl_joule_maxdur, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_align(lbl_joule_maxdur, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(lbl_joule_maxdur, VAL_W);
+        lv_obj_set_pos(lbl_joule_maxdur, VAL_X, y + 14);
+
+        lv_obj_t* l2 = nullptr;
+        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 56,
+                                      C_DARK_GREY);
+        lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(i, on_joule_maxdur_inc, LV_EVENT_CLICKED, nullptr);
+    }
+    y += 56 + 18;
+
+    // ---- APPLY button ----
+    btn_joule_apply =
+        make_cfg_button(tab, "APPLY", &lbl_joule_apply, LABEL_X, y, 250, 56,
+                        C_GREEN);
+    lv_obj_set_style_text_font(lbl_joule_apply, &lv_font_montserrat_24, 0);
+    lv_obj_add_event_cb(btn_joule_apply, on_joule_apply, LV_EVENT_CLICKED,
+                        nullptr);
+
+    // NOTE: the live workpiece-Joules readout was intentionally removed from
+    // this tab. The measured energy is shown on the STATUS tab's "Last Weld"
+    // section (Duration | Peak | Avg | Joules) instead.
+
+    // ---- Note (right side) ----
+    {
+        lv_obj_t* note = lv_label_create(tab);
+        lv_label_set_text(
+            note,
+            "JOULE mode fires until the measured weld energy reaches the "
+            "target, then stops. Max Duration caps the pulse length for "
+            "safety. TIME mode uses the pulse timing set on the PULSE tab.");
+        lv_obj_set_style_text_color(note, C_GREY, 0);
+        lv_obj_set_style_text_font(note, &lv_font_montserrat_16, 0);
+        lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(note, 240);
+        lv_obj_set_pos(note, 530, y - 130);
+    }
+
+    paint_joule_tab();
 }
 
 // ============================================================
@@ -1496,26 +1930,15 @@ static void update_cfg_cwp_label() {
             btn_cfg_cwp, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY, 0);
 }
 
-static float clamp_cfg_lead_r_mohm(float value) {
-    float clamped = value;
-    if (!isfinite(clamped)) clamped = 2.0f;
-    if (clamped < CFG_LEAD_R_MIN_MOHM) clamped = CFG_LEAD_R_MIN_MOHM;
-    if (clamped > CFG_LEAD_R_MAX_MOHM) clamped = CFG_LEAD_R_MAX_MOHM;
-    return clamped;
-}
-
-static void update_cfg_lead_r_label() {
-    _cfg.lead_resistance_mohm = clamp_cfg_lead_r_mohm(_cfg.lead_resistance_mohm);
-
-    if (slider_cfg_lead_r) {
-        int slider_value = (int)lroundf(_cfg.lead_resistance_mohm * CFG_LEAD_R_SCALE);
-        lv_slider_set_value(slider_cfg_lead_r, slider_value, LV_ANIM_OFF);
-    }
-
-    if (lbl_cfg_lead_r) {
-        char text[24];
-        snprintf(text, sizeof(text), "%.1f mΩ", (double)_cfg.lead_resistance_mohm);
-        lv_label_set_text(lbl_cfg_lead_r, text);
+// ============================================================
+// CONFIG TAB: Calibration section helpers (read-only display)
+// ============================================================
+static void update_cfg_cal_labels() {
+    if (lbl_cfg_cal_leadr) {
+        char text[32];
+        snprintf(text, sizeof(text), "%.1fm",
+                 (double)_cfg.lead_resistance_mohm);
+        lv_label_set_text(lbl_cfg_cal_leadr, text);
     }
 }
 
@@ -1594,12 +2017,34 @@ static void on_cfg_brightness(lv_event_t* e) {
     notify_config_changed();
 }
 
-static void on_cfg_hold_time(lv_event_t* e) {
+static void on_cfg_hold_time_dec(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    // Cycle: 1(0.5s) -> ... -> 10(5.0s) -> 1(0.5s)
-    _cfg.contact_hold_steps = (_cfg.contact_hold_steps % 10) + 1;
+    if (_cfg.contact_hold_steps > 1) _cfg.contact_hold_steps--;
     update_cfg_hold_time_label();
     notify_config_changed();
+    if (_contact_delay_cb) _contact_delay_cb(_cfg.contact_hold_steps);
+}
+
+static void on_cfg_hold_time_inc(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (_cfg.contact_hold_steps < 10) _cfg.contact_hold_steps++;
+    update_cfg_hold_time_label();
+    notify_config_changed();
+    if (_contact_delay_cb) _contact_delay_cb(_cfg.contact_hold_steps);
+}
+
+// ============================================================
+// CONFIG TAB: AUTO CALIBRATE button handler
+// ============================================================
+static void on_cfg_calibrate(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (lbl_cfg_cal_status) {
+        // Initial hint only; the live status is driven by ui_notify_cal_message()
+        // as CAL_STATUS/CAL_RESULT/CAL_ERROR lines arrive from the STM32.
+        lv_label_set_text(lbl_cfg_cal_status, "Starting calibration...");
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_ACCENT, LV_PART_MAIN);
+    }
+    if (_calibrate_cb) _calibrate_cb();
 }
 
 static void on_cfg_cwp_toggle(lv_event_t* e) {
@@ -1608,26 +2053,6 @@ static void on_cfg_cwp_toggle(lv_event_t* e) {
     update_cfg_cwp_label();
     notify_config_changed();
     if (_cwp_cb) _cwp_cb(_cfg.contact_with_pedal);
-}
-
-static void on_cfg_lead_r_slider(lv_event_t* e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code != LV_EVENT_VALUE_CHANGED && code != LV_EVENT_RELEASED) return;
-
-    if (!slider_cfg_lead_r) return;
-
-    int raw = lv_slider_get_value(slider_cfg_lead_r);
-    float mohm = clamp_cfg_lead_r_mohm((float)raw / (float)CFG_LEAD_R_SCALE);
-
-    if (fabsf(_cfg.lead_resistance_mohm - mohm) > 0.0001f) {
-        _cfg.lead_resistance_mohm = mohm;
-    }
-
-    update_cfg_lead_r_label();
-
-    if (code == LV_EVENT_RELEASED) {
-        notify_config_changed();
-    }
 }
 
 // ============================================================
@@ -1643,9 +2068,16 @@ static void build_config_tab(lv_obj_t* tab) {
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_scroll_snap_y(tab, LV_SCROLL_SNAP_NONE);
 
-    // Scrollable inner container for all settings
+    // Inner container for all settings. This is a *plain* container – the
+    // scrolling is owned exclusively by the parent `tab`. Previously this
+    // container kept its default LV_OBJ_FLAG_SCROLLABLE flag, which created a
+    // nested scrollable inside the scrollable tab. The two scroll areas then
+    // fought over each touch (scroll chaining), producing the slow / sticky
+    // feel. Clearing the flag here makes the Config page scroll as one smooth
+    // surface.
     lv_obj_t* cont = lv_obj_create(tab);
     lv_obj_remove_style_all(cont);
+    lv_obj_clear_flag(cont, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_width(cont, 780);
     lv_obj_set_style_bg_color(cont, C_BG, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(cont, LV_OPA_COVER, 0);
@@ -1657,25 +2089,143 @@ static void build_config_tab(lv_obj_t* tab) {
     const int BTN_W = 140;
     const int BTN_H = 48;
     const int ROW_H = 60;
+    // +/- stepper geometry (dec [value] inc)
+    const int STEP_W = 56;
+    const int STEP_DEC_X = BTN_X;
+    const int STEP_VAL_X = BTN_X + STEP_W + 8;
+    const int STEP_VAL_W = 120;
+    const int STEP_INC_X = STEP_VAL_X + STEP_VAL_W + 8;
     int y = 4;
 
-    // ---- Section: Editing ----
-    make_section_header(cont, "Editing", LABEL_X, y);
+    // ============================================================
+    // ---- Section: CALIBRATION ----
+    // ============================================================
+    make_section_header(cont, "Calibration", LABEL_X, y);
     y += 32;
 
-    // Hold-to-repeat
+    // Measured lead resistance (read-only)
     {
         lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "Hold-to-repeat (+/- buttons)");
+        lv_label_set_text(lbl, "Lead Resistance (measured)");
         lv_obj_set_style_text_color(lbl, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_hold_repeat = make_cfg_button(
-        cont, _cfg.hold_to_repeat ? "ON" : "OFF", &lbl_cfg_hold_repeat, BTN_X,
-        y, BTN_W, BTN_H, _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
-    lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat,
-                        LV_EVENT_CLICKED, nullptr);
+    lbl_cfg_cal_leadr = lv_label_create(cont);
+    lv_label_set_text(lbl_cfg_cal_leadr, "-- m");
+    lv_obj_set_style_text_color(lbl_cfg_cal_leadr, C_ACCENT, 0);
+    lv_obj_set_style_text_font(lbl_cfg_cal_leadr, &lv_font_montserrat_20, 0);
+    lv_obj_set_pos(lbl_cfg_cal_leadr, BTN_X, y + 10);
+    y += ROW_H;
+
+    // Calibration age (read-only)
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Last Calibrated");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    lbl_cfg_cal_age = lv_label_create(cont);
+    lv_label_set_text(lbl_cfg_cal_age, "\xE2\x80\x94");
+    lv_obj_set_style_text_color(lbl_cfg_cal_age, C_GREY, 0);
+    lv_obj_set_style_text_font(lbl_cfg_cal_age, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(lbl_cfg_cal_age, BTN_X, y + 12);
+    y += ROW_H;
+
+    // AUTO CALIBRATE button (large)
+    btn_cfg_calibrate =
+        make_cfg_button(cont, "AUTO CALIBRATE", &lbl_cfg_calibrate, LABEL_X, y,
+                        320, 56, C_ACCENT);
+    lv_obj_set_style_text_font(lbl_cfg_calibrate, &lv_font_montserrat_20, 0);
+    lv_obj_add_event_cb(btn_cfg_calibrate, on_cfg_calibrate, LV_EVENT_CLICKED,
+                        nullptr);
+    // Calibration status line (right of the button)
+    lbl_cfg_cal_status = lv_label_create(cont);
+    lv_label_set_text(lbl_cfg_cal_status, "Short the leads, then press");
+    lv_obj_set_style_text_color(lbl_cfg_cal_status, C_GREY, 0);
+    lv_obj_set_style_text_font(lbl_cfg_cal_status, &lv_font_montserrat_14, 0);
+    lv_label_set_long_mode(lbl_cfg_cal_status, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_cfg_cal_status, 380);
+    lv_obj_set_pos(lbl_cfg_cal_status, LABEL_X + 332, y + 8);
+    y += 56 + 16;
+
+    // ============================================================
+    // ---- Section: TRIGGER SETTINGS ----
+    // ============================================================
+    make_section_header(cont, "Trigger Settings", LABEL_X, y);
+    y += 32;
+
+    // Contact Delay  [-]  value  [+]
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Contact Delay");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    {
+        lv_obj_t* lbl_dec = nullptr;
+        btn_cfg_hold_time_dec =
+            make_cfg_button(cont, "-", &lbl_dec, STEP_DEC_X, y, STEP_W, BTN_H,
+                            C_DARK_GREY);
+        lv_obj_set_style_text_font(lbl_dec, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(btn_cfg_hold_time_dec, on_cfg_hold_time_dec,
+                            LV_EVENT_CLICKED, nullptr);
+
+        lbl_cfg_hold_time = lv_label_create(cont);
+        lv_label_set_text(lbl_cfg_hold_time,
+                          hold_time_text(_cfg.contact_hold_steps));
+        lv_obj_set_style_text_color(lbl_cfg_hold_time, C_ACCENT, 0);
+        lv_obj_set_style_text_font(lbl_cfg_hold_time, &lv_font_montserrat_20, 0);
+        lv_obj_set_style_text_align(lbl_cfg_hold_time, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(lbl_cfg_hold_time, STEP_VAL_W);
+        lv_obj_set_pos(lbl_cfg_hold_time, STEP_VAL_X, y + 14);
+
+        lv_obj_t* lbl_inc = nullptr;
+        btn_cfg_hold_time_inc =
+            make_cfg_button(cont, "+", &lbl_inc, STEP_INC_X, y, STEP_W, BTN_H,
+                            C_DARK_GREY);
+        lv_obj_set_style_text_font(lbl_inc, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(btn_cfg_hold_time_inc, on_cfg_hold_time_inc,
+                            LV_EVENT_CLICKED, nullptr);
+    }
+    y += ROW_H;
+
+    // Contact With Pedal ON/OFF
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Contact With Pedal");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_cwp = make_cfg_button(
+        cont, _cfg.contact_with_pedal ? "ON" : "OFF", &lbl_cfg_cwp, BTN_X, y,
+        BTN_W, BTN_H, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_cwp, on_cfg_cwp_toggle, LV_EVENT_CLICKED,
+                        nullptr);
+    y += ROW_H + 12;
+
+    // ============================================================
+    // ---- Section: DISPLAY & INPUT ----
+    // ============================================================
+    make_section_header(cont, "Display & Input", LABEL_X, y);
+    y += 32;
+
+    // Screen Brightness
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Screen Brightness");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    btn_cfg_brightness =
+        make_cfg_button(cont, brightness_text(_cfg.brightness),
+                        &lbl_cfg_brightness, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
+    lv_obj_add_event_cb(btn_cfg_brightness, on_cfg_brightness, LV_EVENT_CLICKED,
+                        nullptr);
     y += ROW_H;
 
     // Time Step
@@ -1706,81 +2256,26 @@ static void build_config_tab(lv_obj_t* tab) {
                         &lbl_cfg_power_step, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
     lv_obj_add_event_cb(btn_cfg_power_step, on_cfg_power_step, LV_EVENT_CLICKED,
                         nullptr);
-    y += ROW_H + 12;
-
-    // ---- Section: Trigger ----
-    make_section_header(cont, "Trigger", LABEL_X, y);
-    y += 32;
-
-    // Contact/Probe Hold Time
-    {
-        lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "Contact/Probe Hold Time");
-        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y + 12);
-    }
-    btn_cfg_hold_time =
-        make_cfg_button(cont, hold_time_text(_cfg.contact_hold_steps),
-                        &lbl_cfg_hold_time, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_hold_time, on_cfg_hold_time, LV_EVENT_CLICKED,
-                        nullptr);
     y += ROW_H;
 
-    // Contact With Pedal ON/OFF
+    // Hold-to-repeat
     {
         lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "Contact With Pedal");
+        lv_label_set_text(lbl, "Hold-to-repeat (+/- buttons)");
         lv_obj_set_style_text_color(lbl, C_WHITE, 0);
         lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
         lv_obj_set_pos(lbl, LABEL_X, y + 12);
     }
-    btn_cfg_cwp = make_cfg_button(
-        cont, _cfg.contact_with_pedal ? "ON" : "OFF", &lbl_cfg_cwp, BTN_X, y,
-        BTN_W, BTN_H, _cfg.contact_with_pedal ? C_GREEN : C_DARK_GREY);
-    lv_obj_add_event_cb(btn_cfg_cwp, on_cfg_cwp_toggle, LV_EVENT_CLICKED,
-                        nullptr);
-    y += ROW_H;
-
-    // Lead resistance (mΩ)
-    {
-        lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "Lead Resistance (mΩ)");
-        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y + 12);
-    }
-
-    slider_cfg_lead_r = lv_slider_create(cont);
-    lv_obj_set_size(slider_cfg_lead_r, BTN_W + 80, 12);
-    lv_obj_set_pos(slider_cfg_lead_r, BTN_X, y + 18);
-    lv_slider_set_range(slider_cfg_lead_r,
-                        (int)lroundf(CFG_LEAD_R_MIN_MOHM * CFG_LEAD_R_SCALE),
-                        (int)lroundf(CFG_LEAD_R_MAX_MOHM * CFG_LEAD_R_SCALE));
-    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_DARK_GREY, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_ACCENT, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_color(slider_cfg_lead_r, C_WHITE, LV_PART_KNOB);
-    lv_obj_set_style_bg_opa(slider_cfg_lead_r, LV_OPA_COVER, LV_PART_KNOB);
-    lv_obj_set_style_radius(slider_cfg_lead_r, 6, LV_PART_MAIN);
-    lv_obj_set_style_radius(slider_cfg_lead_r, 6, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(slider_cfg_lead_r, 10, LV_PART_KNOB);
-    lv_obj_add_event_cb(slider_cfg_lead_r, on_cfg_lead_r_slider,
-                        LV_EVENT_VALUE_CHANGED, nullptr);
-    lv_obj_add_event_cb(slider_cfg_lead_r, on_cfg_lead_r_slider,
-                        LV_EVENT_RELEASED, nullptr);
-    make_interaction_safe(slider_cfg_lead_r);
-
-    lbl_cfg_lead_r = lv_label_create(cont);
-    lv_obj_set_style_text_color(lbl_cfg_lead_r, C_ACCENT, 0);
-    lv_obj_set_style_text_font(lbl_cfg_lead_r, &lv_font_montserrat_16, 0);
-    lv_obj_set_pos(lbl_cfg_lead_r, BTN_X + BTN_W + 92, y + 10);
-    update_cfg_lead_r_label();
-
+    btn_cfg_hold_repeat = make_cfg_button(
+        cont, _cfg.hold_to_repeat ? "ON" : "OFF", &lbl_cfg_hold_repeat, BTN_X,
+        y, BTN_W, BTN_H, _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
+    lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat,
+                        LV_EVENT_CLICKED, nullptr);
     y += ROW_H + 12;
 
-    // ---- Section: Startup ----
+    // ============================================================
+    // ---- Section: STARTUP ----
+    // ============================================================
     make_section_header(cont, "Startup", LABEL_X, y);
     y += 32;
 
@@ -1797,26 +2292,32 @@ static void build_config_tab(lv_obj_t* tab) {
         y, BTN_W, BTN_H, _cfg.load_last_on_boot ? C_GREEN : C_DARK_GREY);
     lv_obj_add_event_cb(btn_cfg_load_last, on_cfg_load_last, LV_EVENT_CLICKED,
                         nullptr);
-    y += ROW_H + 12;
+    y += ROW_H + 16;
 
-    // ---- Section: Display ----
-    make_section_header(cont, "Display", LABEL_X, y);
-    y += 32;
-
-    // Screen Brightness
+    // ============================================================
+    // ---- Firmware info footer ----
+    // ============================================================
+    {
+        lv_obj_t* line = lv_obj_create(cont);
+        lv_obj_remove_style_all(line);
+        lv_obj_set_size(line, 740, 2);
+        lv_obj_set_pos(line, LABEL_X, y);
+        lv_obj_set_style_bg_color(line, C_DARK_GREY, 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_COVER, 0);
+    }
+    y += 14;
     {
         lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "Screen Brightness");
-        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+        lv_label_set_text(lbl,
+                          "Spot Welder UI  \xE2\x80\xA2  ESP32 + STM32G474  "
+                          "\xE2\x80\xA2  LVGL 9.1");
+        lv_obj_set_style_text_color(lbl, C_GREY, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y);
     }
-    btn_cfg_brightness =
-        make_cfg_button(cont, brightness_text(_cfg.brightness),
-                        &lbl_cfg_brightness, BTN_X, y, BTN_W, BTN_H, C_ACCENT);
-    lv_obj_add_event_cb(btn_cfg_brightness, on_cfg_brightness, LV_EVENT_CLICKED,
-                        nullptr);
-    y += ROW_H + 20;
+    y += 24;
+
+    update_cfg_cal_labels();
 
     // Set container height to fit all content
     lv_obj_set_height(cont, y);
@@ -1866,14 +2367,14 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
 
     tab_status = lv_tabview_add_tab(tv, LV_SYMBOL_HOME " Status");
     tab_pulse = lv_tabview_add_tab(tv, LV_SYMBOL_CHARGE " Pulse");
-    tab_telemetry = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Telemetry");
+    tab_joule = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Joule");
     tab_config = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Config");
     tab_logs = lv_tabview_add_tab(tv, LV_SYMBOL_BELL " Logs");
 
     // Build all tab contents now that tab objects exist
     build_status_tab(tab_status);
     build_pulse_tab(tab_pulse);
-    build_telemetry_tab(tab_telemetry);
+    build_joule_tab(tab_joule);
     build_config_tab(tab_config);
     build_placeholder_tab(tab_logs, "Logs");
 
@@ -1889,10 +2390,23 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     lv_obj_clear_flag(tab_pulse, LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_set_scrollbar_mode(tab_pulse, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_clear_flag(tab_telemetry, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_clear_flag(tab_telemetry, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_joule, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(tab_joule, LV_OBJ_FLAG_GESTURE_BUBBLE);
 
+    // Config tab keeps vertical scrolling but is tuned for a smooth feel:
+    //  - GESTURE_BUBBLE off  : touch gestures don't bubble up to the tabview.
+    //  - SCROLL_CHAIN off    : no scroll chaining to parent (the inner
+    //                          container is now non-scrollable, so the only
+    //                          scroller is this tab – keep it self-contained).
+    //  - SCROLL_MOMENTUM on  : flick/throw scrolling continues with inertia
+    //                          instead of stopping dead, which is what made
+    //                          the page feel slow and sticky.
+    //  - SCROLL_ELASTIC off  : remove the rubber-band drag-back that adds a
+    //                          laggy, fighting sensation on a resistive panel.
     lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_clear_flag(tab_config, LV_OBJ_FLAG_SCROLL_ELASTIC);
+    lv_obj_add_flag(tab_config, LV_OBJ_FLAG_SCROLL_MOMENTUM);
 
     lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_clear_flag(tab_logs, LV_OBJ_FLAG_GESTURE_BUBBLE);
@@ -1981,12 +2495,6 @@ void ui_update(const WelderDisplayState& st) {
     static float prev_cell1 = -999.0f;
     static float prev_cell2 = -999.0f;
     static float prev_cell3 = -999.0f;
-    static float prev_weld_v = -999.0f;
-    static float prev_weld_drop = -999.0f;
-    static float prev_cap_drop = -999.0f;
-    static float prev_energy_cap = -999.0f;
-    static float prev_energy_weld = -999.0f;
-    static float prev_energy_loss = -999.0f;
     static bool prev_armed = false;
     static bool prev_welding = false;
     static bool prev_charging = false;
@@ -2038,66 +2546,128 @@ void ui_update(const WelderDisplayState& st) {
 
     // ---- Cell Voltages ----
     if (lbl_cell1 && (first_run || fabsf(st.cell1_v - prev_cell1) >= 0.001f)) {
-        snprintf(buf, sizeof(buf), "%.3f V", (double)st.cell1_v);
+        snprintf(buf, sizeof(buf), "C1: %.3f V", (double)st.cell1_v);
         lv_label_set_text(lbl_cell1, buf);
         prev_cell1 = st.cell1_v;
     }
     if (lbl_cell2 && (first_run || fabsf(st.cell2_v - prev_cell2) >= 0.001f)) {
-        snprintf(buf, sizeof(buf), "%.3f V", (double)st.cell2_v);
+        snprintf(buf, sizeof(buf), "C2: %.3f V", (double)st.cell2_v);
         lv_label_set_text(lbl_cell2, buf);
         prev_cell2 = st.cell2_v;
     }
     if (lbl_cell3 && (first_run || fabsf(st.cell3_v - prev_cell3) >= 0.001f)) {
-        snprintf(buf, sizeof(buf), "%.3f V", (double)st.cell3_v);
+        snprintf(buf, sizeof(buf), "C3: %.3f V", (double)st.cell3_v);
         lv_label_set_text(lbl_cell3, buf);
         prev_cell3 = st.cell3_v;
     }
 
-    // ---- Phase 1B voltage/energy cards ----
-    if (lbl_weld_v && (first_run || fabsf(st.weld_v - prev_weld_v) >= 0.01f)) {
-        snprintf(buf, sizeof(buf), "%.2f V", (double)st.weld_v);
-        lv_label_set_text(lbl_weld_v, buf);
-        prev_weld_v = st.weld_v;
+    // ---- Dashboard: Mode line ----
+    {
+        static uint8_t prev_mode = 0xFF;
+        if (lbl_dash_mode && (first_run || st.control_mode != prev_mode)) {
+            lv_label_set_text(lbl_dash_mode,
+                              st.control_mode == 1 ? "JOULE" : "TIME");
+            prev_mode = st.control_mode;
+        }
     }
 
-    if (lbl_weld_drop &&
-        (first_run || fabsf(st.weld_v_drop - prev_weld_drop) >= 0.005f)) {
-        snprintf(buf, sizeof(buf), "%.3f V", (double)st.weld_v_drop);
-        lv_label_set_text(lbl_weld_drop, buf);
-        lv_obj_set_style_text_color(lbl_weld_drop,
-                                    (st.weld_v_drop > 0.30f) ? C_RED : C_GREEN,
-                                    LV_PART_MAIN);
-        prev_weld_drop = st.weld_v_drop;
+    // ---- Dashboard: Lead resistance + Config calibration labels ----
+    {
+        // main.cpp latches lead_r so it only changes on boot / calibration /
+        // SET_LEAD_R (never from periodic STATUS), so this change-detector now
+        // effectively fires only on those events. Ignore non-positive values
+        // so a transient 0 can never paint a "0.0m" reading.
+        static float prev_leadr = -999.0f;
+        if (st.lead_resistance_mohm > 0.0001f &&
+            (first_run || fabsf(st.lead_resistance_mohm - prev_leadr) >= 0.005f)) {
+            if (lbl_dash_leadr) {
+                snprintf(buf, sizeof(buf), "%.1fm",
+                         (double)st.lead_resistance_mohm);
+                lv_label_set_text(lbl_dash_leadr, buf);
+            }
+            // keep config draft + read-only label in sync
+            _cfg.lead_resistance_mohm = st.lead_resistance_mohm;
+            update_cfg_cal_labels();
+            prev_leadr = st.lead_resistance_mohm;
+        }
     }
 
-    if (lbl_cap_drop &&
-        (first_run || fabsf(st.cap_v_drop - prev_cap_drop) >= 0.005f)) {
-        snprintf(buf, sizeof(buf), "%.3f V", (double)st.cap_v_drop);
-        lv_label_set_text(lbl_cap_drop, buf);
-        lv_obj_set_style_text_color(lbl_cap_drop,
-                                    (st.cap_v_drop > 0.40f) ? C_RED : C_GREEN,
-                                    LV_PART_MAIN);
-        prev_cap_drop = st.cap_v_drop;
+    // ---- Dashboard: Calibration age (Config tab) ----
+    {
+        static int32_t prev_cal_age = -2;
+        int32_t age = st.cal_valid ? (int32_t)st.cal_age_sec : -1;
+        if (lbl_cfg_cal_age && (first_run || age != prev_cal_age)) {
+            if (!st.cal_valid) {
+                lv_label_set_text(lbl_cfg_cal_age, "\xE2\x80\x94 (not this session)");
+                lv_obj_set_style_text_color(lbl_cfg_cal_age, C_GREY,
+                                            LV_PART_MAIN);
+            } else {
+                uint32_t s = st.cal_age_sec;
+                if (s < 60)
+                    snprintf(buf, sizeof(buf), "%lus ago", (unsigned long)s);
+                else if (s < 3600)
+                    snprintf(buf, sizeof(buf), "%lum ago",
+                             (unsigned long)(s / 60));
+                else
+                    snprintf(buf, sizeof(buf), "%luh ago",
+                             (unsigned long)(s / 3600));
+                lv_label_set_text(lbl_cfg_cal_age, buf);
+                lv_obj_set_style_text_color(lbl_cfg_cal_age, C_GREEN,
+                                            LV_PART_MAIN);
+            }
+            prev_cal_age = age;
+        }
     }
 
-    if (lbl_energy_cap &&
-        (first_run || fabsf(st.energy_cap_j - prev_energy_cap) >= 0.05f)) {
-        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_cap_j);
-        lv_label_set_text(lbl_energy_cap, buf);
-        prev_energy_cap = st.energy_cap_j;
+    // ---- Last Weld results: Duration | Peak | Avg | Joules ----
+    {
+        static bool  prev_lw_valid = false;
+        static float prev_lw_energy = -999.0f;
+        static float prev_lw_peak = -999.0f;
+        static float prev_lw_avg = -999.0f;
+        static uint32_t prev_lw_dur = 0xFFFFFFFF;
+        bool changed = first_run || st.last_weld_valid != prev_lw_valid ||
+                       fabsf(st.last_weld_energy_j - prev_lw_energy) >= 0.05f ||
+                       fabsf(st.last_weld_peak_a - prev_lw_peak) >= 1.0f ||
+                       fabsf(st.last_weld_avg_a - prev_lw_avg) >= 1.0f ||
+                       st.last_weld_duration_ms != prev_lw_dur;
+        if (changed) {
+            if (!st.last_weld_valid) {
+                if (lbl_lw_duration) lv_label_set_text(lbl_lw_duration, "--");
+                if (lbl_lw_peak) lv_label_set_text(lbl_lw_peak, "--");
+                if (lbl_lw_avg) lv_label_set_text(lbl_lw_avg, "--");
+                if (lbl_lw_joules) lv_label_set_text(lbl_lw_joules, "--");
+            } else {
+                if (lbl_lw_duration) {
+                    snprintf(buf, sizeof(buf), "%u ms",
+                             (unsigned)st.last_weld_duration_ms);
+                    lv_label_set_text(lbl_lw_duration, buf);
+                }
+                if (lbl_lw_peak) {
+                    snprintf(buf, sizeof(buf), "%.0f A",
+                             (double)st.last_weld_peak_a);
+                    lv_label_set_text(lbl_lw_peak, buf);
+                }
+                if (lbl_lw_avg) {
+                    snprintf(buf, sizeof(buf), "%.0f A",
+                             (double)st.last_weld_avg_a);
+                    lv_label_set_text(lbl_lw_avg, buf);
+                }
+                // Joules: measured workpiece energy delivered (moved from Joule tab).
+                if (lbl_lw_joules) {
+                    snprintf(buf, sizeof(buf), "%.1f J",
+                             (double)st.last_weld_energy_j);
+                    lv_label_set_text(lbl_lw_joules, buf);
+                }
+            }
+            prev_lw_valid = st.last_weld_valid;
+            prev_lw_energy = st.last_weld_energy_j;
+            prev_lw_peak = st.last_weld_peak_a;
+            prev_lw_avg = st.last_weld_avg_a;
+            prev_lw_dur = st.last_weld_duration_ms;
+        }
     }
-    if (lbl_energy_weld &&
-        (first_run || fabsf(st.energy_weld_j - prev_energy_weld) >= 0.05f)) {
-        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_weld_j);
-        lv_label_set_text(lbl_energy_weld, buf);
-        prev_energy_weld = st.energy_weld_j;
-    }
-    if (lbl_energy_loss &&
-        (first_run || fabsf(st.energy_loss_j - prev_energy_loss) >= 0.05f)) {
-        snprintf(buf, sizeof(buf), "%.2f", (double)st.energy_loss_j);
-        lv_label_set_text(lbl_energy_loss, buf);
-        prev_energy_loss = st.energy_loss_j;
-    }
+
 
     // ---- Weld Counter ----
     {
@@ -2110,13 +2680,19 @@ void ui_update(const WelderDisplayState& st) {
         }
     }
 
-    // ---- Trigger Source sync from state (2 buttons) ----
+    // ---- Dashboard trigger line sync from state ----
+    // Don't stomp the value while the user is holding a long-press swap.
     {
         static uint8_t prev_trigger = 0xFF;
-        if (first_run || st.trigger_mode != prev_trigger) {
+        static uint8_t prev_contact_steps = 0xFF;
+        bool changed = first_run || st.trigger_mode != prev_trigger ||
+                       st.contact_hold_steps != prev_contact_steps;
+        if (changed && !_trig_longpress_fired) {
             _trigger_mode = st.trigger_mode;
-            paint_trigger_buttons(_trigger_mode);
+            _dash_contact_steps = st.contact_hold_steps;
+            paint_dash_trigger(false);
             prev_trigger = st.trigger_mode;
+            prev_contact_steps = st.contact_hold_steps;
         }
     }
 
@@ -2149,9 +2725,22 @@ void ui_update(const WelderDisplayState& st) {
             }
             lv_label_set_text(lbl_state, txt);
             lv_obj_set_style_text_color(lbl_state, col, LV_PART_MAIN);
+            // NOTE: the old dashboard "HEALTH" column status line (lbl_health)
+            // was removed when ROW 2 was reorganised into 4 columns
+            // (PACK/CELLS/TEMPERATURE/CHARGING).  ARM/WELDING/CHARGING state is
+            // still shown by the big ARM button + System Info box above.
         }
         prev_welding = st.welding;
         prev_charging = st.charging;
+    }
+
+    // ---- Joule tab: seed draft from applied state once (don't stomp edits) ----
+    if (!_joule_draft_init) {
+        _joule_draft_mode = (st.control_mode == 1);
+        if (st.joule_target_j > 0.0f) _joule_draft_target = st.joule_target_j;
+        if (st.joule_max_ms > 0) _joule_draft_maxms = st.joule_max_ms;
+        _joule_draft_init = true;
+        paint_joule_tab();
     }
 
     // ============================================================
@@ -2273,7 +2862,7 @@ void ui_load_config(const ConfigState& cfg) {
     update_cfg_brightness_label();
     update_cfg_cwp_label();
     update_cfg_hold_time_label();
-    update_cfg_lead_r_label();
+    update_cfg_cal_labels();
     // Apply step sizes to spinboxes
     apply_time_step_to_spinboxes();
 }
@@ -2287,3 +2876,98 @@ void ui_set_weld_count_reset_cb(weld_count_reset_cb_t cb) {
 }
 
 void ui_set_contact_with_pedal_cb(contact_with_pedal_cb_t cb) { _cwp_cb = cb; }
+
+void ui_set_calibrate_cb(calibrate_cb_t cb) { _calibrate_cb = cb; }
+
+// ----------------------------------------------------------------------------
+// Calibration progress feedback (CONFIG tab status line)
+//
+// main.cpp's UART poll forwards every STM32 "CAL_*" line here so the touch UI
+// stops being stuck on "Calibrating... keep leads shorted".  The STM32
+// protocol (see performLeadCalibration() in STM32G474CE/src/main.c) emits:
+//
+//   CAL_STATUS=WAITING_FOR_TRIGGER        -> waiting for pedal press / contact
+//   CAL_STATUS=CONTACT_DETECTED_HOLDING   -> tips touching, hold to fire
+//   CAL_STATUS=TRIGGER_DETECTED           -> trigger seen
+//   CAL_STATUS=MEASURING                  -> firing test pulse
+//   CAL_RESULT=<ohms>                     -> SUCCESS (terminal)
+//   CAL_ERROR=<reason>[,...]              -> FAILURE (terminal)
+//
+// The key UX fix: WAITING_FOR_TRIGGER means the operator must actually fire
+// the configured trigger (press the pedal, or hold the tips shorted in
+// contact mode) — simply shorting the leads is not enough in pedal mode.  We
+// surface that instruction instead of the misleading static "keep leads
+// shorted" text, and we always leave the in-progress state on a terminal
+// CAL_RESULT / CAL_ERROR (or the STM32's 8 s TIMEOUT_NO_TRIGGER).
+void ui_notify_cal_message(const char* line) {
+    if (!line || !lbl_cfg_cal_status) return;
+
+    const char* msg = nullptr;
+    lv_color_t col = C_GREY;
+
+    if (strncmp(line, "CAL_RESULT=", 11) == 0) {
+        // Success: STM32 reports resistance in ohms.  Show it in mΩ.
+        float ohms = 0.0f;
+        char buf[48];
+        if (sscanf(line + 11, "%f", &ohms) == 1) {
+            snprintf(buf, sizeof(buf), "Done: %.1fm \xE2\x9C\x93",
+                     (double)(ohms * 1000.0f));
+        } else {
+            snprintf(buf, sizeof(buf), "Calibration complete \xE2\x9C\x93");
+        }
+        lv_label_set_text(lbl_cfg_cal_status, buf);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_GREEN, LV_PART_MAIN);
+        return;
+    }
+
+    if (strncmp(line, "CAL_ERROR=", 10) == 0) {
+        const char* reason = line + 10;
+        char buf[64];
+        // Friendly text for the common terminal errors.
+        if (strncmp(reason, "TIMEOUT_NO_TRIGGER", 18) == 0) {
+            msg = "Timed out: no trigger. Press pedal / short tips, retry.";
+        } else if (strncmp(reason, "TIPS_NOT_SHORTED", 16) == 0) {
+            msg = "Tips not shorted - clamp leads together, then retry.";
+        } else if (strncmp(reason, "VOLTAGE_LOW", 11) == 0) {
+            msg = "Pack voltage low - charge, then retry.";
+        } else if (strncmp(reason, "NOT_READY", 9) == 0) {
+            msg = "Not ready - wait for READY, then retry.";
+        } else if (strncmp(reason, "BUSY", 4) == 0) {
+            msg = "Busy - finish current action, then retry.";
+        } else if (strncmp(reason, "OVERHEAT", 8) == 0 ||
+                   strncmp(reason, "COOLDOWN", 8) == 0) {
+            msg = "Too hot - let it cool, then retry.";
+        } else {
+            snprintf(buf, sizeof(buf), "Calibration failed: %s", reason);
+            msg = buf;
+        }
+        lv_label_set_text(lbl_cfg_cal_status, msg);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, C_RED, LV_PART_MAIN);
+        return;
+    }
+
+    if (strncmp(line, "CAL_STATUS=", 11) == 0) {
+        const char* state = line + 11;
+        col = C_ACCENT;
+        if (strncmp(state, "WAITING_FOR_TRIGGER", 19) == 0) {
+            msg = "Now fire the trigger: press pedal (or hold tips shorted)";
+            col = C_YELLOW;
+        } else if (strncmp(state, "CONTACT_DETECTED_HOLDING", 24) == 0) {
+            msg = "Contact detected - keep tips held...";
+            col = C_YELLOW;
+        } else if (strncmp(state, "TRIGGER_DETECTED", 16) == 0) {
+            msg = "Trigger detected - measuring...";
+        } else if (strncmp(state, "MEASURING", 9) == 0) {
+            msg = "Measuring lead resistance...";
+        } else {
+            msg = "Calibrating...";
+        }
+        lv_label_set_text(lbl_cfg_cal_status, msg);
+        lv_obj_set_style_text_color(lbl_cfg_cal_status, col, LV_PART_MAIN);
+        return;
+    }
+}
+
+void ui_set_joule_apply_cb(joule_apply_cb_t cb) { _joule_apply_cb = cb; }
+
+void ui_set_contact_delay_cb(contact_delay_cb_t cb) { _contact_delay_cb = cb; }

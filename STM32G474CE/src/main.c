@@ -1866,16 +1866,25 @@ static uint16_t get_planned_active_pulse_ms(void) {
         }
     }
 
-    if (weld_mode >= 1U) {
-        active_ms += weld_d1_ms;
-    }
-    if (weld_mode >= 2U) {
-        active_ms += weld_gap1_ms;
-        active_ms += weld_d2_ms;
-    }
-    if (weld_mode >= 3U) {
-        active_ms += weld_gap2_ms;
-        active_ms += weld_d3_ms;
+    if (control_mode == 1U) {
+        /* JOULE mode fires a SINGLE energy-controlled pulse whose length is
+         * governed by the workpiece-energy target and capped by joule_max_ms.
+         * The Pulse-tab time durations (d1/gap1/d2/gap2/d3) and the multi-phase
+         * shape do NOT apply in joule mode, so size the capture window by the
+         * max-duration safety limit instead. */
+        active_ms += joule_max_ms;
+    } else {
+        if (weld_mode >= 1U) {
+            active_ms += weld_d1_ms;
+        }
+        if (weld_mode >= 2U) {
+            active_ms += weld_gap1_ms;
+            active_ms += weld_d2_ms;
+        }
+        if (weld_mode >= 3U) {
+            active_ms += weld_gap2_ms;
+            active_ms += weld_d3_ms;
+        }
     }
 
     if (active_ms > WAVEFORM_MAX_PULSE_MS) {
@@ -2562,6 +2571,25 @@ static void fireRecipe(void) {
         (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
                                  joule_bad_contact_abort);
 
+    /* ── JOULE MODE: single energy-controlled pulse ──────────────────────
+     * In JOULE mode the weld is ONE continuous pulse that runs until the
+     * measured WORKPIECE energy reaches the target (checked sample-by-sample
+     * inside capturePulseAmpsForDurationUs), capped by joule_max_ms as a
+     * safety limit. The Pulse-tab time durations (d1/d2/d3) and the gap/
+     * multi-phase structure do NOT apply. We therefore fire phase 1 for
+     * joule_max_ms (the energy condition stops it early when the target is
+     * met) and skip phases 2 and 3 entirely.
+     *
+     * BUGFIX: previously phase 1 fired for weld_d1_ms (a time-mode setting),
+     * so with high lead losses the pulse ended before the workpiece reached
+     * the target — delivering less energy than requested (e.g. 34J of a 50J
+     * target). Driving the pulse from joule_max_ms lets the energy integrator
+     * actually reach the target. */
+    const bool joule_mode = (control_mode == 1U);
+    uint16_t joule_pulse_ms = (uint16_t)joule_max_ms;
+    if (joule_pulse_ms > MAX_WELD_MS) joule_pulse_ms = MAX_WELD_MS;
+    const uint16_t main1_ms = joule_mode ? joule_pulse_ms : weld_d1_ms;
+
     if (weld_mode >= 1 && !joule_stop_requested) {
         uint16_t main1_start_idx = waveform_index;
         uint32_t* main1_start_us_ptr = NULL;
@@ -2573,7 +2601,7 @@ static void fireRecipe(void) {
             main_pulse_started = true;
         }
         main_pulse_elapsed_us += doPulseMsPwm(
-            weld_d1_ms, mainDuty, main1_start_us_ptr, &wf_main_end_us, NULL);
+            main1_ms, mainDuty, main1_start_us_ptr, &wf_main_end_us, NULL);
         uint16_t main1_end_idx = waveform_index;
         if (main1_start_us_ptr != NULL) {
             uint32_t aligned_main_start_us = 0U;
@@ -2606,11 +2634,21 @@ static void fireRecipe(void) {
 #endif
     }
 
+    /* JOULE MODE: phase 1 IS the entire weld. If the single energy-controlled
+     * pulse finished without the workpiece reaching the target and without a
+     * bad-contact abort, the pulse was cut off by the joule_max_ms safety cap
+     * — report this as a TIMEOUT so the user knows to raise joule_max_ms (or
+     * reduce lead losses). This also covers the race where TIM2 kills the FET
+     * exactly at joule_max_ms before the in-loop timeout flag is set. */
+    if (joule_mode && !joule_target_reached && !joule_bad_contact_abort) {
+        joule_timeout_abort = true;
+    }
+
     joule_stop_requested =
         (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
                                  joule_bad_contact_abort);
 
-    if (weld_mode >= 2 && !joule_stop_requested) {
+    if (weld_mode >= 2 && !joule_mode && !joule_stop_requested) {
         if (weld_gap1_ms) captureGapMsWithWaveform(weld_gap1_ms);
         uint16_t main2_start_idx = waveform_index;
         uint32_t* main2_start_us_ptr = NULL;
@@ -2659,7 +2697,7 @@ static void fireRecipe(void) {
         (control_mode == 1U) && (joule_target_reached || joule_timeout_abort ||
                                  joule_bad_contact_abort);
 
-    if (weld_mode >= 3 && !joule_stop_requested) {
+    if (weld_mode >= 3 && !joule_mode && !joule_stop_requested) {
         if (weld_gap2_ms) captureGapMsWithWaveform(weld_gap2_ms);
         uint16_t main3_start_idx = waveform_index;
         uint32_t* main3_start_us_ptr = NULL;
