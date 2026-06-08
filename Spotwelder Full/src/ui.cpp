@@ -899,14 +899,14 @@ static void build_status_tab(lv_obj_t* tab) {
     }
 
     // ---------------------------------------------------------
-    // ROW 3 (y=175..241): ARM/DISARM button – prominent but compact.
+    // ROW 3 (y=186..252): ARM/DISARM button – prominent but compact.
     // Centred horizontally; also centred VERTICALLY in the gap between ROW 2
-    // (ends y=160) and the Last Weld bar (top y=256): gap=96, button=66, so
-    // ARM_Y = 160 + (96-66)/2 = 175 (equal ~15px above & below).
+    // (ends y=160) and the Last Weld bar (top y=278): gap=118, button=66, so
+    // ARM_Y = 160 + (118-66)/2 = 186 (equal ~26px above & below).
     // ---------------------------------------------------------
     const int ARM_W = 320;
     const int ARM_H = 66;
-    const int ARM_Y = 175;
+    const int ARM_Y = 186;
     const int ARM_X = (CONTENT_W - ARM_W) / 2;  // 230 (centred)
 
     btn_arm = lv_obj_create(tab);
@@ -930,16 +930,18 @@ static void build_status_tab(lv_obj_t* tab) {
     lv_obj_center(lbl_arm);
 
     // ---------------------------------------------------------
-    // ROW 4 (y=256..384): Last Weld results – pushed to the bottom
+    // ROW 4 (y=278..406): Last Weld results – pushed to the bottom
     //   Duration | Peak | Avg | Joules
     // ---------------------------------------------------------
     // IMPORTANT (display safety margin):
     //   The ESP32-8048S043C is an RGB-parallel panel. The last few scanlines
     //   at the very bottom of this board are prone to a DMA/PSRAM timing
-    //   glitch ("scrambled line at the bottom"). We keep a generous bottom
-    //   margin so no real content is drawn into the glitchy region. Do NOT
-    //   extend content below child-y ~390. (Bottom here = 256+128 = 384.)
-    const int LW_Y = 256;
+    //   glitch ("scrambled line at the bottom"). The usable tab content height
+    //   is 418px (480 - 42px tab bar - 2*10px pad). We push Last Weld to the
+    //   bottom while keeping its bottom edge at 406 (~12px clear of the 418
+    //   limit) so no content lands in the glitchy region. Do NOT extend
+    //   content below child-y ~410. (Bottom here = 278+128 = 406.)
+    const int LW_Y = 278;
     const int LW_H = 128;
     {
         lv_obj_t* box = make_panel(tab, 0, LW_Y, CONTENT_W, LW_H);
