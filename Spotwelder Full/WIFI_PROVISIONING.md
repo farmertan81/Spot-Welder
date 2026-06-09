@@ -70,6 +70,49 @@ The provisioning state machine is driven every `loop()` by
   to this IP so the phone's "captive portal detected" prompt opens the page
   automatically.
 
+### Captive-portal auto-detection (how the page pops up by itself)
+When a phone/PC joins a WiFi network it immediately fetches an OS-specific
+"is there internet?" probe URL. If the response isn't what it expects, the OS
+declares a *captive portal* and auto-launches the sign-in page. We make this
+fire reliably with three pieces:
+
+1. **Wildcard DNS.** `dnsServer.start(53, "*", 192.168.4.1)` answers **every**
+   DNS query with the ESP32's IP, with `setErrorReplyCode(NoError)` and
+   `setTTL(0)` so nothing is cached and no query returns NXDOMAIN. Every probe
+   hostname therefore resolves to us.
+
+2. **Explicit probe-URL handlers.** The web server registers the known probe
+   paths so they hit our code regardless of host:
+   - Android: `/generate_204`, `/gen_204`
+   - iOS / macOS: `/hotspot-detect.html`, `/library/test/success.html`
+   - Windows: `/connecttest.txt`, `/ncsi.txt`, `/redirect`, `/fwlink`
+   - Firefox / Linux: `/canonical.html`, `/success.txt`
+
+3. **Response strategy — Method 3 (serve the portal page with HTTP 200).**
+   Every probe handler *and* the catch-all `onNotFound` return the portal HTML
+   with status **200** and no-cache headers. This is the most reliable strategy
+   across OSes:
+   - **iOS** renders the returned HTML directly inside its Captive Network
+     Assistant popup (it expects the literal text "Success"; anything else →
+     popup). It often *abandons* a 302 redirect to a bare IP, so we do **not**
+     redirect.
+   - **Android** expects HTTP 204; a 200-with-body → "Sign in to network".
+   - **Windows** expects "Microsoft Connect Test"; any other body → browser.
+
+   We considered Method 1 (302 redirect for all probes) and Method 2
+   (return each OS's exact expected string) but Method 3 is both the simplest
+   and the most broadly compatible, and is what fixed the earlier
+   "had to type the IP manually" behaviour.
+
+> **Performance note:** the network scan that fills the page's dropdown runs
+> **once** when AP mode starts (cached in `g_scan_options`), *not* on every
+> request. A blocking `WiFi.scanNetworks()` inside the request path was adding
+> 1-2 s of latency to the probe response, which made the popup intermittent.
+> A **"Rescan networks"** link (`/?rescan=1`) lets the user refresh the list.
+
+> If a particular phone still doesn't pop the page (some vendor builds suppress
+> it), browse to **http://192.168.4.1** manually — that always works.
+
 ### The QR code
 Rendered on-screen using **LVGL's built-in `lv_qrcode`** widget (no external
 library — just `LV_USE_QRCODE 1`). The payload uses the standard Wi-Fi

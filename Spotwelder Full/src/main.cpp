@@ -1884,11 +1884,18 @@ static void handlePortalSave() {
     wifi_creds_just_saved = true;  // loop() will reconnect
 }
 
-// Redirect every other request to the portal root (captive-portal behavior).
-static void handlePortalNotFound() {
-    portalServer.sendHeader("Location", "http://192.168.4.1/", true);
-    portalServer.send(302, "text/plain", "");
-}
+// Catch-all for any unmatched request (the bulk of OS captive-portal probes
+// hit random hostnames/paths that DNS has already pointed at us).
+//
+// METHOD 3 (serve the portal page directly with HTTP 200) is used here rather
+// than a 302 redirect, because it is the most reliable across all phone OSes:
+//   - iOS Captive Network Assistant renders this HTML body straight into its
+//     popup; it often abandons a 302 to a bare IP.
+//   - Android sees a non-204 response and raises "Sign in to network".
+//   - Windows sees content != "Microsoft Connect Test" and opens the browser.
+// A 302 works on some devices but is the weaker option, which is likely why the
+// page did not pop up automatically before.
+static void handlePortalNotFound() { sendPortalPage(); }
 
 // ---- Provisioning mode transitions ----
 static void stopApPortal() {
@@ -1923,6 +1930,7 @@ static void startApPortal() {
     dnsServer.start(DNS_PORT, "*", apIP);
 
     portalServer.on("/", handlePortalRoot);
+    portalServer.on("/portal", handlePortalRoot);  // explicit alias
     portalServer.on("/save", HTTP_POST, handlePortalSave);
     // Captive-portal-detection probe endpoints (Android / iOS / Windows /
     // Firefox). Serving the page directly here is what makes the setup screen
