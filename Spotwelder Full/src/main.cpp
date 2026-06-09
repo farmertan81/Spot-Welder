@@ -1955,9 +1955,15 @@ static void startApPortal() {
                   apIP.toString().c_str());
 
     // Tell the UI to show the QR provisioning view.
-    // WIFI: join string lets the phone auto-connect to the open AP, after
-    // which the captive portal pops automatically.
-    String qr = "WIFI:T:nopass;S:" + ap_ssid_str + ";;";
+    //
+    // The QR now encodes the SETUP-PAGE URL (http://192.168.4.1) instead of a
+    // "WIFI:" auto-join string. Once the phone is connected to the SpotWelder
+    // AP, scanning this URL QR makes the camera offer "Open in browser" and
+    // jumps straight to the setup page — bypassing the unreliable captive-
+    // portal auto-detection entirely. (Auto-join from a WIFI: QR proved flaky,
+    // and the captive portal still didn't always pop, so the user had to type
+    // the IP by hand. A URL QR is the most reliable path.)
+    String qr = "http://" + apIP.toString();
     ui_show_wifi_setup(qr.c_str(), ap_ssid_str.c_str(),
                        apIP.toString().c_str());
     pushWifiInfoToUi(true);

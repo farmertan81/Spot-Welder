@@ -3276,46 +3276,80 @@ static void ensure_prov_overlay() {
     lv_obj_clear_flag(prov_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(prov_overlay, LV_OBJ_FLAG_HIDDEN);
 
-    // Heading
+    // ---- Heading (top, centered) ----
     lv_obj_t* head = lv_label_create(prov_overlay);
     lv_label_set_text(head, LV_SYMBOL_WIFI "  WiFi Setup");
     lv_obj_set_style_text_color(head, C_ACCENT, 0);
     lv_obj_set_style_text_font(head, &lv_font_montserrat_24, 0);
-    lv_obj_align(head, LV_ALIGN_TOP_MID, 0, 16);
+    lv_obj_align(head, LV_ALIGN_TOP_MID, 0, 12);
 
-    // Instructions (left side)
-    lv_obj_t* steps = lv_label_create(prov_overlay);
-    lv_label_set_text(steps,
-                      "1. Scan this QR code with your phone\n"
-                      "   (or join the WiFi network below).\n\n"
-                      "2. A setup page opens automatically.\n\n"
-                      "3. Pick your home WiFi and enter\n"
-                      "   its password, then Save.\n\n"
-                      "The welder reboots and connects.");
-    lv_obj_set_style_text_color(steps, C_WHITE, 0);
-    lv_obj_set_style_text_font(steps, &lv_font_montserrat_16, 0);
-    lv_obj_align(steps, LV_ALIGN_LEFT_MID, 24, 10);
+    // ---- Step 1: connect to the welder's WiFi (left column) ----
+    lv_obj_t* step1 = lv_label_create(prov_overlay);
+    lv_label_set_text(step1, "1.  Connect your phone to WiFi:");
+    lv_obj_set_style_text_color(step1, C_WHITE, 0);
+    lv_obj_set_style_text_font(step1, &lv_font_montserrat_18, 0);
+    lv_obj_align(step1, LV_ALIGN_TOP_LEFT, 28, 70);
 
-    // QR code (right side)
+    // SSID shown large + highlighted (this is the network name to join)
+    lbl_prov_ssid = lv_label_create(prov_overlay);
+    lv_label_set_text(lbl_prov_ssid, "SpotWelder-XXXX");
+    lv_obj_set_style_text_color(lbl_prov_ssid, C_GREEN, 0);
+    lv_obj_set_style_text_font(lbl_prov_ssid, &lv_font_montserrat_24, 0);
+    lv_obj_align(lbl_prov_ssid, LV_ALIGN_TOP_LEFT, 56, 100);
+
+    // ---- Step 2: scan the QR (left column) ----
+    lv_obj_t* step2 = lv_label_create(prov_overlay);
+    lv_label_set_text(step2, "2.  Scan the QR code to open");
+    lv_obj_set_style_text_color(step2, C_WHITE, 0);
+    lv_obj_set_style_text_font(step2, &lv_font_montserrat_18, 0);
+    lv_obj_align(step2, LV_ALIGN_TOP_LEFT, 28, 156);
+
+    lv_obj_t* step2b = lv_label_create(prov_overlay);
+    lv_label_set_text(step2b, "the setup page, then tap \"Open\".");
+    lv_obj_set_style_text_color(step2b, C_GREY, 0);
+    lv_obj_set_style_text_font(step2b, &lv_font_montserrat_16, 0);
+    lv_obj_align(step2b, LV_ALIGN_TOP_LEFT, 56, 184);
+
+    // ---- QR code (right column) ----
     prov_qr = lv_qrcode_create(prov_overlay);
-    lv_qrcode_set_size(prov_qr, 200);
+    lv_qrcode_set_size(prov_qr, 190);
     lv_qrcode_set_dark_color(prov_qr, lv_color_hex(0x000000));
     lv_qrcode_set_light_color(prov_qr, lv_color_hex(0xFFFFFF));
     lv_obj_set_style_border_color(prov_qr, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_border_width(prov_qr, 6, 0);
-    lv_obj_align(prov_qr, LV_ALIGN_RIGHT_MID, -60, -6);
+    lv_obj_set_style_border_width(prov_qr, 8, 0);
+    lv_obj_align(prov_qr, LV_ALIGN_TOP_RIGHT, -70, 74);
 
-    lbl_prov_ssid = lv_label_create(prov_overlay);
-    lv_label_set_text(lbl_prov_ssid, "Network: --");
-    lv_obj_set_style_text_color(lbl_prov_ssid, C_GREEN, 0);
-    lv_obj_set_style_text_font(lbl_prov_ssid, &lv_font_montserrat_16, 0);
-    lv_obj_align(lbl_prov_ssid, LV_ALIGN_RIGHT_MID, -20, 118);
+    lv_obj_t* qr_cap = lv_label_create(prov_overlay);
+    lv_label_set_text(qr_cap, "Scan with phone camera");
+    lv_obj_set_style_text_color(qr_cap, C_GREY, 0);
+    lv_obj_set_style_text_font(qr_cap, &lv_font_montserrat_14, 0);
+    lv_obj_align(qr_cap, LV_ALIGN_TOP_RIGHT, -90, 272);
 
-    lbl_prov_ip = lv_label_create(prov_overlay);
-    lv_label_set_text(lbl_prov_ip, "Setup page: http://192.168.4.1");
-    lv_obj_set_style_text_color(lbl_prov_ip, C_GREY, 0);
-    lv_obj_set_style_text_font(lbl_prov_ip, &lv_font_montserrat_14, 0);
-    lv_obj_align(lbl_prov_ip, LV_ALIGN_BOTTOM_MID, 0, -14);
+    // ---- Manual fallback: "Or open a browser and go to:" ----
+    lv_obj_t* or_lbl = lv_label_create(prov_overlay);
+    lv_label_set_text(or_lbl, "Or open a browser and go to:");
+    lv_obj_set_style_text_color(or_lbl, C_GREY, 0);
+    lv_obj_set_style_text_font(or_lbl, &lv_font_montserrat_16, 0);
+    lv_obj_align(or_lbl, LV_ALIGN_BOTTOM_MID, 0, -76);
+
+    // Highlighted box around the IP so it is impossible to miss.
+    lv_obj_t* ip_box = lv_obj_create(prov_overlay);
+    lv_obj_remove_style_all(ip_box);
+    lv_obj_clear_flag(ip_box, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(ip_box, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_size(ip_box, 360, 50);
+    lv_obj_set_style_bg_color(ip_box, C_DARK_GREY, 0);
+    lv_obj_set_style_bg_opa(ip_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(ip_box, 10, 0);
+    lv_obj_set_style_border_color(ip_box, C_ACCENT, 0);
+    lv_obj_set_style_border_width(ip_box, 2, 0);
+    lv_obj_align(ip_box, LV_ALIGN_BOTTOM_MID, 0, -18);
+
+    lbl_prov_ip = lv_label_create(ip_box);
+    lv_label_set_text(lbl_prov_ip, "http://192.168.4.1");
+    lv_obj_set_style_text_color(lbl_prov_ip, C_ACCENT, 0);
+    lv_obj_set_style_text_font(lbl_prov_ip, &lv_font_montserrat_24, 0);
+    lv_obj_center(lbl_prov_ip);
 }
 
 void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
@@ -3326,14 +3360,14 @@ void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
         lv_qrcode_update(prov_qr, qr_payload, strlen(qr_payload));
     }
     if (lbl_prov_ssid) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Network: %s",
-                 (ap_ssid && ap_ssid[0]) ? ap_ssid : "--");
-        lv_label_set_text(lbl_prov_ssid, buf);
+        // Show just the SSID (e.g. "SpotWelder-XXXX") - large/green per new design
+        lv_label_set_text(lbl_prov_ssid,
+                          (ap_ssid && ap_ssid[0]) ? ap_ssid : "--");
     }
     if (lbl_prov_ip) {
         char buf[64];
-        snprintf(buf, sizeof(buf), "Setup page: http://%s",
+        // Show the full URL (e.g. "http://192.168.4.1") inside the highlighted box
+        snprintf(buf, sizeof(buf), "http://%s",
                  (portal_ip && portal_ip[0]) ? portal_ip : "192.168.4.1");
         lv_label_set_text(lbl_prov_ip, buf);
     }

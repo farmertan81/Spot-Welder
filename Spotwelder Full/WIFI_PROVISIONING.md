@@ -18,7 +18,7 @@ Pi/web UI over TCP). It replaces the previous **hardcoded WiFi credentials** in
 | --- | --- | --- |
 | WiFi credentials | Hardcoded `ssid` / `password` in `main.cpp` | Stored in NVS (`wificfg` namespace); none in source |
 | First boot / no creds | N/A | Device starts a WiFi **Access Point** + **captive portal** and shows a **QR code** on screen |
-| Joining your network | Re-flash firmware | Scan QR (or join AP) → pick network → enter password → Save |
+| Joining your network | Re-flash firmware | Join AP → scan QR to open setup page → pick network → enter password → Save |
 | Connection failure | Stuck retrying | Falls back to AP/portal after a 20 s timeout |
 | "Logs" tab (placeholder) | Empty placeholder | **Setup** tab: WiFi status, System Info, Maintenance |
 | Status tab | — | Small WiFi indicator (green = connected, yellow = setup mode, grey = offline) |
@@ -64,8 +64,9 @@ The provisioning state machine is driven every `loop()` by
 ### The Access Point
 - SSID: **`SpotWelder-XXXX`** (XXXX = last 2 bytes of the device MAC, so each
   unit is unique).
-- **Open network (no password)** so a phone can auto-join straight from the QR
-  code. The portal itself is only reachable on the local AP subnet.
+- **Open network (no password)** so a phone can join it quickly, then scan the
+  URL QR to reach the setup page. The portal itself is only reachable on the
+  local AP subnet.
 - Portal IP: **`192.168.4.1`**. A wildcard DNS server resolves every hostname
   to this IP so the phone's "captive portal detected" prompt opens the page
   automatically.
@@ -115,13 +116,27 @@ fire reliably with three pieces:
 
 ### The QR code
 Rendered on-screen using **LVGL's built-in `lv_qrcode`** widget (no external
-library — just `LV_USE_QRCODE 1`). The payload uses the standard Wi-Fi
-join format:
+library — just `LV_USE_QRCODE 1`). The payload is simply the **setup-page URL**:
 ```
-WIFI:T:nopass;S:<SpotWelder-XXXX>;;
+http://192.168.4.1
 ```
-Scanning it with a phone camera offers "Join network SpotWelder-XXXX"; once
-joined, the captive portal pops up automatically.
+**Why a URL, not a `WIFI:` join string?** Auto-join QR codes
+(`WIFI:T:nopass;S:...;;`) and captive-portal auto-detection both proved
+unreliable across phone makes/OS versions — the user frequently had to open a
+browser and type the IP by hand. A plain-URL QR is far more consistent: every
+modern phone camera recognises it and offers an **"Open in browser"** prompt
+that lands directly on the setup page.
+
+**Flow (two simple steps shown on the overlay):**
+1. Connect the phone's Wi-Fi to the **`SpotWelder-XXXX`** open network.
+2. Point the camera at the QR → tap **"Open"** → the setup page loads at
+   `http://192.168.4.1`.
+
+> The phone **must be joined to the SpotWelder AP first** for the URL to
+> resolve — that's why the overlay lists the network name as step 1. The
+> captive-portal auto-pop (above) still runs as a bonus path, but the URL QR is
+> the primary, reliable route. If anything fails, the overlay also shows the
+> `http://192.168.4.1` address in a highlighted box to type manually.
 
 ### Saving credentials
 The portal page (`/`) scans for nearby networks and renders a form (network
@@ -171,8 +186,8 @@ The device comes back up in AP/portal mode because the WiFi creds are gone.
    `pio run -t erase` (or use Factory Reset from the Setup tab on a running unit).
 2. Power on. The screen should show the **WiFi Setup** overlay with a QR code
    and the AP name `SpotWelder-XXXX`.
-3. On a phone, scan the QR → join the open AP → the setup page should open at
-   `http://192.168.4.1`.
+3. On a phone, **join the open AP** `SpotWelder-XXXX` first, then **scan the QR**
+   → tap "Open" → the setup page should load at `http://192.168.4.1`.
 4. Pick your home WiFi, type the password, **Save**.
 5. The device should reboot/connect; the Status-tab WiFi icon turns **green**
    and the Setup tab shows your IP.
@@ -217,7 +232,8 @@ The device comes back up in AP/portal mode because the WiFi creds are gone.
   flash encryption** at the build level (ESP-IDF feature). This is a hardware
   fuse-based step — do it deliberately, it is largely irreversible.
 - **Open setup AP:** the provisioning AP is intentionally open (no password) so
-  the QR auto-join works. The window is small (only while provisioning) and the
+  the phone can join it quickly before scanning the URL QR. The window is small
+  (only while provisioning) and the
   portal only accepts a network selection. Still, provision in a trusted
   location, since during that window anyone nearby could connect to the AP and
   submit a network. If you prefer, change the soft-AP to use a WPA2 password and
