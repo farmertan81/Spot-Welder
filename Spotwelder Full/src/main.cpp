@@ -77,6 +77,12 @@ static WebServer portalServer(80);
 static const byte DNS_PORT = 53;
 static IPAddress apIP(192, 168, 4, 1);
 static String ap_ssid_str = "";  // "SpotWelder-XXXX"
+// Cached network-scan <option> list. We scan ONCE when entering AP mode (and
+// on explicit user rescan) instead of on every HTTP request. A blocking
+// WiFi.scanNetworks() inside the request path delays the phone's captive-portal
+// probe by 1-2 s, which is the main reason the setup page does not pop up
+// reliably. Serving a cached list makes every portal response instant.
+static String g_scan_options = "";
 // Set true by the portal handler once new creds are saved; loop() then
 // tears down the portal and reconnects in STA mode.
 static volatile bool wifi_creds_just_saved = false;
@@ -1762,8 +1768,11 @@ static void pushWifiInfoToUi(bool force) {
 }
 
 // ---- Captive portal HTTP handlers ----
-static String portalPageHtml() {
-    // Scan networks (synchronous; only called inside AP portal mode).
+
+// Rebuild the cached <option> list of nearby networks. Called ONCE on entering
+// AP mode and on explicit user rescan — never from inside a normal page load,
+// so the phone's captive-portal probe gets an instant response.
+static void rescanNetworks() {
     int n = WiFi.scanNetworks();
     String opts = "";
     for (int i = 0; i < n && i < 30; i++) {
@@ -1773,6 +1782,13 @@ static String portalPageHtml() {
                 String(WiFi.RSSI(i)) + " dBm)</option>";
     }
     WiFi.scanDelete();
+    g_scan_options = opts;
+    Serial.printf("[WiFi] Portal scan cached %d network(s)\n", n);
+}
+
+static String portalPageHtml() {
+    // Use the cached scan list (see rescanNetworks). No blocking scan here.
+    String opts = g_scan_options;
 
     String html =
         "<!DOCTYPE html><html><head><meta name='viewport' "
@@ -1796,15 +1812,43 @@ static String portalPageHtml() {
         "<label>Password</label><input name='pass' type='password' "
         "placeholder='WiFi password'>"
         "<button type='submit'>Save &amp; Connect</button>"
-        "</form><p style='color:#789;font-size:13px;margin-top:16px'>"
+        "</form>"
+        "<p style='text-align:center;margin-top:14px'>"
+        "<a style='color:#39c' href='/?rescan=1'>&#x21bb; Rescan networks</a>"
+        "</p>"
+        "<p style='color:#789;font-size:13px;margin-top:16px'>"
         "The welder will reboot and join this network. If it fails it will "
         "return to this setup screen.</p></div></body></html>";
     return html;
 }
 
-static void handlePortalRoot() {
+// Send the portal page with no-cache headers so the phone does not cache a
+// stale "no internet" verdict and re-shows the page on later probes.
+static void sendPortalPage() {
+    portalServer.sendHeader("Cache-Control",
+                            "no-cache, no-store, must-revalidate");
+    portalServer.sendHeader("Pragma", "no-cache");
+    portalServer.sendHeader("Expires", "0");
     portalServer.send(200, "text/html", portalPageHtml());
 }
+
+static void handlePortalRoot() {
+    if (portalServer.hasArg("rescan")) {
+        rescanNetworks();
+    }
+    sendPortalPage();
+}
+
+// Captive-portal-detection (CPD) probe handler.
+//
+// When a phone joins the AP it immediately fetches an OS-specific "is there
+// internet?" URL. To make the setup page pop up reliably we serve the portal
+// page DIRECTLY (HTTP 200) for these probes instead of a redirect — iOS's
+// Captive Network Assistant in particular is far more reliable when its probe
+// (captive.apple.com/hotspot-detect.html) returns a non-"Success" page rather
+// than a 302 to a bare IP. Android/Windows treat any non-expected response as
+// "captive portal present" and surface the sign-in page too.
+static void handleCaptive() { sendPortalPage(); }
 
 static void handlePortalSave() {
     String ssid = portalServer.arg("ssid");
@@ -1869,10 +1913,30 @@ static void startApPortal() {
     WiFi.softAP(ap_ssid_str.c_str());
     delay(200);
 
+    // Scan ONCE now, before any client connects, so portal page loads (and the
+    // phone's captive-portal probe) are served instantly from cache.
+    rescanNetworks();
+
+    // Wildcard DNS: resolve every hostname to us. TTL 0 so phones don't cache.
+    dnsServer.setTTL(0);
+    dnsServer.setErrorReplyCode(DNSReplyCode::NoError);
     dnsServer.start(DNS_PORT, "*", apIP);
 
     portalServer.on("/", handlePortalRoot);
     portalServer.on("/save", HTTP_POST, handlePortalSave);
+    // Captive-portal-detection probe endpoints (Android / iOS / Windows /
+    // Firefox). Serving the page directly here is what makes the setup screen
+    // pop up reliably across phones.
+    portalServer.on("/generate_204", handleCaptive);         // Android
+    portalServer.on("/gen_204", handleCaptive);              // Android (older)
+    portalServer.on("/hotspot-detect.html", handleCaptive);  // iOS / macOS
+    portalServer.on("/library/test/success.html", handleCaptive);  // iOS
+    portalServer.on("/connecttest.txt", handleCaptive);      // Windows
+    portalServer.on("/ncsi.txt", handleCaptive);             // Windows
+    portalServer.on("/redirect", handleCaptive);             // Windows
+    portalServer.on("/fwlink", handleCaptive);               // Windows / MSFT
+    portalServer.on("/canonical.html", handleCaptive);       // Firefox / Linux
+    portalServer.on("/success.txt", handleCaptive);          // Firefox / Linux
     portalServer.onNotFound(handlePortalNotFound);
     portalServer.begin();
 
