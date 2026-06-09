@@ -3,3 +3,10 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Secrets / credentials – never commit WiFi or other secrets.
+# Credentials are now stored at runtime in ESP32 NVS, not in source.
+secrets.h
+wifi_secrets.h
+include/secrets.h
+*.secrets

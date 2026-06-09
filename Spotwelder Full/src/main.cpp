@@ -20,7 +20,9 @@
  */
 
 #include <Arduino.h>
+#include <DNSServer.h>
 #include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
 #include <esp_wifi.h>
@@ -29,6 +31,9 @@
 #include <math.h>
 
 #include "ui.h"
+
+// Firmware version string shown on the Setup tab.
+#define FW_VERSION "1.0.0"
 
 // =========================
 // Sunton hardware mapping
@@ -47,11 +52,37 @@ HardwareSerial STM32Serial(2);
 // =========================
 // WiFi / TCP
 // =========================
-const char* ssid = "Jaime's Wi-Fi Network";
-const char* password = "jackaustin";
+// WiFi credentials are NOT hardcoded. They are provisioned at runtime via the
+// captive-portal Setup flow and stored in NVS ("wificfg"). See the
+// "WiFi provisioning" section below.
+String wifi_ssid = "";  // loaded from NVS at boot
+String wifi_pass = "";  // loaded from NVS at boot
 
-WiFiServer server(8888);
+WiFiServer server(8888);  // STM32<->Flask bridge (STA mode)
 WiFiClient client;
+
+// ---- WiFi provisioning state machine ----
+enum WifiProvState {
+    WIFI_PROV_STA_CONNECTING,  // trying saved creds
+    WIFI_PROV_STA_CONNECTED,   // associated, bridge running
+    WIFI_PROV_AP_PORTAL        // AP + captive portal up (setup mode)
+};
+static WifiProvState wifi_prov_state = WIFI_PROV_STA_CONNECTING;
+static uint32_t wifi_sta_attempt_start_ms = 0;
+// How long to wait for a saved network before falling back to AP portal.
+static const uint32_t WIFI_STA_CONNECT_TIMEOUT_MS = 20000;
+
+static DNSServer dnsServer;
+static WebServer portalServer(80);
+static const byte DNS_PORT = 53;
+static IPAddress apIP(192, 168, 4, 1);
+static String ap_ssid_str = "";  // "SpotWelder-XXXX"
+// Set true by the portal handler once new creds are saved; loop() then
+// tears down the portal and reconnects in STA mode.
+static volatile bool wifi_creds_just_saved = false;
+// Last WiFi info pushed to the UI (avoids redundant ui_set_wifi_info calls).
+static bool ui_wifi_last_connected = false;
+static bool ui_wifi_last_ap = false;
 
 static uint32_t lastTcpRxMs = 0;
 static const uint32_t TCP_IDLE_TIMEOUT_MS = 600000;
@@ -1647,40 +1678,313 @@ void serviceReadyHeartbeat() {
 }
 
 // =========================
-// WiFi / server maintenance
+// WiFi provisioning (captive portal + NVS credentials)
 // =========================
-void ensureWiFiAndServer() {
-    static unsigned long last_attempt = 0;
-    static bool server_started = false;
+// Credentials live in their own NVS namespace ("wificfg") so they are
+// independent of recipe/config and survive power cycles. NVS on the ESP32 is
+// stored in a dedicated flash partition; for at-rest encryption the project
+// can enable NVS encryption (flash-encryption) at the build level — the keys
+// here are plain string keys, the values are whatever the user provisions.
 
-    if (WiFi.status() == WL_CONNECTED) {
-        if (!server_started) {
-            Serial.println("✅ WiFi connected (re) - IP: " +
-                           WiFi.localIP().toString());
-            Serial.println("Starting TCP server on port 8888...");
-            server.begin();
-            server.setNoDelay(true);
-            server_started = true;
-        }
+static void save_wifi_creds_to_nvs(const String& ssid, const String& pass) {
+    Preferences wprefs;
+    wprefs.begin("wificfg", false);
+    wprefs.putString("ssid", ssid);
+    wprefs.putString("pass", pass);
+    wprefs.end();
+    Serial.println("[WiFi] Credentials saved to NVS");
+}
+
+static void load_wifi_creds_from_nvs() {
+    Preferences wprefs;
+    wprefs.begin("wificfg", true);  // read-only
+    wifi_ssid = wprefs.getString("ssid", "");
+    wifi_pass = wprefs.getString("pass", "");
+    wprefs.end();
+    Serial.printf("[WiFi] Creds from NVS: ssid='%s' (%s)\n", wifi_ssid.c_str(),
+                  wifi_ssid.length() ? "set" : "EMPTY");
+}
+
+static void clear_wifi_creds_from_nvs() {
+    Preferences wprefs;
+    wprefs.begin("wificfg", false);
+    wprefs.clear();
+    wprefs.end();
+    wifi_ssid = "";
+    wifi_pass = "";
+    Serial.println("[WiFi] Credentials cleared from NVS");
+}
+
+// Build the per-device AP name from the last 2 bytes of the STA MAC.
+static String makeApSsid() {
+    uint8_t mac[6] = {0};
+    WiFi.macAddress(mac);
+    char buf[24];
+    snprintf(buf, sizeof(buf), "SpotWelder-%02X%02X", mac[4], mac[5]);
+    return String(buf);
+}
+
+// Push the current WiFi status to the UI (Setup tab + Status indicator),
+// only when something actually changed to avoid redraw churn.
+static void pushWifiInfoToUi(bool force) {
+    bool connected;
+    bool ap_mode;
+    String ssid;
+    String ip;
+    int rssi = 0;
+
+    if (wifi_prov_state == WIFI_PROV_AP_PORTAL) {
+        connected = true;  // AP is up
+        ap_mode = true;
+        ssid = ap_ssid_str;
+        ip = WiFi.softAPIP().toString();
+    } else if (WiFi.status() == WL_CONNECTED) {
+        connected = true;
+        ap_mode = false;
+        ssid = WiFi.SSID();
+        ip = WiFi.localIP().toString();
+        rssi = WiFi.RSSI();
+    } else {
+        connected = false;
+        ap_mode = false;
+        ssid = wifi_ssid;  // the network we are trying
+        ip = "";
+    }
+
+    if (!force && connected == ui_wifi_last_connected &&
+        ap_mode == ui_wifi_last_ap) {
+        // Still refresh RSSI/IP occasionally even if connect-state is same.
+        // (handled by periodic forced calls from loop)
+    }
+    ui_wifi_last_connected = connected;
+    ui_wifi_last_ap = ap_mode;
+    ui_set_wifi_info(connected, ap_mode, ssid.c_str(), ip.c_str(), rssi);
+}
+
+// ---- Captive portal HTTP handlers ----
+static String portalPageHtml() {
+    // Scan networks (synchronous; only called inside AP portal mode).
+    int n = WiFi.scanNetworks();
+    String opts = "";
+    for (int i = 0; i < n && i < 30; i++) {
+        String s = WiFi.SSID(i);
+        if (s.length() == 0) continue;
+        opts += "<option value=\"" + s + "\">" + s + " (" +
+                String(WiFi.RSSI(i)) + " dBm)</option>";
+    }
+    WiFi.scanDelete();
+
+    String html =
+        "<!DOCTYPE html><html><head><meta name='viewport' "
+        "content='width=device-width,initial-scale=1'>"
+        "<title>SpotWelder WiFi Setup</title><style>"
+        "body{font-family:sans-serif;background:#0b1623;color:#eee;margin:0;"
+        "padding:20px}h2{color:#39c}label{display:block;margin:14px 0 4px}"
+        "input,select{width:100%;padding:10px;font-size:16px;border-radius:8px;"
+        "border:1px solid #345;background:#13202f;color:#fff;box-sizing:border-box}"
+        "button{margin-top:18px;width:100%;padding:14px;font-size:18px;"
+        "background:#2a8;color:#fff;border:0;border-radius:8px}"
+        ".card{max-width:420px;margin:auto;background:#13202f;padding:20px;"
+        "border-radius:12px}</style></head><body><div class='card'>"
+        "<h2>SpotWelder WiFi Setup</h2>"
+        "<form action='/save' method='POST'>"
+        "<label>Network</label><select name='ssid' id='ssid'>" +
+        opts +
+        "</select>"
+        "<label>or type SSID</label><input name='ssid_manual' "
+        "placeholder='(optional, overrides above)'>"
+        "<label>Password</label><input name='pass' type='password' "
+        "placeholder='WiFi password'>"
+        "<button type='submit'>Save &amp; Connect</button>"
+        "</form><p style='color:#789;font-size:13px;margin-top:16px'>"
+        "The welder will reboot and join this network. If it fails it will "
+        "return to this setup screen.</p></div></body></html>";
+    return html;
+}
+
+static void handlePortalRoot() {
+    portalServer.send(200, "text/html", portalPageHtml());
+}
+
+static void handlePortalSave() {
+    String ssid = portalServer.arg("ssid");
+    String manual = portalServer.arg("ssid_manual");
+    if (manual.length() > 0) ssid = manual;
+    String pass = portalServer.arg("pass");
+    ssid.trim();
+
+    if (ssid.length() == 0) {
+        portalServer.send(200, "text/html",
+                          "<html><body style='font-family:sans-serif;"
+                          "background:#0b1623;color:#eee;padding:24px'>"
+                          "<h3>No network selected.</h3>"
+                          "<a style='color:#39c' href='/'>Go back</a>"
+                          "</body></html>");
         return;
     }
 
-    server_started = false;
+    save_wifi_creds_to_nvs(ssid, pass);
+    wifi_ssid = ssid;
+    wifi_pass = pass;
+
+    portalServer.send(
+        200, "text/html",
+        "<html><head><meta name='viewport' "
+        "content='width=device-width,initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#0b1623;color:#eee;"
+        "padding:24px'><h2>Saved!</h2><p>Connecting to <b>" +
+            ssid +
+            "</b>...</p><p>You can close this page. The welder display will "
+            "show the connection status.</p></body></html>");
+
+    wifi_creds_just_saved = true;  // loop() will reconnect
+}
+
+// Redirect every other request to the portal root (captive-portal behavior).
+static void handlePortalNotFound() {
+    portalServer.sendHeader("Location", "http://192.168.4.1/", true);
+    portalServer.send(302, "text/plain", "");
+}
+
+// ---- Provisioning mode transitions ----
+static void stopApPortal() {
+    portalServer.stop();
+    dnsServer.stop();
+    WiFi.softAPdisconnect(true);
+}
+
+static void startApPortal() {
+    Serial.println("[WiFi] Starting AP + captive portal (setup mode)");
+
+    // Drop any STA bridge client / server.
+    if (client) client.stop();
     server.stop();
-
-    if (client) {
-        client.stop();
-    }
-
     setUiConnected(false);
 
-    unsigned long now = millis();
-    if (now - last_attempt > 5000) {
-        last_attempt = now;
-        Serial.println("⚠️ WiFi disconnected; retrying...");
-        WiFi.disconnect(true);
-        delay(200);
-        WiFi.begin(ssid, password);
+    ap_ssid_str = makeApSsid();
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    // Open AP (no password) so the phone can auto-join from the QR code.
+    WiFi.softAP(ap_ssid_str.c_str());
+    delay(200);
+
+    dnsServer.start(DNS_PORT, "*", apIP);
+
+    portalServer.on("/", handlePortalRoot);
+    portalServer.on("/save", HTTP_POST, handlePortalSave);
+    portalServer.onNotFound(handlePortalNotFound);
+    portalServer.begin();
+
+    wifi_prov_state = WIFI_PROV_AP_PORTAL;
+    wifi_creds_just_saved = false;
+
+    Serial.printf("[WiFi] AP '%s' up at %s\n", ap_ssid_str.c_str(),
+                  apIP.toString().c_str());
+
+    // Tell the UI to show the QR provisioning view.
+    // WIFI: join string lets the phone auto-connect to the open AP, after
+    // which the captive portal pops automatically.
+    String qr = "WIFI:T:nopass;S:" + ap_ssid_str + ";;";
+    ui_show_wifi_setup(qr.c_str(), ap_ssid_str.c_str(),
+                       apIP.toString().c_str());
+    pushWifiInfoToUi(true);
+}
+
+// Begin (or restart) a STA connection attempt with the saved creds.
+static void startStaConnect() {
+    Serial.printf("[WiFi] Connecting (STA) to '%s'\n", wifi_ssid.c_str());
+    WiFi.mode(WIFI_STA);
+    esp_wifi_set_protocol(
+        WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+    wifi_prov_state = WIFI_PROV_STA_CONNECTING;
+    wifi_sta_attempt_start_ms = millis();
+    pushWifiInfoToUi(true);
+}
+
+// Public entry used by the boot sequence + the "Reconfigure WiFi" callback.
+static void beginWifiProvisioning() {
+    load_wifi_creds_from_nvs();
+    if (wifi_ssid.length() == 0) {
+        // First boot / no saved network -> go straight to the portal.
+        startApPortal();
+    } else {
+        startStaConnect();
+    }
+}
+
+// =========================
+// WiFi / server maintenance — drives the provisioning state machine.
+// Called every loop().
+// =========================
+void ensureWiFiAndServer() {
+    static unsigned long last_retry = 0;
+    static unsigned long last_ui_refresh = 0;
+    static bool server_started = false;
+
+    uint32_t now = millis();
+
+    // Periodically refresh WiFi info on the UI (RSSI/IP can drift).
+    if (now - last_ui_refresh > 3000) {
+        last_ui_refresh = now;
+        pushWifiInfoToUi(true);
+    }
+
+    switch (wifi_prov_state) {
+        case WIFI_PROV_AP_PORTAL:
+            dnsServer.processNextRequest();
+            portalServer.handleClient();
+            if (wifi_creds_just_saved) {
+                // New creds arrived from the portal: tear down AP, connect.
+                Serial.println("[WiFi] New creds saved -> switching to STA");
+                stopApPortal();
+                ui_hide_wifi_setup();
+                startStaConnect();
+            }
+            return;
+
+        case WIFI_PROV_STA_CONNECTING:
+            if (WiFi.status() == WL_CONNECTED) {
+                Serial.println("[WiFi] Connected - IP: " +
+                               WiFi.localIP().toString());
+                wifi_prov_state = WIFI_PROV_STA_CONNECTED;
+                pushWifiInfoToUi(true);
+                return;
+            }
+            // Timed out waiting for the saved network -> fall back to portal.
+            if (now - wifi_sta_attempt_start_ms > WIFI_STA_CONNECT_TIMEOUT_MS) {
+                Serial.println(
+                    "[WiFi] STA connect timed out -> AP portal fallback");
+                startApPortal();
+            }
+            return;
+
+        case WIFI_PROV_STA_CONNECTED:
+            if (WiFi.status() == WL_CONNECTED) {
+                if (!server_started) {
+                    Serial.println("✅ WiFi connected - IP: " +
+                                   WiFi.localIP().toString());
+                    Serial.println("Starting TCP server on port 8888...");
+                    server.begin();
+                    server.setNoDelay(true);
+                    server_started = true;
+                }
+                return;
+            }
+            // Lost connection -> retry STA, then portal-fallback via timeout.
+            server_started = false;
+            server.stop();
+            if (client) client.stop();
+            setUiConnected(false);
+            if (now - last_retry > 5000) {
+                last_retry = now;
+                Serial.println("⚠️ WiFi lost; reconnecting...");
+                startStaConnect();
+            }
+            return;
     }
 }
 
@@ -2207,6 +2511,45 @@ static void onContactDelayChange(uint8_t steps) {
 }
 
 // =========================
+// Setup-tab maintenance callbacks
+// =========================
+
+// "Reconfigure WiFi": tear down the current STA connection and bring up the
+// AP captive portal + QR code so the user can join a different network.
+static void onWifiReconfigure() {
+    Serial.println("[WiFi] Reconfigure requested from Setup tab");
+    startApPortal();
+}
+
+// "Restart": simply reboot the ESP32. Saved WiFi creds are retained in NVS,
+// so the device will reconnect normally on the next boot.
+static void onDeviceRestart() {
+    Serial.println("[Maint] Restart requested from Setup tab - rebooting...");
+    delay(200);
+    ESP.restart();
+}
+
+// "Factory Reset": wipe every NVS namespace this firmware uses (WiFi creds,
+// recipes, config, stats) and reboot. The device will come up in AP/portal
+// mode because the WiFi creds are gone.
+static void onFactoryReset() {
+    Serial.println("[Maint] FACTORY RESET requested - clearing all NVS...");
+    Preferences p;
+    const char* namespaces[] = {"wificfg", "weldcfg", "weldrecipe",
+                                "spotwelder", "weldstats"};
+    for (const char* ns : namespaces) {
+        if (p.begin(ns, false)) {
+            p.clear();
+            p.end();
+            Serial.printf("[Maint]   cleared NVS namespace '%s'\n", ns);
+        }
+    }
+    Serial.println("[Maint] Factory reset complete - rebooting...");
+    delay(300);
+    ESP.restart();
+}
+
+// =========================
 // Setup
 // =========================
 void setup() {
@@ -2330,18 +2673,25 @@ void setup() {
     ui_set_calibrate_cb(onCalibrate);
     ui_set_joule_apply_cb(onJouleApply);
     ui_set_contact_delay_cb(onContactDelayChange);
+
+    // --- Setup-tab (WiFi provisioning / maintenance) callbacks ---
+    ui_set_wifi_reconfigure_cb(onWifiReconfigure);
+    ui_set_restart_cb(onDeviceRestart);
+    ui_set_factory_reset_cb(onFactoryReset);
     Serial.println("[Boot] UI callbacks registered");
 
+    // --- Populate static System Info on the Setup tab ---
+    ui_set_system_info(FW_VERSION, ESP.getChipModel(),
+                       (uint32_t)ESP.getFlashChipSize(),
+                       (uint32_t)weld_count);
+
     // ==========================================================
-    // WiFi  (non-blocking – removed blocking wait)
+    // WiFi provisioning (non-blocking, cooperative with LVGL)
+    //   - Loads creds from NVS and connects (STA), OR
+    //   - Starts the AP captive portal + QR code if no creds.
     // ==========================================================
-    WiFi.mode(WIFI_STA);
-    esp_wifi_set_protocol(
-        WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
-    Serial.println("[Boot] 4/4 Starting WiFi + TCP services...");
-    Serial.print("Connecting to WiFi: ");
-    Serial.println(ssid);
-    WiFi.begin(ssid, password);
+    Serial.println("[Boot] 4/4 Starting WiFi provisioning + TCP services...");
+    beginWifiProvisioning();
 
     setup_done_ms = millis();
     Serial.println(

@@ -79,6 +79,9 @@ static contact_with_pedal_cb_t _cwp_cb = nullptr;
 static calibrate_cb_t _calibrate_cb = nullptr;
 static joule_apply_cb_t _joule_apply_cb = nullptr;
 static contact_delay_cb_t _contact_delay_cb = nullptr;
+static wifi_reconfigure_cb_t _wifi_reconfigure_cb = nullptr;
+static device_restart_cb_t _restart_cb = nullptr;
+static factory_reset_cb_t _factory_reset_cb = nullptr;
 
 // ============================================================
 // GLOBAL CONFIG STATE (Config tab v1)
@@ -321,7 +324,34 @@ static lv_obj_t* tab_status = nullptr;
 static lv_obj_t* tab_pulse = nullptr;
 static lv_obj_t* tab_joule = nullptr;
 static lv_obj_t* tab_config = nullptr;
-static lv_obj_t* tab_logs = nullptr;
+static lv_obj_t* tab_logs = nullptr;  // repurposed as the "Setup" tab
+
+// ============================================================
+// SETUP TAB + WiFi provisioning handles
+// ============================================================
+// WiFi status section
+static lv_obj_t* lbl_setup_wifi_state = nullptr;
+static lv_obj_t* lbl_setup_wifi_ssid = nullptr;
+static lv_obj_t* lbl_setup_wifi_ip = nullptr;
+static lv_obj_t* lbl_setup_wifi_rssi = nullptr;
+// System info section
+static lv_obj_t* lbl_setup_fw = nullptr;
+static lv_obj_t* lbl_setup_chip = nullptr;
+static lv_obj_t* lbl_setup_flash = nullptr;
+static lv_obj_t* lbl_setup_welds = nullptr;
+// Small WiFi indicator on the Status tab header
+static lv_obj_t* lbl_status_wifi = nullptr;
+
+// QR provisioning overlay (full-screen, shown during AP portal mode)
+static lv_obj_t* prov_overlay = nullptr;
+static lv_obj_t* prov_qr = nullptr;
+static lv_obj_t* lbl_prov_ssid = nullptr;
+static lv_obj_t* lbl_prov_ip = nullptr;
+
+// Confirmation modal (Restart / Factory Reset)
+static lv_obj_t* confirm_overlay = nullptr;
+static lv_obj_t* lbl_confirm_msg = nullptr;
+static int confirm_action = 0;  // 1 = restart, 2 = factory reset
 
 // ============================================================
 // STATIC UI HANDLES  (Pulse tab – Production)
@@ -692,12 +722,14 @@ static void build_status_tab(lv_obj_t* tab) {
     const int R1_Y = 0;
     const int R1_H = 58;
     const int MODE_W = 150;
-    const int TRIG_W = 280;
+    const int TRIG_W = 236;  // shrunk to make room for the WiFi indicator
+    const int WIFI_W = 34;   // small WiFi status indicator
     const int LEADR_W = 200;
     const int WELDS_W = 120;
     const int MODE_X = 0;
     const int TRIG_X = MODE_X + MODE_W + GAP;     // 160
-    const int LEADR_X = TRIG_X + TRIG_W + GAP;    // 450
+    const int WIFI_X = TRIG_X + TRIG_W + GAP;     // 406
+    const int LEADR_X = WIFI_X + WIFI_W + GAP;    // 450
     const int WELDS_X = LEADR_X + LEADR_W + GAP;  // 660 (ends at 780)
 
     // ---- MODE box ----
@@ -751,6 +783,16 @@ static void build_status_tab(lv_obj_t* tab) {
         lv_obj_set_style_text_color(lbl_dash_trigger, C_ACCENT, 0);
         lv_obj_set_style_text_font(lbl_dash_trigger, &lv_font_montserrat_18, 0);
         lv_obj_align(lbl_dash_trigger, LV_ALIGN_BOTTOM_MID, 0, -6);
+    }
+
+    // ---- WiFi status indicator (small, between TRIGGER and LEAD R) ----
+    {
+        lv_obj_t* p = make_panel(tab, WIFI_X, R1_Y, WIFI_W, R1_H);
+        lbl_status_wifi = lv_label_create(p);
+        lv_label_set_text(lbl_status_wifi, LV_SYMBOL_WIFI);
+        lv_obj_set_style_text_color(lbl_status_wifi, C_GREY, 0);
+        lv_obj_set_style_text_font(lbl_status_wifi, &lv_font_montserrat_18, 0);
+        lv_obj_center(lbl_status_wifi);
     }
 
     // ---- LEAD R box ----
@@ -1764,20 +1806,190 @@ static void build_joule_tab(lv_obj_t* tab) {
 }
 
 // ============================================================
-// PLACEHOLDER TAB BUILDER
+// SETUP TAB helpers
 // ============================================================
-static void build_placeholder_tab(lv_obj_t* tab, const char* name) {
+
+// Create a "key:  value" row inside a panel. Returns the value label.
+static lv_obj_t* make_kv_row(lv_obj_t* parent, const char* key,
+                             lv_obj_t** out_val, int x, int y, int key_w) {
+    lv_obj_t* k = lv_label_create(parent);
+    lv_label_set_text(k, key);
+    lv_obj_set_style_text_color(k, C_GREY, 0);
+    lv_obj_set_style_text_font(k, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(k, x, y + 2);
+
+    lv_obj_t* v = lv_label_create(parent);
+    lv_label_set_text(v, "--");
+    lv_obj_set_style_text_color(v, C_WHITE, 0);
+    lv_obj_set_style_text_font(v, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(v, x + key_w, y);
+    if (out_val) *out_val = v;
+    return v;
+}
+
+// ---- Confirmation modal (Restart / Factory Reset) ----
+static void confirm_yes_event(lv_event_t* e) {
+    (void)e;
+    int act = confirm_action;
+    if (confirm_overlay) lv_obj_add_flag(confirm_overlay, LV_OBJ_FLAG_HIDDEN);
+    if (act == 1 && _restart_cb) {
+        _restart_cb();
+    } else if (act == 2 && _factory_reset_cb) {
+        _factory_reset_cb();
+    }
+}
+
+static void confirm_no_event(lv_event_t* e) {
+    (void)e;
+    if (confirm_overlay) lv_obj_add_flag(confirm_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// Build the modal once (lazily), on the top layer so it floats over any tab.
+static void ensure_confirm_overlay() {
+    if (confirm_overlay) return;
+
+    confirm_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(confirm_overlay);
+    lv_obj_set_size(confirm_overlay, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(confirm_overlay, 0, 0);
+    lv_obj_set_style_bg_color(confirm_overlay, lv_color_hex(0x000000), 0);
+    lv_obj_set_style_bg_opa(confirm_overlay, LV_OPA_70, 0);
+    lv_obj_clear_flag(confirm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(confirm_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t* card = make_panel(confirm_overlay, 0, 0, 460, 220);
+    lv_obj_align(card, LV_ALIGN_CENTER, 0, 0);
+
+    lbl_confirm_msg = lv_label_create(card);
+    lv_label_set_text(lbl_confirm_msg, "Are you sure?");
+    lv_obj_set_style_text_color(lbl_confirm_msg, C_WHITE, 0);
+    lv_obj_set_style_text_font(lbl_confirm_msg, &lv_font_montserrat_18, 0);
+    lv_label_set_long_mode(lbl_confirm_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_confirm_msg, 420);
+    lv_obj_set_style_text_align(lbl_confirm_msg, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(lbl_confirm_msg, LV_ALIGN_TOP_MID, 0, 30);
+
+    lv_obj_t* lbl_no = nullptr;
+    lv_obj_t* btn_no =
+        make_cfg_button(card, "Cancel", &lbl_no, 40, 140, 170, 56, C_DARK_GREY);
+    lv_obj_add_event_cb(btn_no, confirm_no_event, LV_EVENT_CLICKED, nullptr);
+
+    lv_obj_t* lbl_yes = nullptr;
+    lv_obj_t* btn_yes =
+        make_cfg_button(card, "Confirm", &lbl_yes, 250, 140, 170, 56, C_RED);
+    lv_obj_add_event_cb(btn_yes, confirm_yes_event, LV_EVENT_CLICKED, nullptr);
+}
+
+static void show_confirm(int action, const char* msg) {
+    ensure_confirm_overlay();
+    confirm_action = action;
+    if (lbl_confirm_msg) lv_label_set_text(lbl_confirm_msg, msg);
+    lv_obj_clear_flag(confirm_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(confirm_overlay);
+}
+
+// ---- Setup-tab button events ----
+static void on_setup_reconfigure(lv_event_t* e) {
+    (void)e;
+    if (_wifi_reconfigure_cb) _wifi_reconfigure_cb();
+}
+
+static void on_setup_restart(lv_event_t* e) {
+    (void)e;
+    show_confirm(1, "Restart the controller now?\nSaved WiFi will reconnect.");
+}
+
+static void on_setup_factory_reset(lv_event_t* e) {
+    (void)e;
+    show_confirm(2,
+                 "FACTORY RESET erases WiFi credentials, recipes, config and "
+                 "weld stats, then reboots into setup mode. Continue?");
+}
+
+// ============================================================
+// SETUP TAB BUILDER  (replaces the old "Logs" placeholder)
+//   Section 1: WiFi status + Reconfigure
+//   Section 2: System info
+//   Section 3: Maintenance (Restart / Factory Reset)
+// ============================================================
+static void build_setup_tab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
+    lv_obj_set_style_pad_all(tab, 10, LV_PART_MAIN);
     lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
-    char buf[64];
-    snprintf(buf, sizeof(buf), "%s\n(coming in Phase 2)", name);
+    const int GAP = 10;
+    const int COL_W = 380;
+    const int COL2_X = COL_W + GAP;  // 390
 
-    lv_obj_t* lbl = lv_label_create(tab);
-    lv_label_set_text(lbl, buf);
-    lv_obj_set_style_text_color(lbl, C_GREY, LV_PART_MAIN);
-    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_center(lbl);
+    // ---------------------------------------------------------
+    // Section 1: WiFi / Connection (top-left panel)
+    // ---------------------------------------------------------
+    {
+        lv_obj_t* p = make_panel(tab, 0, 0, COL_W, 190);
+
+        lv_obj_t* title = lv_label_create(p);
+        lv_label_set_text(title, LV_SYMBOL_WIFI "  Connection");
+        lv_obj_set_style_text_color(title, C_ACCENT, 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(title, 12, 10);
+
+        make_kv_row(p, "Status", &lbl_setup_wifi_state, 12, 42, 95);
+        make_kv_row(p, "Network", &lbl_setup_wifi_ssid, 12, 68, 95);
+        make_kv_row(p, "IP", &lbl_setup_wifi_ip, 12, 94, 95);
+        make_kv_row(p, "Signal", &lbl_setup_wifi_rssi, 12, 120, 95);
+
+        lv_obj_t* lbl_rc = nullptr;
+        lv_obj_t* btn_rc = make_cfg_button(p, LV_SYMBOL_REFRESH " Reconfigure",
+                                           &lbl_rc, 12, 148, COL_W - 24, 34,
+                                           C_ACCENT);
+        lv_obj_add_event_cb(btn_rc, on_setup_reconfigure, LV_EVENT_CLICKED,
+                            nullptr);
+    }
+
+    // ---------------------------------------------------------
+    // Section 2: System info (top-right panel)
+    // ---------------------------------------------------------
+    {
+        lv_obj_t* p = make_panel(tab, COL2_X, 0, COL_W, 190);
+
+        lv_obj_t* title = lv_label_create(p);
+        lv_label_set_text(title, LV_SYMBOL_LIST "  System Info");
+        lv_obj_set_style_text_color(title, C_ACCENT, 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(title, 12, 10);
+
+        make_kv_row(p, "Firmware", &lbl_setup_fw, 12, 42, 110);
+        make_kv_row(p, "Chip", &lbl_setup_chip, 12, 68, 110);
+        make_kv_row(p, "Flash", &lbl_setup_flash, 12, 94, 110);
+        make_kv_row(p, "Total welds", &lbl_setup_welds, 12, 120, 110);
+    }
+
+    // ---------------------------------------------------------
+    // Section 3: Maintenance (full-width panel)
+    // ---------------------------------------------------------
+    {
+        lv_obj_t* p = make_panel(tab, 0, 200, COL_W * 2 + GAP, 100);
+
+        lv_obj_t* title = lv_label_create(p);
+        lv_label_set_text(title, LV_SYMBOL_SETTINGS "  Maintenance");
+        lv_obj_set_style_text_color(title, C_ACCENT, 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(title, 12, 10);
+
+        lv_obj_t* lbl_rs = nullptr;
+        lv_obj_t* btn_rs = make_cfg_button(p, LV_SYMBOL_POWER " Restart",
+                                           &lbl_rs, 12, 44, 360, 44,
+                                           C_DARK_GREY);
+        lv_obj_add_event_cb(btn_rs, on_setup_restart, LV_EVENT_CLICKED,
+                            nullptr);
+
+        lv_obj_t* lbl_fr = nullptr;
+        lv_obj_t* btn_fr = make_cfg_button(p, LV_SYMBOL_TRASH " Factory Reset",
+                                           &lbl_fr, 388, 44, 360, 44, C_RED);
+        lv_obj_add_event_cb(btn_fr, on_setup_factory_reset, LV_EVENT_CLICKED,
+                            nullptr);
+    }
 }
 
 // ============================================================
@@ -2369,14 +2581,14 @@ void ui_init(arm_toggle_cb_t on_arm_toggle, recipe_apply_cb_t on_recipe_apply) {
     tab_pulse = lv_tabview_add_tab(tv, LV_SYMBOL_CHARGE " Pulse");
     tab_joule = lv_tabview_add_tab(tv, LV_SYMBOL_BATTERY_FULL " Joule");
     tab_config = lv_tabview_add_tab(tv, LV_SYMBOL_SETTINGS " Config");
-    tab_logs = lv_tabview_add_tab(tv, LV_SYMBOL_BELL " Logs");
+    tab_logs = lv_tabview_add_tab(tv, LV_SYMBOL_WIFI " Setup");
 
     // Build all tab contents now that tab objects exist
     build_status_tab(tab_status);
     build_pulse_tab(tab_pulse);
     build_joule_tab(tab_joule);
     build_config_tab(tab_config);
-    build_placeholder_tab(tab_logs, "Logs");
+    build_setup_tab(tab_logs);
 
     // Apply initial step sizes to spinboxes
     apply_time_step_to_spinboxes();
@@ -2971,3 +3183,165 @@ void ui_notify_cal_message(const char* line) {
 void ui_set_joule_apply_cb(joule_apply_cb_t cb) { _joule_apply_cb = cb; }
 
 void ui_set_contact_delay_cb(contact_delay_cb_t cb) { _contact_delay_cb = cb; }
+// ============================================================
+// SETUP TAB: callback registration
+// ============================================================
+void ui_set_wifi_reconfigure_cb(wifi_reconfigure_cb_t cb) {
+    _wifi_reconfigure_cb = cb;
+}
+
+void ui_set_restart_cb(device_restart_cb_t cb) { _restart_cb = cb; }
+
+void ui_set_factory_reset_cb(factory_reset_cb_t cb) { _factory_reset_cb = cb; }
+
+// ============================================================
+// SETUP TAB: live WiFi status
+// ============================================================
+void ui_set_wifi_info(bool connected, bool ap_mode, const char* ssid,
+                      const char* ip, int rssi) {
+    // --- Setup tab "Connection" panel ---
+    if (lbl_setup_wifi_state) {
+        if (ap_mode) {
+            lv_label_set_text(lbl_setup_wifi_state, "Setup mode (AP)");
+            lv_obj_set_style_text_color(lbl_setup_wifi_state, C_YELLOW, 0);
+        } else if (connected) {
+            lv_label_set_text(lbl_setup_wifi_state, "Connected");
+            lv_obj_set_style_text_color(lbl_setup_wifi_state, C_GREEN, 0);
+        } else {
+            lv_label_set_text(lbl_setup_wifi_state, "Disconnected");
+            lv_obj_set_style_text_color(lbl_setup_wifi_state, C_RED, 0);
+        }
+    }
+    if (lbl_setup_wifi_ssid) {
+        lv_label_set_text(lbl_setup_wifi_ssid,
+                          (ssid && ssid[0]) ? ssid : "--");
+    }
+    if (lbl_setup_wifi_ip) {
+        lv_label_set_text(lbl_setup_wifi_ip, (ip && ip[0]) ? ip : "--");
+    }
+    if (lbl_setup_wifi_rssi) {
+        if (connected && !ap_mode) {
+            char buf[24];
+            snprintf(buf, sizeof(buf), "%d dBm", rssi);
+            lv_label_set_text(lbl_setup_wifi_rssi, buf);
+        } else {
+            lv_label_set_text(lbl_setup_wifi_rssi, "--");
+        }
+    }
+
+    // --- Small indicator on the Status tab header ---
+    if (lbl_status_wifi) {
+        lv_color_t col = C_GREY;
+        if (ap_mode)
+            col = C_YELLOW;
+        else if (connected)
+            col = C_GREEN;
+        lv_obj_set_style_text_color(lbl_status_wifi, col, 0);
+    }
+}
+
+// ============================================================
+// SETUP TAB: static system info (set once at boot)
+// ============================================================
+void ui_set_system_info(const char* fw_version, const char* chip_model,
+                        uint32_t flash_size_bytes, uint32_t lifetime_welds) {
+    if (lbl_setup_fw && fw_version) lv_label_set_text(lbl_setup_fw, fw_version);
+    if (lbl_setup_chip && chip_model)
+        lv_label_set_text(lbl_setup_chip, chip_model);
+    if (lbl_setup_flash) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u MB",
+                 (unsigned)(flash_size_bytes / (1024U * 1024U)));
+        lv_label_set_text(lbl_setup_flash, buf);
+    }
+    if (lbl_setup_welds) {
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%u", (unsigned)lifetime_welds);
+        lv_label_set_text(lbl_setup_welds, buf);
+    }
+}
+
+// ============================================================
+// WiFi provisioning QR overlay (full screen, top layer)
+// ============================================================
+static void ensure_prov_overlay() {
+    if (prov_overlay) return;
+
+    prov_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(prov_overlay);
+    lv_obj_set_size(prov_overlay, LV_HOR_RES, LV_VER_RES);
+    lv_obj_set_pos(prov_overlay, 0, 0);
+    lv_obj_set_style_bg_color(prov_overlay, C_BG, 0);
+    lv_obj_set_style_bg_opa(prov_overlay, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(prov_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(prov_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    // Heading
+    lv_obj_t* head = lv_label_create(prov_overlay);
+    lv_label_set_text(head, LV_SYMBOL_WIFI "  WiFi Setup");
+    lv_obj_set_style_text_color(head, C_ACCENT, 0);
+    lv_obj_set_style_text_font(head, &lv_font_montserrat_24, 0);
+    lv_obj_align(head, LV_ALIGN_TOP_MID, 0, 16);
+
+    // Instructions (left side)
+    lv_obj_t* steps = lv_label_create(prov_overlay);
+    lv_label_set_text(steps,
+                      "1. Scan this QR code with your phone\n"
+                      "   (or join the WiFi network below).\n\n"
+                      "2. A setup page opens automatically.\n\n"
+                      "3. Pick your home WiFi and enter\n"
+                      "   its password, then Save.\n\n"
+                      "The welder reboots and connects.");
+    lv_obj_set_style_text_color(steps, C_WHITE, 0);
+    lv_obj_set_style_text_font(steps, &lv_font_montserrat_16, 0);
+    lv_obj_align(steps, LV_ALIGN_LEFT_MID, 24, 10);
+
+    // QR code (right side)
+    prov_qr = lv_qrcode_create(prov_overlay);
+    lv_qrcode_set_size(prov_qr, 200);
+    lv_qrcode_set_dark_color(prov_qr, lv_color_hex(0x000000));
+    lv_qrcode_set_light_color(prov_qr, lv_color_hex(0xFFFFFF));
+    lv_obj_set_style_border_color(prov_qr, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_border_width(prov_qr, 6, 0);
+    lv_obj_align(prov_qr, LV_ALIGN_RIGHT_MID, -60, -6);
+
+    lbl_prov_ssid = lv_label_create(prov_overlay);
+    lv_label_set_text(lbl_prov_ssid, "Network: --");
+    lv_obj_set_style_text_color(lbl_prov_ssid, C_GREEN, 0);
+    lv_obj_set_style_text_font(lbl_prov_ssid, &lv_font_montserrat_16, 0);
+    lv_obj_align(lbl_prov_ssid, LV_ALIGN_RIGHT_MID, -20, 118);
+
+    lbl_prov_ip = lv_label_create(prov_overlay);
+    lv_label_set_text(lbl_prov_ip, "Setup page: http://192.168.4.1");
+    lv_obj_set_style_text_color(lbl_prov_ip, C_GREY, 0);
+    lv_obj_set_style_text_font(lbl_prov_ip, &lv_font_montserrat_14, 0);
+    lv_obj_align(lbl_prov_ip, LV_ALIGN_BOTTOM_MID, 0, -14);
+}
+
+void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
+                        const char* portal_ip) {
+    ensure_prov_overlay();
+
+    if (prov_qr && qr_payload) {
+        lv_qrcode_update(prov_qr, qr_payload, strlen(qr_payload));
+    }
+    if (lbl_prov_ssid) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Network: %s",
+                 (ap_ssid && ap_ssid[0]) ? ap_ssid : "--");
+        lv_label_set_text(lbl_prov_ssid, buf);
+    }
+    if (lbl_prov_ip) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "Setup page: http://%s",
+                 (portal_ip && portal_ip[0]) ? portal_ip : "192.168.4.1");
+        lv_label_set_text(lbl_prov_ip, buf);
+    }
+
+    lv_obj_clear_flag(prov_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(prov_overlay);
+}
+
+void ui_hide_wifi_setup() {
+    if (prov_overlay) lv_obj_add_flag(prov_overlay, LV_OBJ_FLAG_HIDDEN);
+}

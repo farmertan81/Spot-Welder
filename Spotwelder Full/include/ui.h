@@ -131,6 +131,15 @@ typedef void (*joule_apply_cb_t)(bool mode_joule, float target_j,
 // steps: 1-10, each step = 0.5 s.
 typedef void (*contact_delay_cb_t)(uint8_t steps);
 
+// ---- Setup tab (WiFi provisioning + maintenance) callbacks ----
+// "Reconfigure WiFi": main.cpp should drop STA, start the AP + captive
+// portal, and call ui_show_wifi_setup() with the QR payload.
+typedef void (*wifi_reconfigure_cb_t)(void);
+// "Restart Device": main.cpp should ESP.restart().
+typedef void (*device_restart_cb_t)(void);
+// "Factory Reset": main.cpp should erase all NVS (incl. WiFi creds) + restart.
+typedef void (*factory_reset_cb_t)(void);
+
 // Phase 1B shared telemetry globals (defined in src/main.cpp)
 // Kept here so ui.cpp and other modules can read the live parser outputs.
 extern float weld_v;
@@ -200,5 +209,39 @@ void ui_set_touch_active(bool active);
 // on "Calibrating... keep leads shorted".  Safe to call from loop()/UART
 // poll (same task as lv_timer_handler).
 void ui_notify_cal_message(const char* line);
+
+// ============================================================
+// SETUP TAB API (WiFi status, system info, maintenance, provisioning)
+// ============================================================
+
+// Register Setup-tab maintenance callbacks (call before or after ui_init).
+void ui_set_wifi_reconfigure_cb(wifi_reconfigure_cb_t cb);
+void ui_set_restart_cb(device_restart_cb_t cb);
+void ui_set_factory_reset_cb(factory_reset_cb_t cb);
+
+// Update the live WiFi status shown on the Setup tab + the Status-tab
+// indicator. Call whenever WiFi state changes (connect / disconnect / AP).
+//   connected : true if associated to a STA network (or AP is up)
+//   ap_mode   : true if running the provisioning Access Point
+//   ssid      : network name (STA) or AP name (AP mode); may be ""
+//   ip        : dotted-quad IP string; may be ""
+//   rssi      : signal strength in dBm (0 if unknown / AP mode)
+void ui_set_wifi_info(bool connected, bool ap_mode, const char* ssid,
+                      const char* ip, int rssi);
+
+// Set the (mostly static) system-info fields shown on the Setup tab.
+// Call once at boot; uptime/heap are refreshed via ui_update().
+void ui_set_system_info(const char* fw_version, const char* chip_model,
+                        uint32_t flash_size_bytes, uint32_t lifetime_welds);
+
+// Enter the WiFi-provisioning view on the Setup tab: shows a QR code that
+// encodes qr_payload (a WIFI:... join string or a URL), plus the AP name and
+// portal IP as text + instructions. Switches the tabview to the Setup tab.
+void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
+                        const char* portal_ip);
+
+// Leave the provisioning view and return the Setup tab to its normal
+// (status/info/maintenance) layout.
+void ui_hide_wifi_setup();
 
 #endif // UI_H
