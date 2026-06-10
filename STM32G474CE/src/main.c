@@ -3310,6 +3310,26 @@ static void performLeadCalibration(void) {
         return;
     }
 
+    /* ---- Prevent a double pulse in contact mode ----
+     * The tips are shorted right now (that short is what triggered the
+     * calibration). performLeadCalibration() detects the trigger with its own
+     * LOCAL hold timer and never touches the GLOBAL contact-trigger state that
+     * pollContactTrigger() uses in the main loop. So once we return, the still
+     * shorted tips look like a fresh weld trigger to pollContactTrigger(),
+     * which then fires a real (second) full-energy weld -- the reported double
+     * pulse.
+     *
+     * Latch the same fire-lock that pollContactTrigger() sets after it fires.
+     * This forces the operator to release the tips (contact opens) before any
+     * further weld can fire; pollContactTrigger() auto-clears the lock on that
+     * release edge. Pedal mode is edge-triggered (pollPedal) so it is not
+     * affected and needs no change. */
+    if (trigger_mode == 2) {
+        contact_fire_lock     = true;
+        contact_hold_active   = true;
+        contact_hold_start_ms = HAL_GetTick();
+    }
+
     uartSend("CAL_STATUS=MEASURING");
 
     /* ---- Prepare exactly like a weld: charger off, fast ADC ---- */
