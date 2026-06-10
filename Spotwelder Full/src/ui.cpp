@@ -160,6 +160,7 @@ struct HoldRepeatCtx {
     bool is_increment;  // true = +, false = -
     bool is_power;      // true = power button (not spinbox)
     void (*step_fn)(bool inc);  // generic step action (nullptr = use spinbox/power)
+    bool active;        // true only while the finger is physically down
     uint32_t press_start;
     uint32_t last_repeat;
 };
@@ -176,6 +177,7 @@ static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc,
     ctx->is_increment = inc;
     ctx->is_power = is_power;
     ctx->step_fn = nullptr;
+    ctx->active = false;
     ctx->press_start = 0;
     ctx->last_repeat = 0;
     return ctx;
@@ -196,6 +198,7 @@ static void on_repeat_pressed(lv_event_t* e) {
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
     if (!ctx) return;
     uint32_t now = millis();
+    ctx->active = true;        // finger is physically down
     ctx->press_start = now;
     ctx->last_repeat = now;
 
@@ -219,6 +222,7 @@ static void on_repeat_pressing(lv_event_t* e) {
 
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
     if (!ctx) return;
+    if (!ctx->active) return;   // finger already released — ignore stray events
     uint32_t now = millis();
 
     // Wait for initial delay
@@ -239,6 +243,18 @@ static void on_repeat_pressing(lv_event_t* e) {
             lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
         }
     }
+}
+
+// Stop repeating the instant the finger lifts (or the press is lost).
+// Resets the context so any late/stray PRESSING event returns early.
+static void on_repeat_released(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
+    HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
+    if (!ctx) return;
+    ctx->active = false;       // immediate stop
+    ctx->press_start = 0;
+    ctx->last_repeat = 0;
 }
 
 // ============================================================
@@ -317,8 +333,11 @@ static bool _mode_longpress_fired = false;
 // ============================================================
 static lv_obj_t* lbl_joule_target = nullptr;
 static lv_obj_t* lbl_joule_maxdur = nullptr;
+static lv_obj_t* btn_joule_apply = nullptr;
+static lv_obj_t* lbl_joule_apply = nullptr;
 
 // Joule-tab draft state (edited locally; committed on APPLY)
+static bool     _joule_dirty = false;        // true = unsent edits pending
 static bool     _joule_draft_mode = false;   // false=TIME, true=JOULE
 static float    _joule_draft_target = 50.0f; // J
 static uint16_t _joule_draft_maxms = 40;     // ms
@@ -1327,11 +1346,19 @@ static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
                             ctx_dec);
         lv_obj_add_event_cb(btn_dec, on_repeat_pressing, LV_EVENT_PRESSING,
                             ctx_dec);
+        lv_obj_add_event_cb(btn_dec, on_repeat_released, LV_EVENT_RELEASED,
+                            ctx_dec);
+        lv_obj_add_event_cb(btn_dec, on_repeat_released, LV_EVENT_PRESS_LOST,
+                            ctx_dec);
     }
     if (ctx_inc) {
         lv_obj_add_event_cb(btn_inc, on_repeat_pressed, LV_EVENT_PRESSED,
                             ctx_inc);
         lv_obj_add_event_cb(btn_inc, on_repeat_pressing, LV_EVENT_PRESSING,
+                            ctx_inc);
+        lv_obj_add_event_cb(btn_inc, on_repeat_released, LV_EVENT_RELEASED,
+                            ctx_inc);
+        lv_obj_add_event_cb(btn_inc, on_repeat_released, LV_EVENT_PRESS_LOST,
                             ctx_inc);
     }
 
@@ -1530,6 +1557,10 @@ static void build_pulse_tab(lv_obj_t* tab) {
                                 LV_EVENT_PRESSED, ctx);
             lv_obj_add_event_cb(btn_power_minus, on_repeat_pressing,
                                 LV_EVENT_PRESSING, ctx);
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_released,
+                                LV_EVENT_RELEASED, ctx);
+            lv_obj_add_event_cb(btn_power_minus, on_repeat_released,
+                                LV_EVENT_PRESS_LOST, ctx);
         }
     }
     make_interaction_safe(btn_power_minus);
@@ -1576,6 +1607,10 @@ static void build_pulse_tab(lv_obj_t* tab) {
                                 LV_EVENT_PRESSED, ctx);
             lv_obj_add_event_cb(btn_power_plus, on_repeat_pressing,
                                 LV_EVENT_PRESSING, ctx);
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_released,
+                                LV_EVENT_RELEASED, ctx);
+            lv_obj_add_event_cb(btn_power_plus, on_repeat_released,
+                                LV_EVENT_PRESS_LOST, ctx);
         }
     }
     make_interaction_safe(btn_power_plus);
@@ -1693,6 +1728,15 @@ static void paint_joule_tab() {
         snprintf(buf, sizeof(buf), "%u ms", (unsigned)_joule_draft_maxms);
         lv_label_set_text(lbl_joule_maxdur, buf);
     }
+
+    // Apply button state machine:
+    //   _joule_dirty == true  -> "APPLY"  (green, tappable)
+    //   _joule_dirty == false -> "APPLIED" (grey, already sent / in sync)
+    if (btn_joule_apply)
+        lv_obj_set_style_bg_color(btn_joule_apply,
+                                  _joule_dirty ? C_GREEN : C_DARK_GREY, 0);
+    if (lbl_joule_apply)
+        lv_label_set_text(lbl_joule_apply, _joule_dirty ? "APPLY" : "APPLIED");
 }
 
 // ============================================================
@@ -1705,7 +1749,8 @@ static void joule_target_step(bool inc) {
         _joule_draft_target += JOULE_TARGET_STEP;
     else
         _joule_draft_target -= JOULE_TARGET_STEP;
-    paint_joule_tab();  // clamps + repaints
+    _joule_dirty = true;  // re-arm APPLY
+    paint_joule_tab();    // clamps + repaints
 }
 
 static void joule_maxdur_step(bool inc) {
@@ -1718,20 +1763,21 @@ static void joule_maxdur_step(bool inc) {
         else
             _joule_draft_maxms = JOULE_MAXMS_MIN;
     }
-    paint_joule_tab();  // clamps + repaints
+    _joule_dirty = true;  // re-arm APPLY
+    paint_joule_tab();    // clamps + repaints
 }
 
-// Send the current Joule settings to the STM32 when the user lifts their
-// finger off a +/- stepper. Sending on RELEASE (instead of on every step)
-// means a hold-to-repeat ramp results in a single commit, avoiding UART/flash
-// churn. There is no separate Apply button anymore – settings auto-commit.
-static void on_joule_setting_released(lv_event_t* e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
+// Commit the current Joule settings to the STM32 when the user taps APPLY.
+// Tapping is the only commit path – edits stay local (dirty) until applied.
+static void on_joule_apply(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (!_joule_dirty) return;  // nothing to send
     clamp_joule_draft();
     if (_joule_apply_cb)
         _joule_apply_cb(_joule_draft_mode, _joule_draft_target,
                         _joule_draft_maxms);
+    _joule_dirty = false;  // back to "APPLIED" grey
+    paint_joule_tab();
 }
 
 // ============================================================
@@ -1765,8 +1811,9 @@ static void build_joule_tab(lv_obj_t* tab) {
     }
     y += 64;
 
-    // Stepper geometry – wider value field + taller buttons now that the mode
-    // toggles and APPLY button are gone (more vertical room available).
+    // Stepper geometry – steppers occupy the left column; the APPLY button
+    // sits in the right column (x>=440), so keep the +/- value field narrow
+    // enough that the increment button ends well left of the APPLY button.
     const int STEP_W = 80;
     const int VAL_W = 220;
     const int DEC_X = LABEL_X;
@@ -1791,10 +1838,8 @@ static void build_joule_tab(lv_obj_t* tab) {
         HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_target_step, false);
         lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
         lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
-        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_RELEASED,
-                            nullptr);
-        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_PRESS_LOST,
-                            nullptr);
+        lv_obj_add_event_cb(d, on_repeat_released, LV_EVENT_RELEASED, cd);
+        lv_obj_add_event_cb(d, on_repeat_released, LV_EVENT_PRESS_LOST, cd);
 
         lbl_joule_target = lv_label_create(tab);
         lv_label_set_text(lbl_joule_target, "50 J");
@@ -1811,10 +1856,8 @@ static void build_joule_tab(lv_obj_t* tab) {
         HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_target_step, true);
         lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
         lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
-        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_RELEASED,
-                            nullptr);
-        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_PRESS_LOST,
-                            nullptr);
+        lv_obj_add_event_cb(i, on_repeat_released, LV_EVENT_RELEASED, ci);
+        lv_obj_add_event_cb(i, on_repeat_released, LV_EVENT_PRESS_LOST, ci);
     }
     y += BTN_H + 28;
 
@@ -1835,10 +1878,8 @@ static void build_joule_tab(lv_obj_t* tab) {
         HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_maxdur_step, false);
         lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
         lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
-        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_RELEASED,
-                            nullptr);
-        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_PRESS_LOST,
-                            nullptr);
+        lv_obj_add_event_cb(d, on_repeat_released, LV_EVENT_RELEASED, cd);
+        lv_obj_add_event_cb(d, on_repeat_released, LV_EVENT_PRESS_LOST, cd);
 
         lbl_joule_maxdur = lv_label_create(tab);
         lv_label_set_text(lbl_joule_maxdur, "40 ms");
@@ -1855,12 +1896,36 @@ static void build_joule_tab(lv_obj_t* tab) {
         HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_maxdur_step, true);
         lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
         lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
-        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_RELEASED,
-                            nullptr);
-        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_PRESS_LOST,
-                            nullptr);
+        lv_obj_add_event_cb(i, on_repeat_released, LV_EVENT_RELEASED, ci);
+        lv_obj_add_event_cb(i, on_repeat_released, LV_EVENT_PRESS_LOST, ci);
     }
     y += BTN_H + 22;
+
+    // ---- APPLY button (right side, spans both steppers vertically) ----
+    // Widget A pattern (plain lv_obj, no lv_button) to avoid touch shudder.
+    // Shows "APPLY" (green) when there are unsent edits, "APPLIED" (grey)
+    // once the draft has been committed to / is in sync with the STM32.
+    {
+        btn_joule_apply = lv_obj_create(tab);
+        lv_obj_remove_style_all(btn_joule_apply);
+        lv_obj_add_flag(btn_joule_apply, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(btn_joule_apply, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(btn_joule_apply, 330, 174);
+        lv_obj_set_pos(btn_joule_apply, 440, 120);
+        lv_obj_set_style_bg_color(btn_joule_apply, C_DARK_GREY, 0);
+        lv_obj_set_style_bg_opa(btn_joule_apply, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(btn_joule_apply, 10, 0);
+
+        lbl_joule_apply = lv_label_create(btn_joule_apply);
+        lv_label_set_text(lbl_joule_apply, "APPLIED");
+        lv_obj_set_style_text_color(lbl_joule_apply, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl_joule_apply, &lv_font_montserrat_24, 0);
+        lv_obj_center(lbl_joule_apply);
+
+        lv_obj_add_event_cb(btn_joule_apply, on_joule_apply, LV_EVENT_CLICKED,
+                            nullptr);
+        make_interaction_safe(btn_joule_apply);
+    }
 
     // NOTE: the live workpiece-Joules readout was intentionally removed from
     // this tab. The measured energy is shown on the STATUS tab's "Last Weld"
@@ -1874,7 +1939,7 @@ static void build_joule_tab(lv_obj_t* tab) {
             "JOULE mode fires until the measured weld energy reaches the "
             "target, then stops. Max Duration caps the pulse length for "
             "safety. TIME mode uses the pulse timing set on the PULSE tab. "
-            "Changes apply automatically - no APPLY button needed.");
+            "Adjust the values, then tap APPLY to send them to the welder.");
         lv_obj_set_style_text_color(note, C_GREY, 0);
         lv_obj_set_style_text_font(note, &lv_font_montserrat_16, 0);
         lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
