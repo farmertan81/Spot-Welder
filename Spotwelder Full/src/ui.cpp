@@ -159,11 +159,12 @@ struct HoldRepeatCtx {
     lv_obj_t* spinbox;  // target spinbox (nullptr for power buttons)
     bool is_increment;  // true = +, false = -
     bool is_power;      // true = power button (not spinbox)
+    void (*step_fn)(bool inc);  // generic step action (nullptr = use spinbox/power)
     uint32_t press_start;
     uint32_t last_repeat;
 };
 
-#define MAX_REPEAT_BTNS 20
+#define MAX_REPEAT_BTNS 28
 static HoldRepeatCtx _repeat_pool[MAX_REPEAT_BTNS];
 static int _repeat_count = 0;
 
@@ -174,8 +175,16 @@ static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc,
     ctx->spinbox = spin;
     ctx->is_increment = inc;
     ctx->is_power = is_power;
+    ctx->step_fn = nullptr;
     ctx->press_start = 0;
     ctx->last_repeat = 0;
+    return ctx;
+}
+
+// Allocate a repeatable button bound to a generic step function
+static HoldRepeatCtx* alloc_repeat_ctx_fn(void (*fn)(bool inc), bool inc) {
+    HoldRepeatCtx* ctx = alloc_repeat_ctx(nullptr, inc, false);
+    if (ctx) ctx->step_fn = fn;
     return ctx;
 }
 
@@ -191,7 +200,9 @@ static void on_repeat_pressed(lv_event_t* e) {
     ctx->last_repeat = now;
 
     // Perform the action once on press
-    if (ctx->is_power) {
+    if (ctx->step_fn) {
+        ctx->step_fn(ctx->is_increment);
+    } else if (ctx->is_power) {
         do_power_step(ctx->is_increment);
     } else if (ctx->spinbox) {
         if (ctx->is_increment)
@@ -216,7 +227,9 @@ static void on_repeat_pressing(lv_event_t* e) {
     // Repeat at steady rate
     if (now - ctx->last_repeat >= HOLD_REPEAT_RATE_MS) {
         ctx->last_repeat = now;
-        if (ctx->is_power) {
+        if (ctx->step_fn) {
+            ctx->step_fn(ctx->is_increment);
+        } else if (ctx->is_power) {
             do_power_step(ctx->is_increment);
         } else if (ctx->spinbox) {
             if (ctx->is_increment)
@@ -1631,31 +1644,27 @@ static void on_joule_mode_joule(lv_event_t* e) {
     paint_joule_tab();
 }
 
-static void on_joule_target_dec(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    _joule_draft_target -= JOULE_TARGET_STEP;
-    paint_joule_tab();
-}
-
-static void on_joule_target_inc(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    _joule_draft_target += JOULE_TARGET_STEP;
-    paint_joule_tab();
-}
-
-static void on_joule_maxdur_dec(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (_joule_draft_maxms >= JOULE_MAXMS_MIN + JOULE_MAXMS_STEP)
-        _joule_draft_maxms -= JOULE_MAXMS_STEP;
+// Generic step functions for the Joule +/- buttons. Driven either by a single
+// tap or by the hold-to-repeat handler (when enabled in Config).
+static void joule_target_step(bool inc) {
+    if (inc)
+        _joule_draft_target += JOULE_TARGET_STEP;
     else
-        _joule_draft_maxms = JOULE_MAXMS_MIN;
-    paint_joule_tab();
+        _joule_draft_target -= JOULE_TARGET_STEP;
+    paint_joule_tab();  // clamps + repaints
 }
 
-static void on_joule_maxdur_inc(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    _joule_draft_maxms += JOULE_MAXMS_STEP;
-    paint_joule_tab();
+static void joule_maxdur_step(bool inc) {
+    if (inc) {
+        _joule_draft_maxms += JOULE_MAXMS_STEP;
+    } else {
+        // Guard against uint16 underflow wrap before clamp_joule_draft runs
+        if (_joule_draft_maxms >= JOULE_MAXMS_MIN + JOULE_MAXMS_STEP)
+            _joule_draft_maxms -= JOULE_MAXMS_STEP;
+        else
+            _joule_draft_maxms = JOULE_MAXMS_MIN;
+    }
+    paint_joule_tab();  // clamps + repaints
 }
 
 static void on_joule_apply(lv_event_t* e) {
@@ -1725,7 +1734,9 @@ static void build_joule_tab(lv_obj_t* tab) {
         lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 60,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
-        lv_obj_add_event_cb(d, on_joule_target_dec, LV_EVENT_CLICKED, nullptr);
+        HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_target_step, false);
+        lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
+        lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
 
         lbl_joule_target = lv_label_create(tab);
         lv_label_set_text(lbl_joule_target, "50 J");
@@ -1739,7 +1750,9 @@ static void build_joule_tab(lv_obj_t* tab) {
         lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 60,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
-        lv_obj_add_event_cb(i, on_joule_target_inc, LV_EVENT_CLICKED, nullptr);
+        HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_target_step, true);
+        lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
+        lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
     }
     y += 60 + 18;
 
@@ -1757,7 +1770,9 @@ static void build_joule_tab(lv_obj_t* tab) {
         lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 56,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
-        lv_obj_add_event_cb(d, on_joule_maxdur_dec, LV_EVENT_CLICKED, nullptr);
+        HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_maxdur_step, false);
+        lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
+        lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
 
         lbl_joule_maxdur = lv_label_create(tab);
         lv_label_set_text(lbl_joule_maxdur, "40 ms");
@@ -1771,7 +1786,9 @@ static void build_joule_tab(lv_obj_t* tab) {
         lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 56,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
-        lv_obj_add_event_cb(i, on_joule_maxdur_inc, LV_EVENT_CLICKED, nullptr);
+        HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_maxdur_step, true);
+        lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
+        lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
     }
     y += 56 + 18;
 
