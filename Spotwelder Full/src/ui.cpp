@@ -3166,6 +3166,33 @@ void ui_update(const WelderDisplayState& st) {
         paint_joule_tab();
     }
 
+    // ---- Joule tab: mirror applied target / max-duration on CHANGE ----
+    // The seed block above only runs ONCE, so a joule target (or max-duration)
+    // change pushed from the Flask web UI (an external SET_JOULE_TARGET /
+    // SET_JOULE_MAX) used to update the STM32 + ESP32 mirror but never the
+    // touch-screen Joule tab -- the tab kept showing its stale draft.
+    // This mirrors the STM32's authoritative values whenever they change
+    // (exactly like the MODE mirror above does for control_mode) but skips
+    // while the user has an un-APPLIED local edit pending (_joule_dirty) so we
+    // never stomp a value they are in the middle of dialing in on the screen.
+    {
+        static float    prev_joule_target = -1.0f;
+        static uint16_t prev_joule_maxms  = 0;
+
+        bool target_changed = (st.joule_target_j > 0.0f) &&
+                              (fabsf(st.joule_target_j - prev_joule_target) > 0.05f);
+        bool maxms_changed  = (st.joule_max_ms > 0) &&
+                              (st.joule_max_ms != prev_joule_maxms);
+
+        if (!_joule_dirty && (target_changed || maxms_changed)) {
+            if (st.joule_target_j > 0.0f) _joule_draft_target = st.joule_target_j;
+            if (st.joule_max_ms > 0) _joule_draft_maxms = st.joule_max_ms;
+            paint_joule_tab();
+            prev_joule_target = st.joule_target_j;
+            prev_joule_maxms  = st.joule_max_ms;
+        }
+    }
+
     // ============================================================
     // PULSE TAB: All visual updates driven by _ui_dirty or applied changes
     // ============================================================
