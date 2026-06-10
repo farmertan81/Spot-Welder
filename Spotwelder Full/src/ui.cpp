@@ -149,10 +149,23 @@ static void make_interaction_safe(lv_obj_t* obj) {
 }
 
 // ============================================================
-// HOLD-TO-REPEAT: Timer-based repeat for +/- buttons
+// HOLD-TO-REPEAT: event-based repeat for +/- buttons
 // ============================================================
 static const uint32_t HOLD_INITIAL_DELAY_MS = 400;
 static const uint32_t HOLD_REPEAT_RATE_MS = 120;
+
+// RAW physical touch state, published by the debounced touch reader in
+// main.cpp.  We gate the repeat on this instead of LVGL's PRESSED state so a
+// hold STOPS the instant the finger physically lifts.  LVGL keeps reporting
+// PRESSED for TOUCH_RELEASE_DEBOUNCE_MS (and re-arms on release noise), which
+// is exactly what caused the +/- overshoot after release.
+extern bool touch_is_physically_down();
+
+// Set to 1 to print hold-to-repeat diagnostics to the serial console:
+//   start of press, every repeat (with running count), and release (with the
+//   count of repeats that fired AFTER the finger physically lifted — should be
+//   0).  Default 0 to keep the console quiet in normal operation.
+#define HOLD_REPEAT_DEBUG 0
 
 // Context for each repeatable button
 struct HoldRepeatCtx {
@@ -163,6 +176,10 @@ struct HoldRepeatCtx {
     bool active;        // true only while the finger is physically down
     uint32_t press_start;
     uint32_t last_repeat;
+#if HOLD_REPEAT_DEBUG
+    uint32_t dbg_repeats;       // repeats fired during this press
+    uint32_t dbg_after_release; // repeats that fired after physical release
+#endif
 };
 
 #define MAX_REPEAT_BTNS 28
@@ -193,16 +210,8 @@ static HoldRepeatCtx* alloc_repeat_ctx_fn(void (*fn)(bool inc), bool inc) {
 // Forward declaration for power step action
 static void do_power_step(bool increment);
 
-static void on_repeat_pressed(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
-    HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
-    if (!ctx) return;
-    uint32_t now = millis();
-    ctx->active = true;        // finger is physically down
-    ctx->press_start = now;
-    ctx->last_repeat = now;
-
-    // Perform the action once on press
+// Perform one increment/decrement for the given repeat context.
+static void repeat_apply_step(HoldRepeatCtx* ctx) {
     if (ctx->step_fn) {
         ctx->step_fn(ctx->is_increment);
     } else if (ctx->is_power) {
@@ -216,13 +225,57 @@ static void on_repeat_pressed(lv_event_t* e) {
     }
 }
 
+// Hard stop: clear the active flag and zero the timers so no queued/stray
+// PRESSING event can fire another step.
+static void repeat_stop(HoldRepeatCtx* ctx) {
+    ctx->active = false;
+    ctx->press_start = 0;
+    ctx->last_repeat = 0;
+}
+
+static void on_repeat_pressed(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
+    HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
+    if (!ctx) return;
+    uint32_t now = millis();
+    ctx->active = true;        // finger is physically down
+    ctx->press_start = now;
+    ctx->last_repeat = now;
+#if HOLD_REPEAT_DEBUG
+    ctx->dbg_repeats = 0;
+    ctx->dbg_after_release = 0;
+    Serial.printf("[REPEAT] PRESS start  ctx=%p phys=%d\n", (void*)ctx,
+                  (int)touch_is_physically_down());
+#endif
+
+    // Perform the action once on press
+    repeat_apply_step(ctx);
+}
+
 static void on_repeat_pressing(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_PRESSING) return;
-    if (!_cfg.hold_to_repeat) return;  // hold-to-repeat disabled
 
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
     if (!ctx) return;
     if (!ctx->active) return;   // finger already released — ignore stray events
+
+    // CRITICAL overshoot fix: never fire a step while the finger is physically
+    // up.  LVGL still reports PRESSED during the touch release-debounce window
+    // (and re-arms on release noise), so relying on the RELEASED event alone let
+    // the value keep climbing for several extra steps.  The RAW physical state
+    // has no such lag.  We only SKIP here (not hard-stop) so that a momentary
+    // single-read GT911 dropout mid-hold doesn't permanently cancel a genuine
+    // hold — it resumes as soon as the finger is seen down again.  The true
+    // stop is handled by on_repeat_released (RELEASED / PRESS_LOST).
+    if (!touch_is_physically_down()) {
+#if HOLD_REPEAT_DEBUG
+        Serial.printf("[REPEAT] phys-up in PRESSING -> skip  ctx=%p\n",
+                      (void*)ctx);
+#endif
+        return;
+    }
+
+    if (!_cfg.hold_to_repeat) return;  // hold-to-repeat disabled
     uint32_t now = millis();
 
     // Wait for initial delay
@@ -231,30 +284,31 @@ static void on_repeat_pressing(lv_event_t* e) {
     // Repeat at steady rate
     if (now - ctx->last_repeat >= HOLD_REPEAT_RATE_MS) {
         ctx->last_repeat = now;
-        if (ctx->step_fn) {
-            ctx->step_fn(ctx->is_increment);
-        } else if (ctx->is_power) {
-            do_power_step(ctx->is_increment);
-        } else if (ctx->spinbox) {
-            if (ctx->is_increment)
-                lv_spinbox_increment(ctx->spinbox);
-            else
-                lv_spinbox_decrement(ctx->spinbox);
-            lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
-        }
+#if HOLD_REPEAT_DEBUG
+        ctx->dbg_repeats++;
+        if (!touch_is_physically_down()) ctx->dbg_after_release++;
+        Serial.printf("[REPEAT] step #%lu  ctx=%p phys=%d\n",
+                      (unsigned long)ctx->dbg_repeats, (void*)ctx,
+                      (int)touch_is_physically_down());
+#endif
+        repeat_apply_step(ctx);
     }
 }
 
-// Stop repeating the instant the finger lifts (or the press is lost).
-// Resets the context so any late/stray PRESSING event returns early.
+// Stop repeating the instant LVGL delivers RELEASED / PRESS_LOST.  This is the
+// belt-and-braces companion to the physical-touch gate in on_repeat_pressing.
 static void on_repeat_released(lv_event_t* e) {
     lv_event_code_t code = lv_event_get_code(e);
     if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
     if (!ctx) return;
-    ctx->active = false;       // immediate stop
-    ctx->press_start = 0;
-    ctx->last_repeat = 0;
+#if HOLD_REPEAT_DEBUG
+    Serial.printf("[REPEAT] RELEASED  ctx=%p total_repeats=%lu after_release=%lu"
+                  " (after_release should be 0)\n",
+                  (void*)ctx, (unsigned long)ctx->dbg_repeats,
+                  (unsigned long)ctx->dbg_after_release);
+#endif
+    repeat_stop(ctx);
 }
 
 // ============================================================

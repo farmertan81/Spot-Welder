@@ -345,6 +345,18 @@ static struct {
 
 static lv_indev_read_cb_t original_read_cb = nullptr;
 
+// RAW physical touch state, updated on every indev read BEFORE the
+// press/release debounce filter runs.  The UI hold-to-repeat logic reads this
+// (via touch_is_physically_down()) so it can stop incrementing the instant the
+// finger physically lifts, instead of waiting out TOUCH_RELEASE_DEBOUNCE_MS
+// (during which LVGL still reports PRESSED).  That debounce is what caused the
+// +/- overshoot after release.  Kept volatile: written in the indev read,
+// read from the LVGL event handlers (same task, but be explicit).
+volatile bool g_touch_phys_down = false;
+
+// Exposed to ui.cpp (see extern declaration there).
+bool touch_is_physically_down() { return g_touch_phys_down; }
+
 static void debounced_touchpad_read(lv_indev_t* indev, lv_indev_data_t* data) {
     touch_filter.touch_reads++;
 
@@ -359,6 +371,8 @@ static void debounced_touchpad_read(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 
     bool touched = (raw_data.state == LV_INDEV_STATE_PRESSED);
+    // Publish the RAW (un-debounced) physical state for the UI repeat logic.
+    g_touch_phys_down = touched;
     int16_t raw_x = raw_data.point.x;
     int16_t raw_y = raw_data.point.y;
 
@@ -634,6 +648,13 @@ String buildStatus() {
     status += ",contact_hold_steps=" + String(contact_hold_steps);
     status += ",contact_with_pedal=" + String(contact_with_pedal ? 1 : 0);
     status += ",weld_count=" + String(weld_count);
+
+    // Control mode (0=TIME, 1=JOULE) + Joule targets.  The Flask dashboard
+    // reads control_mode to show TIME vs JOULE; without this field it can never
+    // learn the mode and stays out of sync with the on-device display.
+    status += ",control_mode=" + String(control_mode);
+    status += ",joule_target_j=" + String(joule_target_j, 1);
+    status += ",joule_max_ms=" + String(joule_max_ms);
 
     // ---- WiFi info (mirrors the Setup tab; consumed by the Flask dashboard) ----
     // The Flask server has no other way to know the ESP32's SSID/IP/RSSI, so we
@@ -2622,6 +2643,10 @@ static void onJouleApply(bool mode_joule, float target_j, uint16_t max_ms) {
     snprintf(buf, sizeof(buf), "SET_JOULE_MAX,%u", (unsigned)max_ms);
     processCommand(String(buf));
     joule_max_ms = max_ms;
+
+    // Push an immediate STATUS so the Flask dashboard reflects the new control
+    // mode right away instead of waiting for the next periodic STATUS tick.
+    sendToPi(buildStatus());
 
     Serial.printf("[Joule] Applied mode=%s target=%.1fJ max=%ums via touch UI\n",
                   mode_joule ? "JOULE" : "TIME", (double)target_j,
