@@ -635,6 +635,54 @@ String buildStatus() {
     status += ",contact_with_pedal=" + String(contact_with_pedal ? 1 : 0);
     status += ",weld_count=" + String(weld_count);
 
+    // ---- WiFi info (mirrors the Setup tab; consumed by the Flask dashboard) ----
+    // The Flask server has no other way to know the ESP32's SSID/IP/RSSI, so we
+    // forward the same values shown on the on-device Setup tab.
+    {
+        bool wc_connected;
+        bool wc_ap;
+        String wc_ssid;
+        String wc_ip;
+        int    wc_rssi = 0;
+        if (wifi_prov_state == WIFI_PROV_AP_PORTAL) {
+            wc_connected = true;            // soft-AP is up (setup mode)
+            wc_ap        = true;
+            wc_ssid      = ap_ssid_str;
+            wc_ip        = WiFi.softAPIP().toString();
+        } else if (WiFi.status() == WL_CONNECTED) {
+            wc_connected = true;
+            wc_ap        = false;
+            wc_ssid      = WiFi.SSID();
+            wc_ip        = WiFi.localIP().toString();
+            wc_rssi      = WiFi.RSSI();
+        } else {
+            wc_connected = false;
+            wc_ap        = false;
+            wc_ssid      = wifi_ssid;       // the network we are trying to join
+            wc_ip        = "";
+        }
+        // Protect the CSV k=v parser: SSIDs may legally contain ',' or '='.
+        wc_ssid.replace(",", " ");
+        wc_ssid.replace("=", " ");
+        status += ",wifi_connected=" + String(wc_connected ? 1 : 0);
+        status += ",wifi_ap_mode="   + String(wc_ap ? 1 : 0);
+        status += ",wifi_ssid="      + wc_ssid;
+        status += ",wifi_ip="        + wc_ip;
+        status += ",wifi_rssi="      + String(wc_rssi);
+    }
+
+    // ---- System info (mirrors the Setup tab System section) ----
+    status += ",fw_version=" + String(FW_VERSION);
+    {
+        String chip = String(ESP.getChipModel());
+        chip.replace(",", " ");
+        chip.replace("=", " ");
+        status += ",chip_model="  + chip;
+    }
+    status += ",flash_size=" + String((uint32_t)ESP.getFlashChipSize());
+    status += ",free_heap="  + String((uint32_t)ESP.getFreeHeap());
+    status += ",uptime_s="   + String((uint32_t)(millis() / 1000UL));
+
     return status;
 }
 
