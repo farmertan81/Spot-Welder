@@ -279,6 +279,7 @@ static lv_obj_t* lbl_cell2 = nullptr;
 static lv_obj_t* lbl_cell3 = nullptr;
 
 // System-info box labels (Status dashboard)
+static lv_obj_t* btn_dash_mode = nullptr;     // mode box (long-press swap TIME<->JOULE)
 static lv_obj_t* lbl_dash_mode = nullptr;     // control mode line
 static lv_obj_t* btn_dash_trigger = nullptr;  // trigger line (long-press swap)
 static lv_obj_t* lbl_dash_trigger = nullptr;  // trigger line text
@@ -307,15 +308,15 @@ static const uint32_t TRIGGER_LONGPRESS_MS = 600;
 static uint32_t _trig_press_start = 0;
 static bool _trig_longpress_fired = false;
 
+// Long-press tracking for the dashboard MODE box (swap TIME<->JOULE)
+static uint32_t _mode_press_start = 0;
+static bool _mode_longpress_fired = false;
+
 // ============================================================
 // STATIC UI HANDLES  (Joule tab)
 // ============================================================
-static lv_obj_t* btn_joule_mode_time = nullptr;
-static lv_obj_t* btn_joule_mode_joule = nullptr;
 static lv_obj_t* lbl_joule_target = nullptr;
 static lv_obj_t* lbl_joule_maxdur = nullptr;
-static lv_obj_t* btn_joule_apply = nullptr;
-static lv_obj_t* lbl_joule_apply = nullptr;
 
 // Joule-tab draft state (edited locally; committed on APPLY)
 static bool     _joule_draft_mode = false;   // false=TIME, true=JOULE
@@ -628,6 +629,56 @@ static void on_dash_trigger_event(lv_event_t* e) {
 }
 
 // ============================================================
+// DASHBOARD MODE BOX – long-press to swap TIME <-> JOULE
+// ============================================================
+// Forward declaration: the MODE switcher applies the change immediately by
+// reusing the Joule apply path (sends SET_MODE + targets to the STM32).
+// (_joule_draft_mode / _target / _maxms are file-scope statics defined above.)
+static void clamp_joule_draft();
+
+// Repaint the MODE box text + color. Highlight while a long-press is held.
+static void paint_dash_mode(bool holding) {
+    bool joule = _joule_draft_mode;
+    if (lbl_dash_mode) {
+        lv_label_set_text(lbl_dash_mode, joule ? "JOULE" : "TIME");
+        lv_obj_set_style_text_color(
+            lbl_dash_mode,
+            holding ? C_YELLOW : (joule ? C_GREEN : C_ACCENT),
+            LV_PART_MAIN);
+    }
+    if (btn_dash_mode) {
+        lv_obj_set_style_bg_color(btn_dash_mode,
+                                  holding ? C_DARK_GREY : C_CARD, 0);
+    }
+}
+
+// Long-press handler on the MODE box: hold ~600ms to toggle TIME<->JOULE.
+// On toggle the change is applied immediately (SET_MODE to STM32; Flask syncs
+// through the next STATUS packet) – there is no separate Apply step.
+static void on_dash_mode_event(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_PRESSED) {
+        _mode_press_start = millis();
+        _mode_longpress_fired = false;
+        paint_dash_mode(true);  // visual feedback: holding
+    } else if (code == LV_EVENT_PRESSING) {
+        if (!_mode_longpress_fired &&
+            (millis() - _mode_press_start) >= TRIGGER_LONGPRESS_MS) {
+            _mode_longpress_fired = true;
+            // Swap TIME <-> JOULE and apply immediately
+            _joule_draft_mode = !_joule_draft_mode;
+            paint_dash_mode(false);
+            clamp_joule_draft();
+            if (_joule_apply_cb)
+                _joule_apply_cb(_joule_draft_mode, _joule_draft_target,
+                                _joule_draft_maxms);
+        }
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        paint_dash_mode(false);
+    }
+}
+
+// ============================================================
 // ARM BUTTON EVENT
 // ============================================================
 static void arm_btn_event(lv_event_t* e) {
@@ -745,18 +796,39 @@ static void build_status_tab(lv_obj_t* tab) {
     const int LEADR_X = WIFI_X + WIFI_W + GAP;    // 450
     const int WELDS_X = LEADR_X + LEADR_W + GAP;  // 660 (ends at 780)
 
-    // ---- MODE box ----
+    // ---- MODE box (clickable; long-press toggles TIME<->JOULE) ----
     {
-        lv_obj_t* p = make_panel(tab, MODE_X, R1_Y, MODE_W, R1_H);
-        lv_obj_t* t = lv_label_create(p);
+        btn_dash_mode = lv_obj_create(tab);
+        lv_obj_remove_style_all(btn_dash_mode);
+        lv_obj_add_flag(btn_dash_mode, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_clear_flag(btn_dash_mode, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(btn_dash_mode, MODE_W, R1_H);
+        lv_obj_set_pos(btn_dash_mode, MODE_X, R1_Y);
+        lv_obj_set_style_bg_color(btn_dash_mode, C_CARD, 0);
+        lv_obj_set_style_bg_opa(btn_dash_mode, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(btn_dash_mode, 10, 0);
+        lv_obj_set_style_border_color(btn_dash_mode, C_DARK_GREY, 0);
+        lv_obj_set_style_border_width(btn_dash_mode, 1, 0);
+        lv_obj_set_scrollbar_mode(btn_dash_mode, LV_SCROLLBAR_MODE_OFF);
+        lv_obj_add_event_cb(btn_dash_mode, on_dash_mode_event,
+                            LV_EVENT_PRESSED, nullptr);
+        lv_obj_add_event_cb(btn_dash_mode, on_dash_mode_event,
+                            LV_EVENT_PRESSING, nullptr);
+        lv_obj_add_event_cb(btn_dash_mode, on_dash_mode_event,
+                            LV_EVENT_RELEASED, nullptr);
+        lv_obj_add_event_cb(btn_dash_mode, on_dash_mode_event,
+                            LV_EVENT_PRESS_LOST, nullptr);
+        make_interaction_safe(btn_dash_mode);
+
+        lv_obj_t* t = lv_label_create(btn_dash_mode);
         lv_label_set_text(t, "MODE");
         lv_obj_set_style_text_color(t, C_GREY, 0);
         lv_obj_set_style_text_font(t, &lv_font_montserrat_14, 0);
         lv_obj_align(t, LV_ALIGN_TOP_MID, 0, 5);
 
-        lbl_dash_mode = lv_label_create(p);
+        lbl_dash_mode = lv_label_create(btn_dash_mode);
         lv_label_set_text(lbl_dash_mode, "TIME");
-        lv_obj_set_style_text_color(lbl_dash_mode, C_WHITE, 0);
+        lv_obj_set_style_text_color(lbl_dash_mode, C_ACCENT, 0);
         lv_obj_set_style_text_font(lbl_dash_mode, &lv_font_montserrat_18, 0);
         lv_obj_align(lbl_dash_mode, LV_ALIGN_BOTTOM_MID, 0, -6);
     }
@@ -1032,6 +1104,8 @@ static void build_status_tab(lv_obj_t* tab) {
 
     // Initialise trigger-line text
     paint_dash_trigger(false);
+    // Initialise MODE box text
+    paint_dash_mode(false);
 }
 
 // ============================================================
@@ -1609,14 +1683,6 @@ static void clamp_joule_draft() {
 static void paint_joule_tab() {
     clamp_joule_draft();
 
-    // Mode selector colors
-    if (btn_joule_mode_time)
-        lv_obj_set_style_bg_color(
-            btn_joule_mode_time, _joule_draft_mode ? C_DARK_GREY : C_ACCENT, 0);
-    if (btn_joule_mode_joule)
-        lv_obj_set_style_bg_color(
-            btn_joule_mode_joule, _joule_draft_mode ? C_GREEN : C_DARK_GREY, 0);
-
     if (lbl_joule_target) {
         char buf[24];
         snprintf(buf, sizeof(buf), "%.0f J", (double)_joule_draft_target);
@@ -1632,18 +1698,6 @@ static void paint_joule_tab() {
 // ============================================================
 // JOULE TAB: event handlers
 // ============================================================
-static void on_joule_mode_time(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    _joule_draft_mode = false;
-    paint_joule_tab();
-}
-
-static void on_joule_mode_joule(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    _joule_draft_mode = true;
-    paint_joule_tab();
-}
-
 // Generic step functions for the Joule +/- buttons. Driven either by a single
 // tap or by the hold-to-repeat handler (when enabled in Config).
 static void joule_target_step(bool inc) {
@@ -1667,13 +1721,17 @@ static void joule_maxdur_step(bool inc) {
     paint_joule_tab();  // clamps + repaints
 }
 
-static void on_joule_apply(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+// Send the current Joule settings to the STM32 when the user lifts their
+// finger off a +/- stepper. Sending on RELEASE (instead of on every step)
+// means a hold-to-repeat ramp results in a single commit, avoiding UART/flash
+// churn. There is no separate Apply button anymore – settings auto-commit.
+static void on_joule_setting_released(lv_event_t* e) {
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_RELEASED && code != LV_EVENT_PRESS_LOST) return;
     clamp_joule_draft();
     if (_joule_apply_cb)
         _joule_apply_cb(_joule_draft_mode, _joule_draft_target,
                         _joule_draft_maxms);
-    if (lbl_joule_apply) lv_label_set_text(lbl_joule_apply, "APPLIED");
 }
 
 // ============================================================
@@ -1686,137 +1744,142 @@ static void build_joule_tab(lv_obj_t* tab) {
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
     const int LABEL_X = 14;
-    int y = 6;
+    int y = 14;
 
-    // ---- Mode selector ----
+    // ---- Header ----
+    // The welding mode (TIME vs JOULE) is now chosen from the STATUS tab's
+    // MODE switcher (long-press). This tab only sets the JOULE-mode targets.
     {
-        lv_obj_t* lbl = lv_label_create(tab);
-        lv_label_set_text(lbl, "Welding Mode");
-        lv_obj_set_style_text_color(lbl, C_GREY, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y);
-    }
-    y += 28;
-    {
-        lv_obj_t* l1 = nullptr;
-        btn_joule_mode_time = make_cfg_button(tab, "TIME (ms)", &l1, LABEL_X, y,
-                                              250, 56, C_DARK_GREY);
-        lv_obj_set_style_text_font(l1, &lv_font_montserrat_20, 0);
-        lv_obj_add_event_cb(btn_joule_mode_time, on_joule_mode_time,
-                            LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* hdr = lv_label_create(tab);
+        lv_label_set_text(hdr, "ENERGY SETTINGS");
+        lv_obj_set_style_text_color(hdr, C_WHITE, 0);
+        lv_obj_set_style_text_font(hdr, &lv_font_montserrat_20, 0);
+        lv_obj_set_pos(hdr, LABEL_X, y);
 
-        lv_obj_t* l2 = nullptr;
-        btn_joule_mode_joule = make_cfg_button(tab, "JOULE (energy)", &l2,
-                                               LABEL_X + 266, y, 250, 56,
-                                               C_DARK_GREY);
-        lv_obj_set_style_text_font(l2, &lv_font_montserrat_20, 0);
-        lv_obj_add_event_cb(btn_joule_mode_joule, on_joule_mode_joule,
-                            LV_EVENT_CLICKED, nullptr);
+        lv_obj_t* sub = lv_label_create(tab);
+        lv_label_set_text(sub, "Switch TIME / JOULE on the STATUS tab "
+                               "(long-press the MODE box).");
+        lv_obj_set_style_text_color(sub, C_GREY, 0);
+        lv_obj_set_style_text_font(sub, &lv_font_montserrat_14, 0);
+        lv_obj_set_pos(sub, LABEL_X, y + 28);
     }
-    y += 56 + 22;
+    y += 64;
+
+    // Stepper geometry – wider value field + taller buttons now that the mode
+    // toggles and APPLY button are gone (more vertical room available).
+    const int STEP_W = 80;
+    const int VAL_W = 220;
+    const int DEC_X = LABEL_X;
+    const int VAL_X = DEC_X + STEP_W + 12;
+    const int INC_X = VAL_X + VAL_W + 12;
+    const int BTN_H = 72;
 
     // ---- Target Energy stepper ----
-    const int STEP_W = 70;
-    const int VAL_W = 180;
-    const int DEC_X = LABEL_X;
-    const int VAL_X = DEC_X + STEP_W + 10;
-    const int INC_X = VAL_X + VAL_W + 10;
     {
         lv_obj_t* lbl = lv_label_create(tab);
         lv_label_set_text(lbl, "Target Energy");
         lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
         lv_obj_set_pos(lbl, LABEL_X, y);
     }
-    y += 26;
+    y += 30;
     {
         lv_obj_t* l = nullptr;
-        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 60,
+        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, BTN_H,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
         HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_target_step, false);
         lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
         lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
+        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_RELEASED,
+                            nullptr);
+        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_PRESS_LOST,
+                            nullptr);
 
         lbl_joule_target = lv_label_create(tab);
         lv_label_set_text(lbl_joule_target, "50 J");
         lv_obj_set_style_text_color(lbl_joule_target, C_ACCENT, 0);
-        lv_obj_set_style_text_font(lbl_joule_target, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_font(lbl_joule_target, &lv_font_montserrat_48, 0);
         lv_obj_set_style_text_align(lbl_joule_target, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(lbl_joule_target, VAL_W);
-        lv_obj_set_pos(lbl_joule_target, VAL_X, y + 8);
+        lv_obj_set_pos(lbl_joule_target, VAL_X, y + 12);
 
         lv_obj_t* l2 = nullptr;
-        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 60,
+        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, BTN_H,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
         HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_target_step, true);
         lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
         lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
+        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_RELEASED,
+                            nullptr);
+        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_PRESS_LOST,
+                            nullptr);
     }
-    y += 60 + 18;
+    y += BTN_H + 28;
 
     // ---- Max Duration (safety limit) stepper ----
     {
         lv_obj_t* lbl = lv_label_create(tab);
         lv_label_set_text(lbl, "Max Duration (safety limit)");
         lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
         lv_obj_set_pos(lbl, LABEL_X, y);
     }
-    y += 26;
+    y += 30;
     {
         lv_obj_t* l = nullptr;
-        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, 56,
+        lv_obj_t* d = make_cfg_button(tab, "-", &l, DEC_X, y, STEP_W, BTN_H,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l, &lv_font_montserrat_24, 0);
         HoldRepeatCtx* cd = alloc_repeat_ctx_fn(joule_maxdur_step, false);
         lv_obj_add_event_cb(d, on_repeat_pressed, LV_EVENT_PRESSED, cd);
         lv_obj_add_event_cb(d, on_repeat_pressing, LV_EVENT_PRESSING, cd);
+        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_RELEASED,
+                            nullptr);
+        lv_obj_add_event_cb(d, on_joule_setting_released, LV_EVENT_PRESS_LOST,
+                            nullptr);
 
         lbl_joule_maxdur = lv_label_create(tab);
         lv_label_set_text(lbl_joule_maxdur, "40 ms");
         lv_obj_set_style_text_color(lbl_joule_maxdur, C_YELLOW, 0);
-        lv_obj_set_style_text_font(lbl_joule_maxdur, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_font(lbl_joule_maxdur, &lv_font_montserrat_48, 0);
         lv_obj_set_style_text_align(lbl_joule_maxdur, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_set_width(lbl_joule_maxdur, VAL_W);
-        lv_obj_set_pos(lbl_joule_maxdur, VAL_X, y + 14);
+        lv_obj_set_pos(lbl_joule_maxdur, VAL_X, y + 12);
 
         lv_obj_t* l2 = nullptr;
-        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, 56,
+        lv_obj_t* i = make_cfg_button(tab, "+", &l2, INC_X, y, STEP_W, BTN_H,
                                       C_DARK_GREY);
         lv_obj_set_style_text_font(l2, &lv_font_montserrat_24, 0);
         HoldRepeatCtx* ci = alloc_repeat_ctx_fn(joule_maxdur_step, true);
         lv_obj_add_event_cb(i, on_repeat_pressed, LV_EVENT_PRESSED, ci);
         lv_obj_add_event_cb(i, on_repeat_pressing, LV_EVENT_PRESSING, ci);
+        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_RELEASED,
+                            nullptr);
+        lv_obj_add_event_cb(i, on_joule_setting_released, LV_EVENT_PRESS_LOST,
+                            nullptr);
     }
-    y += 56 + 18;
-
-    // ---- APPLY button ----
-    btn_joule_apply =
-        make_cfg_button(tab, "APPLY", &lbl_joule_apply, LABEL_X, y, 250, 56,
-                        C_GREEN);
-    lv_obj_set_style_text_font(lbl_joule_apply, &lv_font_montserrat_24, 0);
-    lv_obj_add_event_cb(btn_joule_apply, on_joule_apply, LV_EVENT_CLICKED,
-                        nullptr);
+    y += BTN_H + 22;
 
     // NOTE: the live workpiece-Joules readout was intentionally removed from
     // this tab. The measured energy is shown on the STATUS tab's "Last Weld"
     // section (Duration | Peak | Avg | Joules) instead.
 
-    // ---- Note (right side) ----
+    // ---- Explanatory note (full width, below the steppers) ----
     {
         lv_obj_t* note = lv_label_create(tab);
         lv_label_set_text(
             note,
             "JOULE mode fires until the measured weld energy reaches the "
             "target, then stops. Max Duration caps the pulse length for "
-            "safety. TIME mode uses the pulse timing set on the PULSE tab.");
+            "safety. TIME mode uses the pulse timing set on the PULSE tab. "
+            "Changes apply automatically - no APPLY button needed.");
         lv_obj_set_style_text_color(note, C_GREY, 0);
         lv_obj_set_style_text_font(note, &lv_font_montserrat_16, 0);
         lv_label_set_long_mode(note, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(note, 240);
-        lv_obj_set_pos(note, 530, y - 130);
+        lv_obj_set_width(note, 760);
+        lv_obj_set_pos(note, LABEL_X, y);
     }
 
     paint_joule_tab();
@@ -2791,11 +2854,16 @@ void ui_update(const WelderDisplayState& st) {
     }
 
     // ---- Dashboard: Mode line ----
+    // The MODE box is now a long-press switcher (TIME<->JOULE). Keep the
+    // locally-tracked _joule_draft_mode mirrored to the STM32's authoritative
+    // control_mode so the switcher and the Joule tab always reflect reality.
+    // Skip while a long-press toggle is in flight so we don't fight the user.
     {
         static uint8_t prev_mode = 0xFF;
-        if (lbl_dash_mode && (first_run || st.control_mode != prev_mode)) {
-            lv_label_set_text(lbl_dash_mode,
-                              st.control_mode == 1 ? "JOULE" : "TIME");
+        if (!_mode_longpress_fired &&
+            (first_run || st.control_mode != prev_mode)) {
+            _joule_draft_mode = (st.control_mode == 1);
+            paint_dash_mode(false);
             prev_mode = st.control_mode;
         }
     }
