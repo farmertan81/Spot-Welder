@@ -2898,6 +2898,23 @@ void loop() {
         lastStatusReqMs = now;
     }
 
+    // Guaranteed periodic STATUS push to Flask (every 2s), INDEPENDENT of the
+    // STM32 STATUS response path above. The normal path only forwards a STATUS
+    // to Flask when the STM32 replies; if the STM32 is briefly busy/quiet, the
+    // dashboard could stall on stale values. This fallback ensures control_mode,
+    // joule_target_j and the rest are pushed continuously even with no activity.
+    static uint32_t lastStatusPushMs = 0;
+    if (client && client.connected() && (now - lastStatusPushMs) >= 2000) {
+        if ((now - lastStatusForwardMs) >= STATUS_FORWARD_MIN_INTERVAL_MS) {
+            String s = buildStatus();
+            Serial.printf("[TCP] Periodic STATUS -> Flask (mode=%u target=%.1fJ)\n",
+                          (unsigned)control_mode, (double)joule_target_j);
+            sendToPi(s);
+            lastStatusForwardMs = now;
+        }
+        lastStatusPushMs = now;
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
         WiFiClient newClient = server.available();
         if (newClient) {
@@ -2914,6 +2931,9 @@ void loop() {
 
             lastTcpRxMs = millis();
             setUiConnected(true);
+            Serial.printf("[TCP] Flask connected -> sending STATUS immediately "
+                          "(mode=%u target=%.1fJ)\n",
+                          (unsigned)control_mode, (double)joule_target_j);
             sendToPi(buildStatus());
             syncSettingsAfterUiReconnect();
             requestStm32Status();
