@@ -20,7 +20,9 @@
  */
 
 #include <Arduino.h>
+#include <ArduinoOTA.h>
 #include <DNSServer.h>
+#include <ESPmDNS.h>
 #include <Preferences.h>
 #include <WebServer.h>
 #include <WiFi.h>
@@ -34,6 +36,17 @@
 
 // Firmware version string shown on the Setup tab.
 #define FW_VERSION "1.0.0"
+
+// =========================
+// OTA (over-the-air) firmware update configuration
+// =========================
+// These must match the [env:esp32-8048S043C-ota] upload settings in
+// platformio.ini so `pio run -e esp32-8048S043C-ota -t upload` can reach the
+// device over WiFi (espota). The mDNS hostname makes the device reachable at
+// "spotwelder.local"; the password gates uploads.
+#define OTA_HOSTNAME "spotwelder"
+#define OTA_PASSWORD "spotwelder2024"
+#define OTA_PORT 3232
 
 // =========================
 // Sunton hardware mapping
@@ -2064,6 +2077,144 @@ static void beginWifiProvisioning() {
 }
 
 // =========================
+// OTA (over-the-air firmware update) support
+// =========================
+// A full-screen LVGL overlay shows update status/progress so the operator sees
+// what is happening while the device is being reflashed over WiFi. The overlay
+// is drawn on top of whatever tab is active. Because ArduinoOTA.handle() blocks
+// the main loop during the actual transfer, the OTA callbacks force an
+// immediate LVGL redraw (lv_refr_now) so the progress bar stays live.
+
+static lv_obj_t* ota_overlay = nullptr;
+static lv_obj_t* ota_label = nullptr;
+static lv_obj_t* ota_bar = nullptr;
+static bool ota_in_progress = false;  // set while an OTA transfer is running
+
+void showOTAOverlay(const char* message) {
+    if (!ota_overlay) {
+        // Create full-screen modal overlay on the active screen.
+        ota_overlay = lv_obj_create(lv_scr_act());
+        lv_obj_set_size(ota_overlay, 800, 480);
+        lv_obj_set_style_bg_color(ota_overlay, lv_color_hex(0x000000), 0);
+        lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_90, 0);
+        lv_obj_set_style_border_width(ota_overlay, 0, 0);
+        lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        ota_label = lv_label_create(ota_overlay);
+        lv_obj_set_style_text_font(ota_label, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(ota_label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(ota_label, LV_ALIGN_CENTER, 0, -40);
+
+        ota_bar = lv_bar_create(ota_overlay);
+        lv_obj_set_size(ota_bar, 400, 20);
+        lv_obj_align(ota_bar, LV_ALIGN_CENTER, 0, 20);
+        lv_bar_set_range(ota_bar, 0, 100);
+        lv_bar_set_value(ota_bar, 0, LV_ANIM_OFF);
+    }
+    lv_label_set_text(ota_label, message);
+    lv_refr_now(NULL);  // force immediate redraw (loop is blocked during OTA)
+}
+
+void updateOTAProgress(unsigned int percent) {
+    if (ota_bar) {
+        if (percent > 100) percent = 100;
+        lv_bar_set_value(ota_bar, (int32_t)percent, LV_ANIM_OFF);
+        lv_refr_now(NULL);  // force immediate redraw during the blocking transfer
+    }
+}
+
+void hideOTAOverlay() {
+    if (ota_overlay) {
+        lv_obj_del(ota_overlay);
+        ota_overlay = nullptr;
+        ota_label = nullptr;
+        ota_bar = nullptr;
+        lv_refr_now(NULL);
+    }
+}
+
+void setupOTA() {
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.setPassword(OTA_PASSWORD);
+    ArduinoOTA.setPort(OTA_PORT);
+
+    ArduinoOTA.onStart([]() {
+        ota_in_progress = true;
+        String type =
+            (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+        Serial.println("[OTA] Start updating " + type);
+        // Stop the TCP bridge so it cannot fight for time/heap mid-update.
+        if (client) client.stop();
+        showOTAOverlay("Updating firmware...");
+    });
+
+    ArduinoOTA.onEnd([]() {
+        Serial.println("\n[OTA] Update complete - rebooting");
+        showOTAOverlay("Update complete! Rebooting...");
+        // ESP.restart() is invoked automatically by ArduinoOTA after this
+        // callback returns; the overlay stays up until the reboot.
+    });
+
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+        unsigned int percent =
+            (total > 0) ? (unsigned int)((progress * 100ULL) / total) : 0;
+        Serial.printf("[OTA] Progress: %u%%\r", percent);
+        updateOTAProgress(percent);
+    });
+
+    ArduinoOTA.onError([](ota_error_t error) {
+        ota_in_progress = false;
+        Serial.printf("[OTA] Error[%u]: ", error);
+        const char* msg = "Update failed!";
+        if (error == OTA_AUTH_ERROR) {
+            Serial.println("Auth Failed");
+            msg = "Auth Failed!";
+        } else if (error == OTA_BEGIN_ERROR) {
+            Serial.println("Begin Failed");
+            msg = "Begin Failed!";
+        } else if (error == OTA_CONNECT_ERROR) {
+            Serial.println("Connect Failed");
+            msg = "Connect Failed!";
+        } else if (error == OTA_RECEIVE_ERROR) {
+            Serial.println("Receive Failed");
+            msg = "Receive Failed!";
+        } else if (error == OTA_END_ERROR) {
+            Serial.println("End Failed");
+            msg = "End Failed!";
+        }
+        showOTAOverlay(msg);
+        delay(3000);
+        hideOTAOverlay();
+    });
+
+    ArduinoOTA.begin();
+    Serial.printf("[OTA] Ready - host '%s.local' port %d\n", OTA_HOSTNAME,
+                  OTA_PORT);
+}
+
+// Start mDNS + OTA once WiFi (STA) is up. Idempotent: safe to call again after
+// a WiFi reconnect — mDNS is torn down and restarted, OTA re-armed.
+static void startNetworkServices() {
+    static bool ota_initialized = false;
+
+    // (Re)start the mDNS responder so the device answers to "spotwelder.local".
+    MDNS.end();
+    if (MDNS.begin(OTA_HOSTNAME)) {
+        Serial.println("[mDNS] responder started: " OTA_HOSTNAME ".local");
+    } else {
+        Serial.println("[mDNS] failed to start responder");
+    }
+
+    // ArduinoOTA only needs to be set up once; begin() re-arms its listener.
+    if (!ota_initialized) {
+        setupOTA();
+        ota_initialized = true;
+    } else {
+        ArduinoOTA.begin();
+    }
+}
+
+// =========================
 // WiFi / server maintenance — drives the provisioning state machine.
 // Called every loop().
 // =========================
@@ -2118,6 +2269,10 @@ void ensureWiFiAndServer() {
                     server.begin();
                     server.setNoDelay(true);
                     server_started = true;
+
+                    // Now that STA is up, (re)start mDNS + arm OTA so the
+                    // device is flashable over WiFi at "spotwelder.local".
+                    startNetworkServices();
                 }
                 return;
             }
@@ -2870,6 +3025,14 @@ void loop() {
 
     // --- Existing logic ---
     ensureWiFiAndServer();
+
+    // --- Service OTA (over-the-air) firmware updates when WiFi is up ---
+    // ArduinoOTA.handle() is cheap when idle; once an upload starts it blocks
+    // here for the duration of the transfer (the OTA overlay shows progress).
+    if (WiFi.status() == WL_CONNECTED) {
+        ArduinoOTA.handle();
+    }
+
     pollStm32Uart();
     serviceReadyHeartbeat();
 
@@ -2975,7 +3138,11 @@ void loop() {
     }
 
     // --- Update on-screen UI (display-smoothing applied inside helper) ---
-    updateScreenDisplay();
+    // Skip while an OTA transfer is running so the normal tab UI does not flash
+    // through / fight the full-screen OTA progress overlay.
+    if (!ota_in_progress) {
+        updateScreenDisplay();
+    }
 
     delay(5);
 }
