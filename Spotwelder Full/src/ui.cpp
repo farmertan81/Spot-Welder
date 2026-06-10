@@ -174,6 +174,8 @@ struct HoldRepeatCtx {
     bool is_power;      // true = power button (not spinbox)
     void (*step_fn)(bool inc);  // generic step action (nullptr = use spinbox/power)
     bool active;        // true only while the finger is physically down
+    bool stop_latched;  // true once a physical release is seen; blocks ALL further
+                        // steps (immune to release-bounce noise) until next PRESSED
     uint32_t press_start;
     uint32_t last_repeat;
 #if HOLD_REPEAT_DEBUG
@@ -195,6 +197,7 @@ static HoldRepeatCtx* alloc_repeat_ctx(lv_obj_t* spin, bool inc,
     ctx->is_power = is_power;
     ctx->step_fn = nullptr;
     ctx->active = false;
+    ctx->stop_latched = false;
     ctx->press_start = 0;
     ctx->last_repeat = 0;
     return ctx;
@@ -225,10 +228,11 @@ static void repeat_apply_step(HoldRepeatCtx* ctx) {
     }
 }
 
-// Hard stop: clear the active flag and zero the timers so no queued/stray
-// PRESSING event can fire another step.
+// Hard stop: latch the stop, clear the active flag and zero the timers so no
+// queued / stray / noise-driven PRESSING event can fire another step.
 static void repeat_stop(HoldRepeatCtx* ctx) {
     ctx->active = false;
+    ctx->stop_latched = true;
     ctx->press_start = 0;
     ctx->last_repeat = 0;
 }
@@ -239,6 +243,7 @@ static void on_repeat_pressed(lv_event_t* e) {
     if (!ctx) return;
     uint32_t now = millis();
     ctx->active = true;        // finger is physically down
+    ctx->stop_latched = false; // fresh genuine press clears the latch
     ctx->press_start = now;
     ctx->last_repeat = now;
 #if HOLD_REPEAT_DEBUG
@@ -257,21 +262,23 @@ static void on_repeat_pressing(lv_event_t* e) {
 
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
     if (!ctx) return;
-    if (!ctx->active) return;   // finger already released — ignore stray events
+    if (!ctx->active) return;       // finger already released — ignore stray events
+    if (ctx->stop_latched) return;  // release already latched — block ALL steps
 
-    // CRITICAL overshoot fix: never fire a step while the finger is physically
-    // up.  LVGL still reports PRESSED during the touch release-debounce window
-    // (and re-arms on release noise), so relying on the RELEASED event alone let
-    // the value keep climbing for several extra steps.  The RAW physical state
-    // has no such lag.  We only SKIP here (not hard-stop) so that a momentary
-    // single-read GT911 dropout mid-hold doesn't permanently cancel a genuine
-    // hold — it resumes as soon as the finger is seen down again.  The true
-    // stop is handled by on_repeat_released (RELEASED / PRESS_LOST).
+    // CRITICAL overshoot fix: the moment the finger physically lifts, LATCH a
+    // hard stop.  LVGL still reports PRESSED during the touch release-debounce
+    // window, and the GT911 frequently emits 1-2 spurious "touched" reads as the
+    // finger bounces off — those previously re-armed the repeat and produced the
+    // residual 1-2 step overshoot.  Latching means once we have seen the finger
+    // up, NO further step can fire (regardless of subsequent noise) until a brand
+    // new genuine PRESSED event clears the latch.  The RAW physical state has no
+    // debounce lag, so this stops on the very first un-touched read.
     if (!touch_is_physically_down()) {
 #if HOLD_REPEAT_DEBUG
-        Serial.printf("[REPEAT] phys-up in PRESSING -> skip  ctx=%p\n",
+        Serial.printf("[REPEAT] phys-up in PRESSING -> LATCH stop  ctx=%p\n",
                       (void*)ctx);
 #endif
+        repeat_stop(ctx);
         return;
     }
 
