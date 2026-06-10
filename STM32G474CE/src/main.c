@@ -4454,7 +4454,18 @@ static void pollContactTrigger(void) {
     if (!contact_now) {
         contact_hold_active = false;
         contact_hold_start_ms = 0;
-        contact_fire_lock = false;
+        /* Do NOT release the fire-lock while the charger lockout is active.
+         * Right after a weld OR a calibration test pulse the cap is briefly
+         * depleted, which makes the voltage-based contactDetected() read false
+         * even though the operator is still holding the tips down. Clearing the
+         * lock here would let those still-shorted tips re-trigger a weld the
+         * instant the cap recharges -- the reported double pulse. The 500 ms
+         * charger-lockout window covers this depletion transient; once it
+         * expires, a genuine release (tips lifted) reads false with the cap
+         * recharged and clears the lock normally. */
+        if (!charger_lockout) {
+            contact_fire_lock = false;
+        }
         return;
     }
 
@@ -4586,6 +4597,12 @@ int main(void) {
     }
 
     uartSend("BOOT,STM32G474_WELD_BRAIN_10KHZ_READY");
+    /* Firmware build tag -- bump on each flashed change so the operator can
+     * confirm (over UART / serial monitor) that the NEW firmware is actually
+     * running. If this line is missing after a flash, the flash did not take
+     * (e.g. a BlackMagic ".data MIS-MATCHED" verify failure) -- re-flash with a
+     * full chip erase. */
+    uartSend("BOOT,FW=cal-dblpulse-fix-2");
 
     {
         char boot_mode_msg[32];
