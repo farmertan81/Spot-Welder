@@ -2080,24 +2080,39 @@ static void beginWifiProvisioning() {
 // =========================
 // OTA (over-the-air firmware update) support
 // =========================
-// A full-screen LVGL overlay shows update status/progress so the operator sees
-// what is happening while the device is being reflashed over WiFi. The overlay
-// is drawn on top of whatever tab is active. Because ArduinoOTA.handle() blocks
-// the main loop during the actual transfer, the OTA callbacks force an
-// immediate LVGL redraw (lv_refr_now) so the progress bar stays live.
+// A full-screen opaque LVGL overlay shows update status/progress so the operator
+// sees what is happening while the device is being reflashed over WiFi.
+//
+// GLITCH-AVOIDANCE STRATEGY (why this is structured the way it is):
+// On this Sunton board the RGB panel streams the framebuffer out of PSRAM. A
+// full-frame flush (lv_refr_now) is a large synchronous PSRAM->LCD transfer. An
+// OTA download simultaneously hammers the same PSRAM/SoC bus (WiFi RX + flash
+// write), and if we flush the screen on every progress tick the two fight for
+// the bus and the panel tears/scrambles -- exactly the glitching reported.
+// So during OTA we (1) FREEZE all normal UI work via ota_in_progress, and
+// (2) flush the progress bar only every ~5%, keeping bus contention minimal
+// while still showing live progress.
 
 static lv_obj_t* ota_overlay = nullptr;
 static lv_obj_t* ota_label = nullptr;
 static lv_obj_t* ota_bar = nullptr;
-static bool ota_in_progress = false;  // set while an OTA transfer is running
+// volatile: written from the ArduinoOTA callbacks and read in loop() to gate
+// all normal UI/UART/TCP work while a transfer is running.
+volatile bool ota_in_progress = false;  // set while an OTA transfer is running
 
-void showOTAOverlay(const char* message) {
+// Create/show the OTA overlay. `repaint` triggers exactly ONE full-frame flush
+// (lv_refr_now is a synchronous 800x480 PSRAM->LCD transfer). We deliberately
+// keep these flushes RARE during OTA: every flush competes with the WiFi RX +
+// flash write for the PSRAM/SoC bus, which is the root cause of the glitching
+// the operator sees on the progress screen. So we repaint only on overlay
+// creation and on text changes, NOT on every progress tick.
+void showOTAOverlay(const char* message, bool repaint = true) {
     if (!ota_overlay) {
         // Create full-screen modal overlay on the active screen.
         ota_overlay = lv_obj_create(lv_scr_act());
         lv_obj_set_size(ota_overlay, 800, 480);
         lv_obj_set_style_bg_color(ota_overlay, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_90, 0);
+        lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_COVER, 0);  // fully opaque
         lv_obj_set_style_border_width(ota_overlay, 0, 0);
         lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
 
@@ -2113,14 +2128,25 @@ void showOTAOverlay(const char* message) {
         lv_bar_set_value(ota_bar, 0, LV_ANIM_OFF);
     }
     lv_label_set_text(ota_label, message);
-    lv_refr_now(NULL);  // force immediate redraw (loop is blocked during OTA)
+    if (repaint) {
+        lv_refr_now(NULL);  // single synchronous flush (loop is blocked in OTA)
+    }
 }
 
+// Update the progress bar. The actual screen flush is THROTTLED: we only force a
+// redraw every 5% so the bar still animates visibly while minimising the number
+// of PSRAM->LCD transfers that fight the firmware download for bus bandwidth.
 void updateOTAProgress(unsigned int percent) {
-    if (ota_bar) {
-        if (percent > 100) percent = 100;
-        lv_bar_set_value(ota_bar, (int32_t)percent, LV_ANIM_OFF);
-        lv_refr_now(NULL);  // force immediate redraw during the blocking transfer
+    if (!ota_bar) return;
+    if (percent > 100) percent = 100;
+
+    lv_bar_set_value(ota_bar, (int32_t)percent, LV_ANIM_OFF);
+
+    static int last_drawn_pct = -1;
+    if (last_drawn_pct < 0 || (int)percent - last_drawn_pct >= 5 ||
+        percent >= 100) {
+        last_drawn_pct = (int)percent;
+        lv_refr_now(NULL);  // sparse: ~20 flushes across the whole transfer
     }
 }
 
@@ -2140,20 +2166,33 @@ void setupOTA() {
     ArduinoOTA.setPort(OTA_PORT);
 
     ArduinoOTA.onStart([]() {
+        // FREEZE the normal UI. From here until reboot/error, loop() does no
+        // tab rendering, no UART polling and no TCP work (see the ota_in_progress
+        // guard in loop()), so the firmware download gets the PSRAM/SoC bus to
+        // itself. This is what stops the glitching on the update screen.
         ota_in_progress = true;
+
         String type =
             (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-        Serial.println("[OTA] Start updating " + type);
-        // Stop the TCP bridge so it cannot fight for time/heap mid-update.
+        Serial.println("[OTA] Start updating " + type + " - display frozen");
+
+        // Stop the TCP bridge so it cannot fight for time/heap/bus mid-update.
         if (client) client.stop();
-        showOTAOverlay("Updating firmware...");
+
+        // Paint the overlay ONCE, cleanly, before the transfer saturates the
+        // bus. lv_timer_handler() lets LVGL process the just-created widgets,
+        // then showOTAOverlay() does the single full-frame flush.
+        showOTAOverlay("Updating firmware...", /*repaint=*/false);
+        lv_timer_handler();
+        lv_refr_now(NULL);
     });
 
     ArduinoOTA.onEnd([]() {
         Serial.println("\n[OTA] Update complete - rebooting");
-        showOTAOverlay("Update complete! Rebooting...");
-        // ESP.restart() is invoked automatically by ArduinoOTA after this
-        // callback returns; the overlay stays up until the reboot.
+        // One last flush to show the reboot message, then ArduinoOTA reboots
+        // automatically after this callback returns (a clean boot also clears
+        // any residual panel glitch, matching the manual power-cycle behaviour).
+        showOTAOverlay("Update complete! Rebooting...", /*repaint=*/true);
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
@@ -3011,10 +3050,27 @@ void setup() {
 static unsigned long lv_last_tick = 0;
 
 void loop() {
-    // --- LVGL tick + task handler ---
+    // --- LVGL tick (must run before any early-return so timing stays sane) ---
     unsigned long now_ms = millis();
     lv_tick_inc(now_ms - lv_last_tick);
     lv_last_tick = now_ms;
+
+    // --- Service OTA FIRST ---------------------------------------------------
+    // ArduinoOTA.handle() is cheap when idle. When a transfer starts it BLOCKS
+    // here for the whole download, driving the progress overlay from its own
+    // (throttled) callbacks. The ota_in_progress guard below is the safety net
+    // for the brief window before handle() blocks and for the post-error path:
+    // while an OTA is active we skip ALL normal work (UI render, UART, TCP) so
+    // the download owns the PSRAM/SoC bus and the screen does not glitch.
+    if (WiFi.status() == WL_CONNECTED) {
+        ArduinoOTA.handle();
+    }
+    if (ota_in_progress) {
+        delay(10);  // yield to WiFi/flash; no UI/UART/TCP during the update
+        return;
+    }
+
+    // --- Normal UI servicing (only when NOT doing OTA) ---
     lv_timer_handler();
 
     // --- Phase 1: fallback timeout – send config if no BOOT msg received ---
@@ -3026,14 +3082,6 @@ void loop() {
 
     // --- Existing logic ---
     ensureWiFiAndServer();
-
-    // --- Service OTA (over-the-air) firmware updates when WiFi is up ---
-    // ArduinoOTA.handle() is cheap when idle; once an upload starts it blocks
-    // here for the duration of the transfer (the OTA overlay shows progress).
-    if (WiFi.status() == WL_CONNECTED) {
-        ArduinoOTA.handle();
-    }
-
     pollStm32Uart();
     serviceReadyHeartbeat();
 
@@ -3139,11 +3187,8 @@ void loop() {
     }
 
     // --- Update on-screen UI (display-smoothing applied inside helper) ---
-    // Skip while an OTA transfer is running so the normal tab UI does not flash
-    // through / fight the full-screen OTA progress overlay.
-    if (!ota_in_progress) {
-        updateScreenDisplay();
-    }
+    // (Unreachable during OTA: loop() returns early above while ota_in_progress.)
+    updateScreenDisplay();
 
     delay(5);
 }
