@@ -28,6 +28,15 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
+#if defined(DISPLAY_ST7262_PAR)
+// RGB-panel runtime controls used for the display-drift / OTA-glitch fix:
+//   esp_lcd_rgb_panel_set_pclk()  -> slow the pixel clock during OTA so the
+//                                    panel reads PSRAM slower and leaves bus
+//                                    bandwidth for the firmware flash writes.
+//   esp_lcd_rgb_panel_restart()   -> re-align the scan-out DMA after a drift
+//                                    ("permanent shift") without a power cycle.
+#include <esp_lcd_panel_rgb.h>
+#endif
 #include <esp_wifi.h>
 #include <lv_conf.h>
 #include <lvgl.h>
@@ -2160,6 +2169,71 @@ void hideOTAOverlay() {
     }
 }
 
+// =========================================================================
+// RGB-panel drift / glitch recovery helpers
+// -------------------------------------------------------------------------
+// Root cause of the intermittent "whole image shifted / overscanned" glitch
+// (seen on a plain reboot AND, worse, during an OTA flash):
+//
+//   The Sunton ESP32-8048S043C streams its 800x480x16bpp framebuffer (768 KB)
+//   CONTINUOUSLY out of QSPI PSRAM (quad, 80 MHz) to feed the RGB panel. The
+//   esp_lcd RGB refill / VSYNC-restart interrupt in the *precompiled* Arduino
+//   libraries is NOT IRAM-safe (CONFIG_LCD_RGB_ISR_IRAM_SAFE is unset). So
+//   whenever the SPI-flash cache is briefly disabled - NVS reads and WiFi RF
+//   calibration loads during boot, and especially the sustained flash writes
+//   during an OTA update - the panel's line DMA underruns, the scan-out pointer
+//   slips, and the picture drifts. Historically only a power cycle cleared it.
+//
+// Two stock esp_lcd RGB APIs (available even with the precompiled libs) let us
+// fix this in software:
+//   * esp_lcd_rgb_panel_set_pclk()  - slow the pixel clock while flash is busy
+//                                     (OTA) so the panel's PSRAM read demand
+//                                     drops and the bus has room for the writes.
+//   * esp_lcd_rgb_panel_restart()   - request a DMA re-sync at the next VSYNC,
+//                                     recovering an already-drifted frame
+//                                     without a power cycle.
+// =========================================================================
+#if defined(DISPLAY_ST7262_PAR)
+// Pixel clock matches ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ in the board def.
+static const uint32_t RGB_PCLK_NORMAL_HZ = 12000000;  // ~29 Hz refresh
+// Halved during OTA: the update screen is static, so a low refresh is fine and
+// it roughly halves the panel's PSRAM read bandwidth during the flash writes.
+static const uint32_t RGB_PCLK_OTA_HZ = 6000000;  // ~15 Hz refresh
+
+static esp_lcd_panel_handle_t getRgbPanelHandle() {
+    lv_display_t* disp = lv_display_get_default();
+    if (!disp) return nullptr;
+    return (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
+}
+
+// Change the RGB pixel clock at runtime (applied at the next VSYNC).
+static void displaySetPclk(uint32_t hz) {
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (!panel) return;
+    esp_err_t err = esp_lcd_rgb_panel_set_pclk(panel, hz);
+    Serial.printf("[Display] set PCLK -> %u Hz: %s\n", (unsigned)hz,
+                  esp_err_to_name(err));
+}
+
+// Re-align the panel scan-out DMA and repaint a full clean frame. Use after a
+// flash-heavy window (boot, OTA abort) to clear any drift in software.
+static void resyncDisplayPanel(const char* reason) {
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (!panel) return;
+    esp_err_t err = esp_lcd_rgb_panel_restart(panel);
+    Serial.printf("[Display] RGB resync (%s): %s\n", reason ? reason : "",
+                  esp_err_to_name(err));
+    // Force LVGL to redraw the whole framebuffer so the restarted scan-out is
+    // fed complete, correct pixel data.
+    lv_obj_invalidate(lv_scr_act());
+    lv_refr_now(lv_display_get_default());
+}
+#else
+// Non-RGB panel build: these are no-ops so the call sites stay clean.
+static inline void displaySetPclk(uint32_t) {}
+static inline void resyncDisplayPanel(const char*) {}
+#endif
+
 void setupOTA() {
     ArduinoOTA.setHostname(OTA_HOSTNAME);
     ArduinoOTA.setPassword(OTA_PASSWORD);
@@ -2185,6 +2259,14 @@ void setupOTA() {
         showOTAOverlay("Updating firmware...", /*repaint=*/false);
         lv_timer_handler();
         lv_refr_now(NULL);
+
+        // Slow the RGB pixel clock for the duration of the transfer. The panel
+        // now reads its framebuffer out of PSRAM at ~half the rate, freeing bus
+        // bandwidth for the sustained flash writes and stopping the underrun
+        // (= drift / whole-screen glitch) that the cache-disabled flash writes
+        // would otherwise cause. The static update screen looks identical at
+        // the lower refresh. Restored on a clean reboot (success) or in onError.
+        displaySetPclk(RGB_PCLK_OTA_HZ);
     });
 
     ArduinoOTA.onEnd([]() {
@@ -2222,9 +2304,14 @@ void setupOTA() {
             Serial.println("End Failed");
             msg = "End Failed!";
         }
+        // OTA aborted: the device keeps running, so restore the normal pixel
+        // clock and re-align the panel in case the partial flash activity left
+        // the scan-out drifted.
+        displaySetPclk(RGB_PCLK_NORMAL_HZ);
         showOTAOverlay(msg);
         delay(3000);
         hideOTAOverlay();
+        resyncDisplayPanel("ota-error");
     });
 
     ArduinoOTA.begin();
@@ -3072,6 +3159,22 @@ void loop() {
 
     // --- Normal UI servicing (only when NOT doing OTA) ---
     lv_timer_handler();
+
+    // --- Post-boot display drift recovery -----------------------------------
+    // The flash-heavy early-boot window (NVS reads + WiFi RF-calibration loads)
+    // can briefly starve the non-IRAM-safe RGB refill ISR and leave the panel
+    // scan-out drifted ("image shifted / spilling off the edge" on a plain
+    // reboot). Re-align the panel a few times over the first ~9 s, after that
+    // activity settles, so the picture self-corrects WITHOUT a power cycle.
+    {
+        static uint8_t boot_resync_idx = 0;
+        static const uint32_t kBootResyncDelaysMs[] = {2000, 5000, 9000};
+        if (boot_resync_idx < 3 && setup_done_ms > 0 &&
+            (now_ms - setup_done_ms) >= kBootResyncDelaysMs[boot_resync_idx]) {
+            resyncDisplayPanel("post-boot");
+            boot_resync_idx++;
+        }
+    }
 
     // --- Phase 1: fallback timeout – send config if no BOOT msg received ---
     if (!config_sent && !stm32_booted && setup_done_ms > 0 &&
