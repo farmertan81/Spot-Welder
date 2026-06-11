@@ -1,4 +1,5 @@
 /**
+ * OTA firmware for ESP32-based TFT display
  * Spot Welder – Merged Firmware (Milestone 1) – REFACTORED
  *
  * REFACTOR CHANGES:
