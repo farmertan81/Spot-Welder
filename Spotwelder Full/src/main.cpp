@@ -346,25 +346,52 @@ static const uint32_t STATUS_FORWARD_MIN_INTERVAL_MS = 100;
  * WITHOUT touching Wire (which would conflict).
  *
  * GT911 7-bit address = 0x5D (board uses the default ADDR pin level).
- * Sensitivity is set via the on-chip config block:
- *   0x8047        Config_Version (start of config)
- *   0x8053        Touch_Level  (press threshold – LOWER = more sensitive)
- *   0x8054        Leave_Level  (release threshold – must be < Touch_Level)
+ *
+ * IMPORTANT (v2 – noise-immune profiles):
+ *   The spot welder's high-current switching generates EMI that couples into
+ *   the touch panel.  Simply lowering Touch_Level (v1) made the panel MORE
+ *   sensitive but also dropped the threshold BELOW the EMI noise floor, so the
+ *   controller reported a storm of phantom touches ("bouncing / mind of its
+ *   own").  The fix is NOT a lower threshold – it is to keep a MODERATE
+ *   threshold and add hardware noise filtering that scales with sensitivity.
+ *
+ * Each UI sensitivity step (1-10) now selects a full PROFILE that tunes
+ * several config registers together:
+ *   0x804C  Touch_Number   – forced to 1 (single-finger UI; rejects phantom
+ *                            multi-point noise)
+ *   0x804F  Shake_Count    – de-jitter confirm samples. We raise the
+ *                            touch-DOWN confirm count (low nibble) at high
+ *                            sensitivity so a press must persist for several
+ *                            scan frames before it registers (kills transient
+ *                            EMI spikes). The touch-UP nibble is preserved.
+ *   0x8050  Filter         – Normal_Filter coordinate smoothing (low nibble),
+ *                            raised at high sensitivity to stop the cursor
+ *                            "bouncing around". First_Filter nibble preserved.
+ *   0x8052  Noise_Reduction– 0-15, raised at high sensitivity for EMI immunity.
+ *   0x8053  Touch_Level    – press threshold (kept in a usable 46-88 band, not
+ *                            driven down to the noise floor).
+ *   0x8054  Leave_Level    – release threshold, ~16 below Touch_Level for
+ *                            solid hysteresis (less release chatter).
  *   0x8047..0x80FE  184 config bytes
- *   0x80FF        Config_Chksum = (~sum(0x8047..0x80FE) + 1) & 0xFF
- *   0x8100        Config_Fresh – write 0x01 to commit the new config
+ *   0x80FF  Config_Chksum = (~sum(0x8047..0x80FE) + 1) & 0xFF
+ *   0x8100  Config_Fresh – write 0x01 to commit the new config
  *
  * We use the safe read-modify-write method: read the whole config block,
- * change ONLY the two threshold bytes, recompute the checksum, then write
- * the block back and set Config_Fresh.  Changing only these 2 bytes is the
- * documented, low-risk way to retune sensitivity at runtime.
+ * change ONLY the profile bytes (preserving the high nibbles of Shake_Count /
+ * Filter that the factory set), recompute the checksum, then write the block
+ * back and set Config_Fresh.  This is the documented, low-risk way to retune
+ * the controller at runtime.
  * ============================================================ */
 
 #define GT911_I2C_PORT        I2C_NUM_0
 #define GT911_I2C_ADDR_7BIT   0x5D
 #define GT911_REG_CONFIG_VER  0x8047  // first byte of config block
-#define GT911_REG_TOUCH_LEVEL 0x8053  // press threshold
-#define GT911_REG_LEAVE_LEVEL 0x8054  // release threshold
+#define GT911_REG_TOUCH_NUMBER 0x804C // max touch points (1-5)
+#define GT911_REG_SHAKE_COUNT 0x804F  // de-jitter: hi nibble=touch-up, lo=touch-down confirm
+#define GT911_REG_FILTER      0x8050  // hi nibble=First_Filter, lo=Normal_Filter (coord smoothing)
+#define GT911_REG_NOISE_REDUCE 0x8052 // 0-15: higher = more EMI/noise immunity
+#define GT911_REG_TOUCH_LEVEL 0x8053  // press threshold (higher = firmer press needed)
+#define GT911_REG_LEAVE_LEVEL 0x8054  // release threshold (must be < Touch_Level)
 #define GT911_REG_CONFIG_CHK  0x80FF  // checksum byte
 #define GT911_REG_CONFIG_FRESH 0x8100 // commit trigger
 #define GT911_CONFIG_LEN      184      // 0x8047..0x80FE inclusive
@@ -392,54 +419,100 @@ static bool gt911_write_reg(uint16_t reg, const uint8_t* data, size_t len) {
     return err == ESP_OK;
 }
 
-// Map UI sensitivity (1..10, 10=lightest/most sensitive) to a GT911 press
-// threshold.  Higher sensitivity -> lower Touch_Level.
-//   sens 1  -> ~100 (firmest press required)
-//   sens 5  -> ~64  (GT911 typical default region)
-//   sens 10 -> ~19  (lightest touch)
-static uint8_t gt911_touch_level_for(uint8_t sens) {
-    if (sens < 1) sens = 1;
-    if (sens > 10) sens = 10;
-    int level = 100 - (int)(sens - 1) * 9;  // 100..19
-    if (level < 10) level = 10;
-    if (level > 0xFF) level = 0xFF;
-    return (uint8_t)level;
+// One tuning profile per UI sensitivity step.  These bundle the threshold with
+// the noise-filtering registers so that high sensitivity stays usable under the
+// welder's EMI.  All values are deliberately conservative (well within the
+// GT911's documented ranges) since they cannot be verified on bench hardware
+// from here – the operator can fine-tune after a quick on-device test.
+struct Gt911TouchProfile {
+    uint8_t touch_level;      // 0x8053 press threshold  (higher = firmer press)
+    uint8_t leave_level;      // 0x8054 release threshold (< touch_level)
+    uint8_t noise_reduction;  // 0x8052 value 0-15        (higher = more immune)
+    uint8_t shake_down;       // 0x804F low nibble 0-15   (touch-down confirm)
+    uint8_t filter_norm;      // 0x8050 low nibble 0-15   (coordinate smoothing)
+};
+
+// Index 0 unused; sensitivity 1..10.  As sensitivity rises the threshold drops
+// (more responsive) BUT noise-reduction, confirm samples and coordinate
+// smoothing all rise to keep it stable against EMI.  Threshold floor is kept at
+// 46 (NOT the old 19) so it never sinks into the noise floor.
+static const Gt911TouchProfile kTouchProfiles[11] = {
+    /* [0] unused      */ {0, 0, 0, 0, 0},
+    /* [1] least sens  */ {88, 72, 1, 1, 2},
+    /* [2]             */ {82, 66, 1, 1, 2},
+    /* [3]             */ {76, 60, 2, 1, 3},
+    /* [4]             */ {70, 54, 2, 2, 3},
+    /* [5] balanced    */ {64, 48, 3, 2, 4},
+    /* [6]             */ {60, 44, 4, 2, 4},
+    /* [7]             */ {56, 40, 6, 3, 5},
+    /* [8]             */ {52, 36, 8, 3, 6},
+    /* [9]             */ {49, 32, 10, 4, 7},
+    /* [10] most sens  */ {46, 28, 12, 4, 8},
+};
+
+static inline uint8_t clamp_sens(uint8_t sens) {
+    if (sens < 1) return 1;
+    if (sens > 10) return 10;
+    return sens;
 }
 
-// Apply the touch sensitivity to the GT911 by read-modify-writing its config
-// block (only the two threshold bytes are changed). Safe: bails out on any I2C
-// error and never leaves a half-written config (Config_Fresh is set last).
+// Apply a full touch-sensitivity profile to the GT911 by read-modify-writing
+// its config block.  Only the profile bytes are changed (high nibbles of the
+// Shake_Count / Filter bytes are preserved). Safe: bails out on any I2C error
+// and sets Config_Fresh LAST so a half-written config is never committed.
 static bool applyTouchSensitivity(uint8_t sens) {
-    uint8_t touch_level = gt911_touch_level_for(sens);
-    // Keep leave_level a bit below touch_level so release is detected reliably.
-    int leave = (int)touch_level - 10;
-    if (leave < 10) leave = 10;
-    uint8_t leave_level = (uint8_t)leave;
+    sens = clamp_sens(sens);
+    const Gt911TouchProfile& p = kTouchProfiles[sens];
 
     // 1) Read the full config block.
     uint8_t cfg[GT911_CONFIG_LEN];
     if (!gt911_read_reg(GT911_REG_CONFIG_VER, cfg, GT911_CONFIG_LEN)) {
-        Serial.println("[Touch] GT911 config read FAILED – sensitivity not applied");
+        Serial.println(
+            "[Touch] GT911 config read FAILED – sensitivity not applied");
         return false;
     }
 
-    // 2) Modify only the two threshold bytes (offset from 0x8047).
-    const size_t off_touch = GT911_REG_TOUCH_LEVEL - GT911_REG_CONFIG_VER;  // 12
-    const size_t off_leave = GT911_REG_LEAVE_LEVEL - GT911_REG_CONFIG_VER;  // 13
-    if (cfg[off_touch] == touch_level && cfg[off_leave] == leave_level) {
-        Serial.printf("[Touch] GT911 sensitivity already at level=%u (sens %u)\n",
-                      touch_level, sens);
-        return true;  // nothing to do
-    }
-    cfg[off_touch] = touch_level;
-    cfg[off_leave] = leave_level;
+    // 2) Compute byte offsets into the config block (base = 0x8047).
+    const size_t off_tnum  = GT911_REG_TOUCH_NUMBER - GT911_REG_CONFIG_VER;   // 5
+    const size_t off_shake = GT911_REG_SHAKE_COUNT  - GT911_REG_CONFIG_VER;   // 8
+    const size_t off_filt  = GT911_REG_FILTER       - GT911_REG_CONFIG_VER;   // 9
+    const size_t off_noise = GT911_REG_NOISE_REDUCE - GT911_REG_CONFIG_VER;   // 11
+    const size_t off_touch = GT911_REG_TOUCH_LEVEL  - GT911_REG_CONFIG_VER;   // 12
+    const size_t off_leave = GT911_REG_LEAVE_LEVEL  - GT911_REG_CONFIG_VER;   // 13
 
-    // 3) Recompute checksum over the 184 config bytes.
+    // Build the new bytes, preserving high nibbles where only the low nibble is
+    // ours to tune (Touch_Number low 3 bits hold the finger count).
+    uint8_t new_tnum  = (uint8_t)((cfg[off_tnum] & 0xF0) | 0x01);  // 1 finger
+    uint8_t new_shake = (uint8_t)((cfg[off_shake] & 0xF0) | (p.shake_down & 0x0F));
+    uint8_t new_filt  = (uint8_t)((cfg[off_filt]  & 0xF0) | (p.filter_norm & 0x0F));
+    uint8_t new_noise = (uint8_t)(p.noise_reduction & 0x0F);
+    uint8_t new_touch = p.touch_level;
+    uint8_t new_leave = p.leave_level;
+
+    // 3) Skip the (relatively expensive) write if nothing actually changed.
+    if (cfg[off_tnum] == new_tnum && cfg[off_shake] == new_shake &&
+        cfg[off_filt] == new_filt && cfg[off_noise] == new_noise &&
+        cfg[off_touch] == new_touch && cfg[off_leave] == new_leave) {
+        Serial.printf(
+            "[Touch] GT911 sens %u already applied "
+            "(touch=%u leave=%u noise=%u shake=0x%02X filt=0x%02X)\n",
+            sens, new_touch, new_leave, new_noise, new_shake, new_filt);
+        return true;
+    }
+
+    cfg[off_tnum]  = new_tnum;
+    cfg[off_shake] = new_shake;
+    cfg[off_filt]  = new_filt;
+    cfg[off_noise] = new_noise;
+    cfg[off_touch] = new_touch;
+    cfg[off_leave] = new_leave;
+
+    // 4) Recompute checksum over the 184 config bytes.
     uint8_t sum = 0;
     for (size_t i = 0; i < GT911_CONFIG_LEN; i++) sum += cfg[i];
     uint8_t checksum = (uint8_t)((~sum) + 1);
 
-    // 4) Write the config block back, then checksum, then commit.
+    // 5) Write the config block back, then checksum, then commit (fresh last).
     if (!gt911_write_reg(GT911_REG_CONFIG_VER, cfg, GT911_CONFIG_LEN)) {
         Serial.println("[Touch] GT911 config write FAILED");
         return false;
@@ -454,8 +527,9 @@ static bool applyTouchSensitivity(uint8_t sens) {
         return false;
     }
     Serial.printf(
-        "[Touch] GT911 sensitivity=%u applied (Touch_Level=%u, Leave_Level=%u)\n",
-        sens, touch_level, leave_level);
+        "[Touch] GT911 sens=%u applied: Touch_Level=%u Leave_Level=%u "
+        "Noise=%u Shake=0x%02X Filter=0x%02X\n",
+        sens, new_touch, new_leave, new_noise, new_shake, new_filt);
     return true;
 }
 
