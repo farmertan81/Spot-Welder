@@ -45,6 +45,7 @@
 #include <lv_conf.h>
 #include <lvgl.h>
 #include <math.h>
+#include <string.h>  // memset() for the boot framebuffer clear
 
 #include "ui.h"
 
@@ -2209,6 +2210,63 @@ static void resyncDisplayPanel(const char* reason) {
 }
 
 // =========================================================================
+// BOOT DISPLAY STABILIZATION  (fix for garbled/overlapping UI on cold boot)
+// -------------------------------------------------------------------------
+// Symptom: right after a power-on/reset the UI is drawn garbled, overlapping
+// and shifted; a manual reset later corrects it. Root cause is a startup race:
+//   1) smartdisplay_init() allocates the 800x480x16bpp framebuffer in PSRAM but
+//      does NOT clear it, so it starts full of random power-on garbage.
+//   2) The RGB panel's scan-out DMA begins streaming that garbage immediately,
+//      while the early-boot flash-heavy window (NVS reads + WiFi RF-cal loads)
+//      starves the non-IRAM RGB refill ISR, so the DMA scan-out pointer is
+//      already drifted before LVGL even draws its first frame.
+//   3) LVGL then renders the UI on top of a drifted/garbage scan-out -> the
+//      "garbled, overlapping, misaligned" first screen.
+//
+// Fix: BEFORE any UI is created, (a) zero the PSRAM framebuffer so there is no
+// garbage to scan out, (b) esp_lcd_rgb_panel_restart() to re-align the DMA to a
+// clean VSYNC, then (c) a short settle delay so the panel is streaming a stable
+// (black) frame by the time LVGL starts drawing the real UI. The caller keeps
+// the backlight OFF across this window so the operator never sees the garbage.
+// =========================================================================
+static void displayBootStabilize() {
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (!panel) {
+        Serial.println("[Display] boot stabilize: no RGB panel handle");
+        return;
+    }
+
+    // (a) Zero the PSRAM framebuffer(s) so the panel scans out solid black
+    //     instead of random power-on garbage. The RGB driver may keep 1+ frame
+    //     buffers; clear whichever it hands back.
+    void* fb0 = nullptr;
+    void* fb1 = nullptr;
+    const size_t fb_bytes = (size_t)DISPLAY_WIDTH * DISPLAY_HEIGHT * 2;  // RGB565
+    // Try two buffers first (double-buffered configs); fall back to one.
+    if (esp_lcd_rgb_panel_get_frame_buffer(panel, 2, &fb0, &fb1) == ESP_OK) {
+        if (fb0) memset(fb0, 0, fb_bytes);
+        if (fb1) memset(fb1, 0, fb_bytes);
+        Serial.println("[Display] boot stabilize: cleared 2 framebuffers");
+    } else if (esp_lcd_rgb_panel_get_frame_buffer(panel, 1, &fb0) == ESP_OK &&
+               fb0) {
+        memset(fb0, 0, fb_bytes);
+        Serial.println("[Display] boot stabilize: cleared 1 framebuffer");
+    } else {
+        Serial.println("[Display] boot stabilize: framebuffer fetch failed");
+    }
+
+    // (b) Re-align the scan-out DMA to a clean VSYNC now that the buffer is
+    //     black, clearing any drift from the flash-heavy early-boot window.
+    esp_err_t err = esp_lcd_rgb_panel_restart(panel);
+    Serial.printf("[Display] boot stabilize: DMA restart: %s\n",
+                  esp_err_to_name(err));
+
+    // (c) Let the panel stream a couple of stable black frames before LVGL
+    //     starts drawing the real UI (panel runs ~29 Hz -> ~35 ms/frame).
+    delay(80);
+}
+
+// =========================================================================
 // OTA HARD-BLANK  (the real fix for the OTA "color loop" crash)
 // -------------------------------------------------------------------------
 // During an OTA flash write, esp_ota_write() erases/programs flash, and EACH
@@ -2257,6 +2315,7 @@ static void displayUnblankAfterOta() {
 #else
 // Non-RGB panel build: these are no-ops so the call sites stay clean.
 static inline void resyncDisplayPanel(const char*) {}
+static inline void displayBootStabilize() {}
 static inline void displayBlankForOta() {}
 static inline void displayUnblankAfterOta() {}
 #endif
@@ -3039,9 +3098,18 @@ void setup() {
     // DO NOT call Wire.begin() after this – it conflicts!
     // ==========================================================
     Serial.println("Initializing display (smartdisplay)...");
-    smartdisplay_init();
-    smartdisplay_lcd_set_backlight(1.0f);
-    Serial.println("✅ Display initialized");
+    smartdisplay_init();  // creates the RGB panel + framebuffer and runs lv_init()
+
+    // BOOT STABILIZATION: keep the backlight OFF, then clear the (uninitialised,
+    // garbage-filled) PSRAM framebuffer and re-align the scan-out DMA BEFORE any
+    // UI is created. This kills the garbled/overlapping/shifted first frame seen
+    // on a cold boot (see displayBootStabilize() for the full root-cause notes).
+    // The backlight is turned back on further below, only after LVGL has drawn
+    // the real UI into the now-clean framebuffer, so the operator never sees the
+    // power-on garbage.
+    smartdisplay_lcd_set_backlight(0.0f);
+    displayBootStabilize();
+    Serial.println("✅ Display initialized (framebuffer cleared, DMA synced)");
 
     // ==========================================================
     // TOUCH INDEV OVERRIDE – wrap smartdisplay driver with filter
@@ -3070,6 +3138,16 @@ void setup() {
     // ==========================================================
     ui_init(onArmToggle, onRecipeApply);
     Serial.println("✅ UI created (5-tab shell + Pulse tab)");
+
+    // Render the real UI into the (already-cleared) framebuffer ONCE, then turn
+    // the backlight back on. Because the framebuffer was zeroed and the DMA
+    // re-synced in displayBootStabilize(), the very first thing the operator
+    // sees is the fully-drawn, correctly-aligned UI — never the power-on
+    // garbage or a half-drawn frame.
+    lv_timer_handler();        // let LVGL process the freshly-created widgets
+    lv_refr_now(NULL);         // synchronous full-frame flush to the panel
+    smartdisplay_lcd_set_backlight(1.0f);
+    Serial.println("✅ Backlight on (UI rendered into clean framebuffer)");
 
     // --- Config: Load settings from NVS into memory (Phase 1: NO STM32 sends
     // here) ---
