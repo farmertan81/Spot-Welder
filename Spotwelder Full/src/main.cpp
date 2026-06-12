@@ -36,6 +36,10 @@
 //   esp_lcd_rgb_panel_restart()   -> re-align the scan-out DMA after a drift
 //                                    ("permanent shift") without a power cycle.
 #include <esp_lcd_panel_rgb.h>
+// esp_lcd_panel_disp_on_off() halts/restarts the RGB panel's scan-out so the
+// LCD stops streaming the (about-to-be-garbage) PSRAM framebuffer during the
+// flash-cache-disabled windows of an OTA write. Used by the OTA hard-blank fix.
+#include <esp_lcd_panel_ops.h>
 #endif
 #include <esp_wifi.h>
 #include <lv_conf.h>
@@ -2228,10 +2232,59 @@ static void resyncDisplayPanel(const char* reason) {
     lv_obj_invalidate(lv_scr_act());
     lv_refr_now(lv_display_get_default());
 }
+
+// =========================================================================
+// OTA HARD-BLANK  (the real fix for the OTA "color loop" crash)
+// -------------------------------------------------------------------------
+// During an OTA flash write, esp_ota_write() erases/programs flash, and EACH
+// erase/program op momentarily DISABLES the SPI-flash cache. While the cache is
+// off the RGB panel cannot fetch its framebuffer out of PSRAM, and the (non-
+// IRAM) RGB refill ISR cannot run from flash -> the panel scans out garbage
+// (cycling solid colors: black/white/yellow/red/blue) and can fault, so the OTA
+// never completes and needs a manual reset.
+//
+// The robust fix is to STOP the panel scanning out entirely for the duration of
+// the transfer: turn the backlight off AND halt the panel scan-out via
+// esp_lcd_panel_disp_on_off(panel,false). With the panel quiescent there is no
+// PSRAM read demand and no refill ISR to fire during the cache-disable windows,
+// so the flash writes complete cleanly. The screen is intentionally black while
+// flashing; it is fully restored on completion (onEnd reboots -> clean boot) or
+// on abort (onError -> blank off + resync).
+// =========================================================================
+static void displayBlankForOta() {
+    // 1) Backlight off first so the operator never sees the garbage frame that
+    //    a half-written framebuffer would otherwise show.
+    smartdisplay_lcd_set_backlight(0.0f);
+    // 2) Halt the RGB panel scan-out so DMA stops reading PSRAM. This is what
+    //    removes the cache-disable contention/fault during flash writes.
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (panel) {
+        esp_err_t err = esp_lcd_panel_disp_on_off(panel, false);
+        Serial.printf("[Display] OTA blank: panel off: %s\n",
+                      esp_err_to_name(err));
+    }
+}
+
+// Bring the panel back after an aborted OTA (onError). On success the device
+// reboots from onEnd, so this is only needed on the abort path.
+static void displayUnblankAfterOta() {
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (panel) {
+        esp_err_t err = esp_lcd_panel_disp_on_off(panel, true);
+        Serial.printf("[Display] OTA unblank: panel on: %s\n",
+                      esp_err_to_name(err));
+    }
+    // Re-align the scan-out DMA and repaint a full clean frame before the
+    // backlight comes back, so the operator sees a correct picture immediately.
+    resyncDisplayPanel("ota-unblank");
+    smartdisplay_lcd_set_backlight(1.0f);
+}
 #else
 // Non-RGB panel build: these are no-ops so the call sites stay clean.
 static inline void displaySetPclk(uint32_t) {}
 static inline void resyncDisplayPanel(const char*) {}
+static inline void displayBlankForOta() {}
+static inline void displayUnblankAfterOta() {}
 #endif
 
 void setupOTA() {
@@ -2248,33 +2301,31 @@ void setupOTA() {
 
         String type =
             (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-        Serial.println("[OTA] Start updating " + type + " - display frozen");
+        Serial.println("[OTA] Start updating " + type + " - display blanked");
 
         // Stop the TCP bridge so it cannot fight for time/heap/bus mid-update.
         if (client) client.stop();
 
-        // Paint the overlay ONCE, cleanly, before the transfer saturates the
-        // bus. lv_timer_handler() lets LVGL process the just-created widgets,
-        // then showOTAOverlay() does the single full-frame flush.
-        showOTAOverlay("Updating firmware...", /*repaint=*/false);
-        lv_timer_handler();
-        lv_refr_now(NULL);
-
-        // Slow the RGB pixel clock for the duration of the transfer. The panel
-        // now reads its framebuffer out of PSRAM at ~half the rate, freeing bus
-        // bandwidth for the sustained flash writes and stopping the underrun
-        // (= drift / whole-screen glitch) that the cache-disabled flash writes
-        // would otherwise cause. The static update screen looks identical at
-        // the lower refresh. Restored on a clean reboot (success) or in onError.
-        displaySetPclk(RGB_PCLK_OTA_HZ);
+        // HARD BLANK the display for the whole transfer. This is the real fix
+        // for the "color loop" crash: each flash erase/program disables the
+        // SPI-flash cache, during which the RGB panel cannot fetch its PSRAM
+        // framebuffer and the non-IRAM refill ISR cannot run -> garbage scan-out
+        // + fault. Turning the backlight off and halting panel scan-out removes
+        // all PSRAM read demand and the refill ISR during those windows, so the
+        // flash writes complete cleanly. The screen stays black until reboot
+        // (success) or unblank (abort). NOTE: do this BEFORE any LVGL flush so
+        // we never push a frame to a panel we are about to stop.
+        displayBlankForOta();
     });
 
     ArduinoOTA.onEnd([]() {
         Serial.println("\n[OTA] Update complete - rebooting");
-        // One last flush to show the reboot message, then ArduinoOTA reboots
-        // automatically after this callback returns (a clean boot also clears
-        // any residual panel glitch, matching the manual power-cycle behaviour).
-        showOTAOverlay("Update complete! Rebooting...", /*repaint=*/true);
+        // Bring the panel/backlight back so the (very brief) pre-reboot moment
+        // and the upcoming clean boot are not left on a powered-off panel. The
+        // device reboots automatically after this callback returns, and the
+        // clean boot re-initialises the display + restores the full UI/status
+        // bar from scratch (matching a manual power-cycle).
+        displayUnblankAfterOta();
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
@@ -2304,10 +2355,13 @@ void setupOTA() {
             Serial.println("End Failed");
             msg = "End Failed!";
         }
-        // OTA aborted: the device keeps running, so restore the normal pixel
-        // clock and re-align the panel in case the partial flash activity left
-        // the scan-out drifted.
-        displaySetPclk(RGB_PCLK_NORMAL_HZ);
+        // OTA aborted: the device keeps running, so bring the panel back BEFORE
+        // we try to draw anything. displayUnblankAfterOta() turns the panel
+        // scan-out + backlight back on and re-aligns the DMA, so the error
+        // message below renders on a live, correctly-scanned panel. (The OTA
+        // overlay was never created this cycle, but hard-blank turned the panel
+        // off, so without this the message would draw to a stopped panel.)
+        displayUnblankAfterOta();
         showOTAOverlay(msg);
         delay(3000);
         hideOTAOverlay();
