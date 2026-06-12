@@ -80,6 +80,7 @@ struct ConfigState {
     bool    contact_with_pedal;   // ON/OFF – require contact detection when using pedal trigger
     uint8_t contact_hold_steps;   // 1-10 (0.5s per step) – probe/contact hold time
     float   lead_resistance_mohm; // 0.5-5.0 mΩ
+    uint8_t touch_sensitivity;    // 1-10 (10=most sensitive/lightest touch) – GT911 touch threshold
 };
 
 // Default config values
@@ -93,6 +94,7 @@ static inline ConfigState config_defaults() {
     c.contact_with_pedal = false;
     c.contact_hold_steps = 2;      // default 1.0s
     c.lead_resistance_mohm = 2.0f; // default 2.0 mΩ
+    c.touch_sensitivity = 5;       // default mid sensitivity
     return c;
 }
 

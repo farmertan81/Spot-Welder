@@ -334,6 +334,9 @@ static lv_obj_t* btn_cfg_brightness = nullptr;
 static lv_obj_t* lbl_cfg_hold_time = nullptr;     // contact delay value label
 static lv_obj_t* btn_cfg_hold_time_dec = nullptr; // contact delay [-]
 static lv_obj_t* btn_cfg_hold_time_inc = nullptr; // contact delay [+]
+static lv_obj_t* lbl_cfg_touch_sens = nullptr;     // touch sensitivity value label
+static lv_obj_t* btn_cfg_touch_sens_dec = nullptr; // touch sensitivity [-]
+static lv_obj_t* btn_cfg_touch_sens_inc = nullptr; // touch sensitivity [+]
 static lv_obj_t* lbl_cfg_cwp = nullptr;  // Contact With Pedal label
 static lv_obj_t* btn_cfg_cwp = nullptr;  // Contact With Pedal button
 
@@ -2264,6 +2267,15 @@ static void update_cfg_hold_time_label() {
                           hold_time_text(_cfg.contact_hold_steps));
 }
 
+// Touch Sensitivity (1-10, 10 = lightest/most sensitive) – GT911 threshold
+static void update_cfg_touch_sens_label() {
+    if (lbl_cfg_touch_sens) {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%u", (unsigned)_cfg.touch_sensitivity);
+        lv_label_set_text(lbl_cfg_touch_sens, buf);
+    }
+}
+
 static void update_cfg_cwp_label() {
     if (lbl_cfg_cwp)
         lv_label_set_text(lbl_cfg_cwp, _cfg.contact_with_pedal ? "ON" : "OFF");
@@ -2373,6 +2385,20 @@ static void on_cfg_hold_time_inc(lv_event_t* e) {
     update_cfg_hold_time_label();
     notify_config_changed();
     if (_contact_delay_cb) _contact_delay_cb(_cfg.contact_hold_steps);
+}
+
+static void on_cfg_touch_sens_dec(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (_cfg.touch_sensitivity > 1) _cfg.touch_sensitivity--;
+    update_cfg_touch_sens_label();
+    notify_config_changed();  // main.cpp applies to GT911 + saves NVS
+}
+
+static void on_cfg_touch_sens_inc(lv_event_t* e) {
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    if (_cfg.touch_sensitivity < 10) _cfg.touch_sensitivity++;
+    update_cfg_touch_sens_label();
+    notify_config_changed();  // main.cpp applies to GT911 + saves NVS
 }
 
 // ============================================================
@@ -2613,6 +2639,42 @@ static void build_config_tab(lv_obj_t* tab) {
         y, BTN_W, BTN_H, _cfg.hold_to_repeat ? C_GREEN : C_DARK_GREY);
     lv_obj_add_event_cb(btn_cfg_hold_repeat, on_cfg_hold_repeat,
                         LV_EVENT_CLICKED, nullptr);
+    y += ROW_H;
+
+    // Touch Sensitivity  [-]  value  [+]   (1-10, 10 = lightest touch)
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "Touch Sensitivity (1-10)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    {
+        lv_obj_t* lbl_dec = nullptr;
+        btn_cfg_touch_sens_dec =
+            make_cfg_button(cont, "-", &lbl_dec, STEP_DEC_X, y, STEP_W, BTN_H,
+                            C_DARK_GREY);
+        lv_obj_set_style_text_font(lbl_dec, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(btn_cfg_touch_sens_dec, on_cfg_touch_sens_dec,
+                            LV_EVENT_CLICKED, nullptr);
+
+        lbl_cfg_touch_sens = lv_label_create(cont);
+        update_cfg_touch_sens_label();
+        lv_obj_set_style_text_color(lbl_cfg_touch_sens, C_ACCENT, 0);
+        lv_obj_set_style_text_font(lbl_cfg_touch_sens, &lv_font_montserrat_20,
+                                   0);
+        lv_obj_set_style_text_align(lbl_cfg_touch_sens, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_set_width(lbl_cfg_touch_sens, STEP_VAL_W);
+        lv_obj_set_pos(lbl_cfg_touch_sens, STEP_VAL_X, y + 14);
+
+        lv_obj_t* lbl_inc = nullptr;
+        btn_cfg_touch_sens_inc =
+            make_cfg_button(cont, "+", &lbl_inc, STEP_INC_X, y, STEP_W, BTN_H,
+                            C_DARK_GREY);
+        lv_obj_set_style_text_font(lbl_inc, &lv_font_montserrat_24, 0);
+        lv_obj_add_event_cb(btn_cfg_touch_sens_inc, on_cfg_touch_sens_inc,
+                            LV_EVENT_CLICKED, nullptr);
+    }
     y += ROW_H + 12;
 
     // ============================================================
@@ -3236,6 +3298,7 @@ void ui_load_config(const ConfigState& cfg) {
     update_cfg_brightness_label();
     update_cfg_cwp_label();
     update_cfg_hold_time_label();
+    update_cfg_touch_sens_label();
     update_cfg_cal_labels();
     // Apply step sizes to spinboxes
     apply_time_step_to_spinboxes();

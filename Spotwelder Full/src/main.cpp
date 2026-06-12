@@ -28,6 +28,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
+#include <driver/i2c.h>  // raw GT911 register access for touch-sensitivity
 #if defined(DISPLAY_ST7262_PAR)
 // RGB-panel runtime controls used for the display-drift / OTA-glitch fix:
 //   esp_lcd_rgb_panel_set_pclk()  -> slow the pixel clock during OTA so the
@@ -335,6 +336,128 @@ static const uint32_t READY_PERIOD_MS = 1000;
 // STATUS forwarding throttle state (shared by parser + command fast-path).
 static uint32_t lastStatusForwardMs = 0;
 static const uint32_t STATUS_FORWARD_MIN_INTERVAL_MS = 100;
+
+/* ============================================================
+ * GT911 TOUCH SENSITIVITY (hardware threshold adjust)
+ *
+ * smartdisplay_init() already installs the legacy I2C driver on
+ * I2C_NUM_0 (SDA=GPIO19, SCL=GPIO20, 400 kHz) for the GT911 controller,
+ * so we can issue raw register reads/writes here WITHOUT re-init and
+ * WITHOUT touching Wire (which would conflict).
+ *
+ * GT911 7-bit address = 0x5D (board uses the default ADDR pin level).
+ * Sensitivity is set via the on-chip config block:
+ *   0x8047        Config_Version (start of config)
+ *   0x8053        Touch_Level  (press threshold – LOWER = more sensitive)
+ *   0x8054        Leave_Level  (release threshold – must be < Touch_Level)
+ *   0x8047..0x80FE  184 config bytes
+ *   0x80FF        Config_Chksum = (~sum(0x8047..0x80FE) + 1) & 0xFF
+ *   0x8100        Config_Fresh – write 0x01 to commit the new config
+ *
+ * We use the safe read-modify-write method: read the whole config block,
+ * change ONLY the two threshold bytes, recompute the checksum, then write
+ * the block back and set Config_Fresh.  Changing only these 2 bytes is the
+ * documented, low-risk way to retune sensitivity at runtime.
+ * ============================================================ */
+
+#define GT911_I2C_PORT        I2C_NUM_0
+#define GT911_I2C_ADDR_7BIT   0x5D
+#define GT911_REG_CONFIG_VER  0x8047  // first byte of config block
+#define GT911_REG_TOUCH_LEVEL 0x8053  // press threshold
+#define GT911_REG_LEAVE_LEVEL 0x8054  // release threshold
+#define GT911_REG_CONFIG_CHK  0x80FF  // checksum byte
+#define GT911_REG_CONFIG_FRESH 0x8100 // commit trigger
+#define GT911_CONFIG_LEN      184      // 0x8047..0x80FE inclusive
+#define GT911_I2C_TIMEOUT_MS  100
+
+// Read `len` bytes from a 16-bit GT911 register into buf. Returns true on ok.
+static bool gt911_read_reg(uint16_t reg, uint8_t* buf, size_t len) {
+    uint8_t reg_be[2] = {(uint8_t)(reg >> 8), (uint8_t)(reg & 0xFF)};
+    esp_err_t err = i2c_master_write_read_device(
+        GT911_I2C_PORT, GT911_I2C_ADDR_7BIT, reg_be, 2, buf, len,
+        pdMS_TO_TICKS(GT911_I2C_TIMEOUT_MS));
+    return err == ESP_OK;
+}
+
+// Write `len` bytes to a 16-bit GT911 register. Returns true on ok.
+static bool gt911_write_reg(uint16_t reg, const uint8_t* data, size_t len) {
+    uint8_t tx[2 + 256];
+    if (len > 256) return false;
+    tx[0] = (uint8_t)(reg >> 8);
+    tx[1] = (uint8_t)(reg & 0xFF);
+    memcpy(tx + 2, data, len);
+    esp_err_t err = i2c_master_write_to_device(
+        GT911_I2C_PORT, GT911_I2C_ADDR_7BIT, tx, len + 2,
+        pdMS_TO_TICKS(GT911_I2C_TIMEOUT_MS));
+    return err == ESP_OK;
+}
+
+// Map UI sensitivity (1..10, 10=lightest/most sensitive) to a GT911 press
+// threshold.  Higher sensitivity -> lower Touch_Level.
+//   sens 1  -> ~100 (firmest press required)
+//   sens 5  -> ~64  (GT911 typical default region)
+//   sens 10 -> ~19  (lightest touch)
+static uint8_t gt911_touch_level_for(uint8_t sens) {
+    if (sens < 1) sens = 1;
+    if (sens > 10) sens = 10;
+    int level = 100 - (int)(sens - 1) * 9;  // 100..19
+    if (level < 10) level = 10;
+    if (level > 0xFF) level = 0xFF;
+    return (uint8_t)level;
+}
+
+// Apply the touch sensitivity to the GT911 by read-modify-writing its config
+// block (only the two threshold bytes are changed). Safe: bails out on any I2C
+// error and never leaves a half-written config (Config_Fresh is set last).
+static bool applyTouchSensitivity(uint8_t sens) {
+    uint8_t touch_level = gt911_touch_level_for(sens);
+    // Keep leave_level a bit below touch_level so release is detected reliably.
+    int leave = (int)touch_level - 10;
+    if (leave < 10) leave = 10;
+    uint8_t leave_level = (uint8_t)leave;
+
+    // 1) Read the full config block.
+    uint8_t cfg[GT911_CONFIG_LEN];
+    if (!gt911_read_reg(GT911_REG_CONFIG_VER, cfg, GT911_CONFIG_LEN)) {
+        Serial.println("[Touch] GT911 config read FAILED – sensitivity not applied");
+        return false;
+    }
+
+    // 2) Modify only the two threshold bytes (offset from 0x8047).
+    const size_t off_touch = GT911_REG_TOUCH_LEVEL - GT911_REG_CONFIG_VER;  // 12
+    const size_t off_leave = GT911_REG_LEAVE_LEVEL - GT911_REG_CONFIG_VER;  // 13
+    if (cfg[off_touch] == touch_level && cfg[off_leave] == leave_level) {
+        Serial.printf("[Touch] GT911 sensitivity already at level=%u (sens %u)\n",
+                      touch_level, sens);
+        return true;  // nothing to do
+    }
+    cfg[off_touch] = touch_level;
+    cfg[off_leave] = leave_level;
+
+    // 3) Recompute checksum over the 184 config bytes.
+    uint8_t sum = 0;
+    for (size_t i = 0; i < GT911_CONFIG_LEN; i++) sum += cfg[i];
+    uint8_t checksum = (uint8_t)((~sum) + 1);
+
+    // 4) Write the config block back, then checksum, then commit.
+    if (!gt911_write_reg(GT911_REG_CONFIG_VER, cfg, GT911_CONFIG_LEN)) {
+        Serial.println("[Touch] GT911 config write FAILED");
+        return false;
+    }
+    if (!gt911_write_reg(GT911_REG_CONFIG_CHK, &checksum, 1)) {
+        Serial.println("[Touch] GT911 checksum write FAILED");
+        return false;
+    }
+    uint8_t fresh = 0x01;
+    if (!gt911_write_reg(GT911_REG_CONFIG_FRESH, &fresh, 1)) {
+        Serial.println("[Touch] GT911 config-fresh write FAILED");
+        return false;
+    }
+    Serial.printf(
+        "[Touch] GT911 sensitivity=%u applied (Touch_Level=%u, Leave_Level=%u)\n",
+        sens, touch_level, leave_level);
+    return true;
+}
 
 /* ============================================================
  * TOUCH FILTER / DEBOUNCE  (verbatim from proven Touch project)
@@ -2594,6 +2717,7 @@ static void save_config_to_nvs(const ConfigState& cfg) {
     prefs.putUChar("trigMode", trigger_mode);
     prefs.putUChar("holdSteps", cfg.contact_hold_steps);
     prefs.putFloat("leadRmohm", clamp_lead_r_mohm_ui(cfg.lead_resistance_mohm));
+    prefs.putUChar("touchSens", cfg.touch_sensitivity);
     prefs.end();
     Serial.println("[Config] Saved to NVS");
 }
@@ -2611,6 +2735,10 @@ static ConfigState load_config_from_nvs() {
     trigger_mode = prefs.getUChar("trigMode", trigger_mode);
     cfg.contact_hold_steps =
         prefs.getUChar("holdSteps", cfg.contact_hold_steps);
+    cfg.touch_sensitivity =
+        prefs.getUChar("touchSens", cfg.touch_sensitivity);
+    if (cfg.touch_sensitivity < 1 || cfg.touch_sensitivity > 10)
+        cfg.touch_sensitivity = 5;
 
     // Prefer consolidated weldcfg key; fallback to legacy namespace key.
     bool has_lead_r_in_weldcfg = prefs.isKey("leadRmohm");
@@ -2931,6 +3059,15 @@ static void onConfigChange(const ConfigState& cfg) {
 
     apply_brightness(normalized_cfg.brightness);
 
+    // Apply touch sensitivity to GT911 only when it actually changed (avoids
+    // re-writing the controller config block on every unrelated config edit).
+    static int8_t last_touch_sens = -1;  // -1 = never applied this session
+    uint8_t ts = normalized_cfg.touch_sensitivity;
+    if (ts < 1 || ts > 10) ts = 5;
+    if ((int8_t)ts != last_touch_sens) {
+        if (applyTouchSensitivity(ts)) last_touch_sens = (int8_t)ts;
+    }
+
     // Sync contact_hold_steps from ConfigState to main.cpp global and STM32
     if (normalized_cfg.contact_hold_steps != contact_hold_steps) {
         contact_hold_steps = normalized_cfg.contact_hold_steps;
@@ -3156,6 +3293,10 @@ void setup() {
 
         // Apply brightness immediately (local display only, not STM32)
         apply_brightness(cfg.brightness);
+
+        // Apply touch sensitivity to the GT911 (controller already initialised
+        // by smartdisplay_init above, so its config block is writable now).
+        applyTouchSensitivity(cfg.touch_sensitivity);
 
         // Restore recipe from NVS if enabled – into globals only, NOT sent to
         // STM32
