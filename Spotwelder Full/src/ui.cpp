@@ -659,10 +659,6 @@ static void on_weld_count_reset(lv_event_t* e) {
 // ============================================================
 // DASHBOARD TRIGGER LINE – long-press to swap Pedal <-> Contact
 // ============================================================
-static const char* trigger_mode_name(uint8_t mode) {
-    return (mode == 2) ? "Contact" : "Pedal";
-}
-
 // Repaint the trigger line text + color. Highlight while a long-press is held.
 static void paint_dash_trigger(bool holding) {
     if (lbl_dash_trigger) {
@@ -770,38 +766,6 @@ static void arm_btn_event(lv_event_t* e) {
     if (_arm_cb) {
         _arm_cb(requested);
     }
-}
-
-// ============================================================
-// HELPER – create a value card inside a parent
-// ============================================================
-static lv_obj_t* make_card(lv_obj_t* parent, const char* title,
-                           lv_obj_t** out_value_label, int w, int h,
-                           const lv_font_t* val_font = &lv_font_montserrat_14) {
-    lv_obj_t* card = lv_obj_create(parent);
-    lv_obj_set_size(card, w, h);
-    lv_obj_set_style_bg_color(card, C_CARD, LV_PART_MAIN);
-    lv_obj_set_style_border_color(card, C_DARK_GREY, LV_PART_MAIN);
-    lv_obj_set_style_border_width(card, 1, LV_PART_MAIN);
-    lv_obj_set_style_radius(card, 10, LV_PART_MAIN);
-    lv_obj_set_style_pad_all(card, 8, LV_PART_MAIN);
-    lv_obj_set_scrollbar_mode(card, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t* lbl_t = lv_label_create(card);
-    lv_label_set_text(lbl_t, title);
-    lv_obj_set_style_text_color(lbl_t, C_GREY, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_t, &lv_font_montserrat_14, LV_PART_MAIN);
-    lv_obj_align(lbl_t, LV_ALIGN_TOP_MID, 0, 0);
-
-    lv_obj_t* lbl_v = lv_label_create(card);
-    lv_label_set_text(lbl_v, "---");
-    lv_obj_set_style_text_color(lbl_v, C_GREEN, LV_PART_MAIN);
-    lv_obj_set_style_text_font(lbl_v, val_font, LV_PART_MAIN);
-    lv_obj_align(lbl_v, LV_ALIGN_CENTER, 0, 8);
-
-    if (out_value_label) *out_value_label = lbl_v;
-    return card;
 }
 
 // ============================================================
@@ -1278,16 +1242,6 @@ static void do_power_step(bool increment) {
     mark_dirty();
 }
 
-// Data-only callback: power +/- buttons (legacy CLICKED path, kept for safety)
-static void on_power_minus(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    do_power_step(false);
-}
-static void on_power_plus(lv_event_t* e) {
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    do_power_step(true);
-}
-
 // Data-only callback: preheat toggle (plain object click)
 static void on_preheat_toggle(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
@@ -1431,36 +1385,6 @@ static lv_obj_t* make_touch_row(lv_obj_t* parent, const char* title,
     register_lockable(btn_inc);
 
     return row;
-}
-
-// ============================================================
-// PULSE TAB: Lock/unlock all controls based on armed state
-// ============================================================
-static void lock_pulse_tab(bool locked) {
-    static bool prev_locked = false;
-    if (locked == prev_locked) return;
-    prev_locked = locked;
-
-    for (int i = 0; i < lockable_count; i++) {
-        if (!lockable_objs[i]) continue;
-        if (locked)
-            lv_obj_add_state(lockable_objs[i], LV_STATE_DISABLED);
-        else
-            lv_obj_remove_state(lockable_objs[i], LV_STATE_DISABLED);
-    }
-
-    auto set_lock = [&](lv_obj_t* obj) {
-        if (!obj) return;
-        if (locked)
-            lv_obj_add_state(obj, LV_STATE_DISABLED);
-        else
-            lv_obj_remove_state(obj, LV_STATE_DISABLED);
-    };
-    for (int i = 0; i < 3; i++) set_lock(btn_mode[i]);
-    set_lock(btn_power_minus);
-    set_lock(btn_power_plus);
-    set_lock(btn_preheat);
-    set_lock(btn_apply);
 }
 
 // ============================================================

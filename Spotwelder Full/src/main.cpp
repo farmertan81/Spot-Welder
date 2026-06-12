@@ -1807,16 +1807,6 @@ static void load_wifi_creds_from_nvs() {
                   wifi_ssid.length() ? "set" : "EMPTY");
 }
 
-static void clear_wifi_creds_from_nvs() {
-    Preferences wprefs;
-    wprefs.begin("wificfg", false);
-    wprefs.clear();
-    wprefs.end();
-    wifi_ssid = "";
-    wifi_pass = "";
-    Serial.println("[WiFi] Credentials cleared from NVS");
-}
-
 // Build the per-device AP name from the last 2 bytes of the STA MAC.
 static String makeApSsid() {
     uint8_t mac[6] = {0};
@@ -2198,25 +2188,10 @@ void hideOTAOverlay() {
 //                                     without a power cycle.
 // =========================================================================
 #if defined(DISPLAY_ST7262_PAR)
-// Pixel clock matches ST7262_PANEL_CONFIG_TIMINGS_PCLK_HZ in the board def.
-static const uint32_t RGB_PCLK_NORMAL_HZ = 12000000;  // ~29 Hz refresh
-// Halved during OTA: the update screen is static, so a low refresh is fine and
-// it roughly halves the panel's PSRAM read bandwidth during the flash writes.
-static const uint32_t RGB_PCLK_OTA_HZ = 6000000;  // ~15 Hz refresh
-
 static esp_lcd_panel_handle_t getRgbPanelHandle() {
     lv_display_t* disp = lv_display_get_default();
     if (!disp) return nullptr;
     return (esp_lcd_panel_handle_t)lv_display_get_user_data(disp);
-}
-
-// Change the RGB pixel clock at runtime (applied at the next VSYNC).
-static void displaySetPclk(uint32_t hz) {
-    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
-    if (!panel) return;
-    esp_err_t err = esp_lcd_rgb_panel_set_pclk(panel, hz);
-    Serial.printf("[Display] set PCLK -> %u Hz: %s\n", (unsigned)hz,
-                  esp_err_to_name(err));
 }
 
 // Re-align the panel scan-out DMA and repaint a full clean frame. Use after a
@@ -2281,7 +2256,6 @@ static void displayUnblankAfterOta() {
 }
 #else
 // Non-RGB panel build: these are no-ops so the call sites stay clean.
-static inline void displaySetPclk(uint32_t) {}
 static inline void resyncDisplayPanel(const char*) {}
 static inline void displayBlankForOta() {}
 static inline void displayUnblankAfterOta() {}
@@ -3285,7 +3259,7 @@ void loop() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        WiFiClient newClient = server.available();
+        WiFiClient newClient = server.accept();
         if (newClient) {
             if (client && client.connected()) {
                 Serial.println(
