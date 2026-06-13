@@ -70,12 +70,13 @@
 // =========================
 // Sunton hardware mapping
 // =========================
-// STM32 data link now uses the dedicated RXD/TXD header (P1) on the Sunton
-// board, which breaks out the ESP32-S3 UART0 pins GPIO43/GPIO44. This frees
-// GPIO17/18 for the STM32 BOOT0/RESET control lines (see below) and leaves the
-// GT911 touch I2C bus (GPIO19/20) completely untouched.
-#define STM32_TO_ESP32_PIN 43  // ESP RX  <- STM32 TX  (P1 header "RXD")
-#define ESP32_TO_STM32_PIN 44  // ESP TX  -> STM32 RX  (P1 header "TXD")
+// STM32 data link uses GPIO17/18 (the original, known-good wiring). The dual
+// firmware updater drives the STM32 into its ROM bootloader purely in SOFTWARE
+// (an ESP32 -> STM32 "BOOTLOADER" UART command that the STM32 application acts
+// on), so NO BOOT0/RESET GPIO control lines are needed and these are the only
+// pins on the STM32 link. The GT911 touch I2C bus (GPIO19/20) is untouched.
+#define STM32_TO_ESP32_PIN 17  // ESP RX  <- STM32 TX
+#define ESP32_TO_STM32_PIN 18  // ESP TX  -> STM32 RX
 
 // Touch I2C (I2C_NUM_0) – managed by smartdisplay, DO NOT use Wire
 #define TOUCH_SDA 19
@@ -107,21 +108,21 @@
 #define SD_STM32_FW_PATH "/stm32_firmware.bin"
 
 // =========================
-// STM32 remote-flash control lines (HARDWARE MOD – see notes)
+// STM32 remote-flash control: SOFTWARE bootloader entry (no GPIO mod)
 // -------------------------------------------------------------------------
-// ESP32 GPIO17 -> STM32 PB8 (bridged to BOOT0 on the WeAct module)
-// ESP32 GPIO18 -> STM32 NRST (active-low reset)
+// There are NO BOOT0/NRST control wires between the ESP32 and the STM32. The
+// updater instead asks the running STM32 application to jump into its built-in
+// ROM bootloader by sending a "BOOTLOADER" command over the normal UART link
+// (sendBootloaderCommand(), below). The STM32 firmware must implement a handler
+// that, on receiving this command, calls its jump-to-system-memory routine.
+// After flashing, the AN3155 "Go" command (0x21) launches the freshly written
+// application — again, with no hardware reset line.
 //
-// These two pins were previously the STM32 UART (now moved to GPIO43/44 on the
-// P1 RXD/TXD header). With the UART relocated, GPIO17/18 are free to act as the
-// dedicated bootloader control lines. There is NO touch-bus conflict any more:
-// the GT911 capacitive-touch I2C bus stays on GPIO19/20 and is never disturbed,
-// so touch keeps working normally throughout an STM32 flash (no reboot needed
-// to recover touch). The ESP32 still reboots after a flash to cleanly relaunch
-// the STM32 application link, but that is for the data link, not for touch.
+// Trade-off: this is software-only, so if the STM32 application is bricked (no
+// running firmware to receive the command) there is no GPIO fallback to force
+// the bootloader; recovery then needs the STM32's own BOOT0 strap / SWD. The
+// GT911 touch I2C bus (GPIO19/20) is never touched by any of this.
 // =========================
-#define STM32_BOOT0_PIN 17  // -> STM32 PB8/BOOT0 (HIGH = enter ROM bootloader)
-#define STM32_RESET_PIN 18  // -> STM32 NRST (LOW pulse = reset)
 
 HardwareSerial STM32Serial(2);
 
@@ -3341,12 +3342,14 @@ static void onFactoryReset() {
 //      and the device reboots into the new image on success.
 //
 //   2) flashSTM32FromSD()   reads /stm32_firmware.bin and programs the STM32
-//      over the GPIO43/44 UART link (P1 RXD/TXD header) using the ST ROM
-//      bootloader protocol (AN3155). BOOT0/RESET are driven on GPIO17/GPIO18
-//      (dedicated control lines, no touch conflict). Because the ESP32's own
-//      flash/PSRAM are untouched here, the panel stays ON and shows a live
-//      progress bar, and touch keeps working throughout. The ESP32 reboots
-//      afterwards only to cleanly relaunch the STM32 application data link.
+//      over the GPIO17/18 UART link using the ST ROM bootloader protocol
+//      (AN3155). Bootloader entry is SOFTWARE-only: the ESP32 sends a
+//      "BOOTLOADER" command and the STM32 application jumps to system memory
+//      itself (no BOOT0/NRST wires). The new app is launched with the AN3155
+//      "Go" command. Because the ESP32's own flash/PSRAM are untouched here,
+//      the panel stays ON and shows a live progress bar, and touch keeps
+//      working throughout. The ESP32 reboots afterwards only to cleanly
+//      relaunch the STM32 application data link.
 //
 // Both flows are REQUESTED from the LVGL button callback (which only sets a
 // flag) and EXECUTED from loop(), never from inside the LVGL event dispatch —
@@ -3586,10 +3589,9 @@ static bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len) {
     return stmWaitAck(2000);
 }
 
-// Go (0x21): jump to and run the application at `addr`. Provided for
-// completeness (the AN3155 "Go" command); the flash flow uses a hardware
-// BOOT0-low + reset to launch the app instead, so this may be unused.
-static bool stmGo(uint32_t addr) __attribute__((unused));
+// Go (0x21): jump to and run the application at `addr`. In the software-
+// bootloader flow this is how the freshly written STM32 application is launched
+// (there is no NRST line to pulse), so it is called at the end of a flash.
 static bool stmGo(uint32_t addr) {
     if (!stmSendCmd(0x21)) return false;
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
@@ -3601,26 +3603,16 @@ static bool stmGo(uint32_t addr) {
     return stmWaitAck(1000);
 }
 
-// Drive BOOT0 high and pulse NRST -> STM32 starts in the ROM bootloader.
-// BOOT0/RESET are on dedicated pins GPIO17/18 now, so touch (GPIO19/20) is
-// unaffected by this.
-static void enterSTM32Bootloader() {
-    pinMode(STM32_BOOT0_PIN, OUTPUT);
-    pinMode(STM32_RESET_PIN, OUTPUT);
-    digitalWrite(STM32_BOOT0_PIN, HIGH);  // BOOT0 = 1 -> system bootloader
-    digitalWrite(STM32_RESET_PIN, LOW);   // assert reset (NRST active-low)
-    delay(10);
-    digitalWrite(STM32_RESET_PIN, HIGH);  // release reset
-    delay(60);                            // bootloader samples BOOT0 & starts
-}
-
-// Drive BOOT0 low and pulse NRST -> STM32 boots the user application.
-static void exitSTM32Bootloader() {
-    digitalWrite(STM32_BOOT0_PIN, LOW);  // BOOT0 = 0 -> run user flash
-    digitalWrite(STM32_RESET_PIN, LOW);
-    delay(10);
-    digitalWrite(STM32_RESET_PIN, HIGH);
-    delay(20);
+// Software jump-to-bootloader: ask the running STM32 application to reboot into
+// its built-in ROM bootloader. Sent over the NORMAL application link (2 Mbaud,
+// 8N1) BEFORE we switch the ESP32 UART to bootloader settings. The STM32
+// firmware must implement a matching handler that, on receiving this line,
+// calls its jump-to-system-memory routine (see the notes returned to the user).
+// There is no hardware BOOT0/NRST line, so this command is the only way in.
+static void sendBootloaderCommand() {
+    STM32Serial.print("BOOTLOADER");
+    STM32Serial.print("\r\n");
+    STM32Serial.flush();
 }
 
 // Restore the normal 2 Mbaud 8N1 application link to the STM32.
@@ -3661,11 +3653,15 @@ static bool flashSTM32FromSD() {
         return false;
     }
 
-    // --- Enter bootloader and reopen the UART at 8E1 (bootloader format) ---
-    ui_fw_set_status("STM32: entering bootloader...");
+    // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
+    ui_fw_set_status("STM32: requesting bootloader...");
     lv_refr_now(NULL);
+    // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
+    // is still open, then give the STM32 time to reboot into system memory
+    // before we switch the ESP32 UART to AN3155 bootloader settings.
+    sendBootloaderCommand();
+    delay(100);  // STM32 resets into the ROM bootloader
     STM32Serial.end();
-    enterSTM32Bootloader();
     // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
     STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
@@ -3723,16 +3719,18 @@ static bool flashSTM32FromSD() {
 
     f.close();
 
-    // Return the STM32 to RUN mode (BOOT0 low + reset) and restore the link.
+    // Launch the freshly written application with the AN3155 "Go" command
+    // (there is no NRST line to pulse in the software-bootloader approach),
+    // then restore the normal 2 Mbaud 8N1 application link settings.
     ui_fw_set_status(ok ? "STM32: launching new firmware..."
                         : (err ? err : "ERROR: STM32 update failed"));
     lv_refr_now(NULL);
-    exitSTM32Bootloader();
+    if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
-    // Touch (GPIO19/20) was never disturbed, but the STM32 data link was torn
-    // down and reopened at bootloader settings. Reboot the ESP32 to cleanly
-    // re-establish the normal application link and UI state.
+    // Touch (GPIO19/20) was never disturbed, but the STM32 link was reopened at
+    // bootloader settings and the STM32 just rebooted into the new app. Reboot
+    // the ESP32 too so both sides start from a clean, re-synced app link/UI.
     ui_fw_set_status(ok ? "STM32 updated OK - restarting..."
                         : (err ? err : "STM32 update failed - restarting..."));
     lv_refr_now(NULL);

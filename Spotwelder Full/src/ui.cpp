@@ -85,7 +85,7 @@ static factory_reset_cb_t _factory_reset_cb = nullptr;
 static fw_update_cb_t _fw_esp32_cb = nullptr;
 static fw_update_cb_t _fw_stm32_cb = nullptr;
 
-// Firmware-update widgets (CONFIG tab). Created in build_config_tab().
+// Firmware-update widgets (SETUP tab). Created in build_setup_tab().
 static lv_obj_t* _fw_status_label   = nullptr;  // status text line
 static lv_obj_t* _fw_progress_bar   = nullptr;  // 0..100 progress (hidden default)
 static lv_obj_t* _fw_btn_esp32      = nullptr;  // "Update ESP32 from SD"
@@ -2079,8 +2079,10 @@ static void on_fw_update_stm32(lv_event_t* e) {
 static void build_setup_tab(lv_obj_t* tab) {
     lv_obj_set_style_bg_color(tab, C_BG, LV_PART_MAIN);
     lv_obj_set_style_pad_all(tab, 10, LV_PART_MAIN);
-    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_OFF);
-    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+    // Allow vertical scrolling so the Firmware Update panel (added below the
+    // Maintenance panel) is always reachable on the 800x480 screen.
+    lv_obj_set_scrollbar_mode(tab, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_scroll_dir(tab, LV_DIR_VER);
 
     const int GAP = 10;
     const int COL_W = 380;
@@ -2153,6 +2155,75 @@ static void build_setup_tab(lv_obj_t* tab) {
                                            &lbl_fr, 388, 44, 360, 44, C_RED);
         lv_obj_add_event_cb(btn_fr, on_setup_factory_reset, LV_EVENT_CLICKED,
                             nullptr);
+    }
+
+    // ---------------------------------------------------------
+    // Section 4: Firmware Update from SD card (full-width panel)
+    //   ESP32 (display controller) + STM32 (welder controller).
+    //   STM32 is flashed over UART using a software bootloader entry
+    //   (no BOOT0/NRST wires); see flashSTM32FromSD() in main.cpp.
+    // ---------------------------------------------------------
+    {
+        lv_obj_t* p = make_panel(tab, 0, 310, COL_W * 2 + GAP, 200);
+
+        lv_obj_t* title = lv_label_create(p);
+        lv_label_set_text(title, LV_SYMBOL_DOWNLOAD "  Firmware Update (SD card)");
+        lv_obj_set_style_text_color(title, C_ACCENT, 0);
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(title, 12, 10);
+
+        // Hint text describing where the files come from.
+        lv_obj_t* hint = lv_label_create(p);
+        lv_label_set_text(hint,
+                          "Place esp32_firmware.bin / stm32_firmware.bin on the "
+                          "SD card root, then tap to flash.");
+        lv_obj_set_style_text_color(hint, C_GREY, 0);
+        lv_obj_set_style_text_font(hint, &lv_font_montserrat_14, 0);
+        lv_label_set_long_mode(hint, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(hint, COL_W * 2 + GAP - 24);
+        lv_obj_set_pos(hint, 12, 36);
+
+        // ESP32 update button (left).
+        {
+            lv_obj_t* lbl_btn = nullptr;
+            _fw_btn_esp32 = make_cfg_button(p, "UPDATE ESP32", &lbl_btn, 12, 66,
+                                            360, 40, C_ACCENT);
+            lv_obj_add_event_cb(_fw_btn_esp32, on_fw_update_esp32,
+                                LV_EVENT_CLICKED, nullptr);
+        }
+
+        // STM32 update button (right).
+        {
+            lv_obj_t* lbl_btn = nullptr;
+            _fw_btn_stm32 = make_cfg_button(p, "UPDATE STM32", &lbl_btn, 388, 66,
+                                            360, 40, C_ACCENT);
+            lv_obj_add_event_cb(_fw_btn_stm32, on_fw_update_stm32,
+                                LV_EVENT_CLICKED, nullptr);
+        }
+
+        // Status line (updated live during a flash operation).
+        _fw_status_label = lv_label_create(p);
+        lv_label_set_text(_fw_status_label, "Ready.");
+        lv_obj_set_style_text_color(_fw_status_label, C_GREY, 0);
+        lv_obj_set_style_text_font(_fw_status_label, &lv_font_montserrat_16, 0);
+        lv_label_set_long_mode(_fw_status_label, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(_fw_status_label, COL_W * 2 + GAP - 24);
+        lv_obj_set_pos(_fw_status_label, 12, 116);
+
+        // Progress bar (hidden by default; shown during STM32 flash).
+        _fw_progress_bar = lv_bar_create(p);
+        lv_obj_set_size(_fw_progress_bar, COL_W * 2 + GAP - 24, 18);
+        lv_obj_set_pos(_fw_progress_bar, 12, 150);
+        lv_bar_set_range(_fw_progress_bar, 0, 100);
+        lv_bar_set_value(_fw_progress_bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(_fw_progress_bar, C_DARK_GREY, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(_fw_progress_bar, C_GREEN, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER,
+                                LV_PART_INDICATOR);
+        lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_MAIN);
+        lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_INDICATOR);
+        lv_obj_add_flag(_fw_progress_bar, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -2729,84 +2800,8 @@ static void build_config_tab(lv_obj_t* tab) {
                         nullptr);
     y += ROW_H + 16;
 
-    // ============================================================
-    // ---- Section: FIRMWARE UPDATE (from SD card) ----
-    // ============================================================
-    make_section_header(cont, "Firmware Update", LABEL_X, y);
-    y += 32;
-
-    // Helper text describing where the files come from.
-    {
-        lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl,
-                          "Place esp32_firmware.bin / stm32_firmware.bin on the "
-                          "SD card root, then tap to flash.");
-        lv_obj_set_style_text_color(lbl, C_GREY, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
-        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
-        lv_obj_set_width(lbl, 740);
-        lv_obj_set_pos(lbl, LABEL_X, y);
-    }
-    y += 30;
-
-    // Row: ESP32 label + button
-    {
-        lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "ESP32 (display controller)");
-        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y + 12);
-    }
-    {
-        lv_obj_t* lbl_btn = nullptr;
-        _fw_btn_esp32 = make_cfg_button(cont, "UPDATE ESP32", &lbl_btn, BTN_X, y,
-                                        180, BTN_H, C_ACCENT);
-        lv_obj_add_event_cb(_fw_btn_esp32, on_fw_update_esp32, LV_EVENT_CLICKED,
-                            nullptr);
-    }
-    y += ROW_H;
-
-    // Row: STM32 label + button
-    {
-        lv_obj_t* lbl = lv_label_create(cont);
-        lv_label_set_text(lbl, "STM32 (welder controller)");
-        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
-        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
-        lv_obj_set_pos(lbl, LABEL_X, y + 12);
-    }
-    {
-        lv_obj_t* lbl_btn = nullptr;
-        _fw_btn_stm32 = make_cfg_button(cont, "UPDATE STM32", &lbl_btn, BTN_X, y,
-                                        180, BTN_H, C_ACCENT);
-        lv_obj_add_event_cb(_fw_btn_stm32, on_fw_update_stm32, LV_EVENT_CLICKED,
-                            nullptr);
-    }
-    y += ROW_H;
-
-    // Status line (updated live during a flash operation).
-    _fw_status_label = lv_label_create(cont);
-    lv_label_set_text(_fw_status_label, "Ready.");
-    lv_obj_set_style_text_color(_fw_status_label, C_GREY, 0);
-    lv_obj_set_style_text_font(_fw_status_label, &lv_font_montserrat_16, 0);
-    lv_label_set_long_mode(_fw_status_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(_fw_status_label, 740);
-    lv_obj_set_pos(_fw_status_label, LABEL_X, y);
-    y += 28;
-
-    // Progress bar (hidden by default; shown during STM32 flash).
-    _fw_progress_bar = lv_bar_create(cont);
-    lv_obj_set_size(_fw_progress_bar, 740, 18);
-    lv_obj_set_pos(_fw_progress_bar, LABEL_X, y);
-    lv_bar_set_range(_fw_progress_bar, 0, 100);
-    lv_bar_set_value(_fw_progress_bar, 0, LV_ANIM_OFF);
-    lv_obj_set_style_bg_color(_fw_progress_bar, C_DARK_GREY, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(_fw_progress_bar, C_GREEN, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER, LV_PART_INDICATOR);
-    lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_MAIN);
-    lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_INDICATOR);
-    lv_obj_add_flag(_fw_progress_bar, LV_OBJ_FLAG_HIDDEN);
-    y += 18 + 16;
+    // NOTE: the "Firmware Update" section now lives on the SETUP tab
+    // (build_setup_tab), not here on the Config tab.
 
     // ============================================================
     // ---- Firmware info footer ----
