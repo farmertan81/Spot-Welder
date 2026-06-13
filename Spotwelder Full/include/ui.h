@@ -142,6 +142,11 @@ typedef void (*device_restart_cb_t)(void);
 // "Factory Reset": main.cpp should erase all NVS (incl. WiFi creds) + restart.
 typedef void (*factory_reset_cb_t)(void);
 
+// Firmware-update buttons in the CONFIG tab. The callback should ONLY latch a
+// request flag; the actual (long, blocking) flash operation must run later from
+// loop(), OUTSIDE the LVGL event/callback path. See src/main.cpp.
+typedef void (*fw_update_cb_t)(void);
+
 // Phase 1B shared telemetry globals (defined in src/main.cpp)
 // Kept here so ui.cpp and other modules can read the live parser outputs.
 extern float weld_v;
@@ -220,6 +225,27 @@ void ui_notify_cal_message(const char* line);
 void ui_set_wifi_reconfigure_cb(wifi_reconfigure_cb_t cb);
 void ui_set_restart_cb(device_restart_cb_t cb);
 void ui_set_factory_reset_cb(factory_reset_cb_t cb);
+
+// ============================================================
+// FIRMWARE UPDATE API (CONFIG tab "FIRMWARE UPDATE" section)
+// ============================================================
+
+// Register the two firmware-update button callbacks (call before/after ui_init).
+//   esp32 : "Update ESP32 from SD"  -> flashes /esp32_firmware.bin onto THIS MCU
+//   stm32 : "Update STM32 from SD"  -> flashes /stm32_firmware.bin onto the STM32
+void ui_set_fw_update_esp32_cb(fw_update_cb_t cb);
+void ui_set_fw_update_stm32_cb(fw_update_cb_t cb);
+
+// Show / hide the firmware-update progress bar (hidden by default). Safe to call
+// from the same task as lv_timer_handler() (i.e. from loop()/flash routines).
+void ui_fw_show_progress(bool show);
+
+// Set the firmware-update progress bar value (0..100). Forces an immediate
+// refresh so progress is visible even while the flash routine blocks loop().
+void ui_fw_set_progress(int percent);
+
+// Set the firmware-update status line text. Forces an immediate refresh.
+void ui_fw_set_status(const char* text);
 
 // Update the live WiFi status shown on the Setup tab + the Status-tab
 // indicator. Call whenever WiFi state changes (connect / disconnect / AP).

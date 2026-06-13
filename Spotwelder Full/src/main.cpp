@@ -25,6 +25,9 @@
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
+#include <SD.h>      // microSD card (bundled with arduino-esp32 – NOT a lib_deps entry)
+#include <SPI.h>     // dedicated SPI bus for the SD card (bundled)
+#include <Update.h>  // ESP32 self-flash from a firmware image (bundled)
 #include <WebServer.h>
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
@@ -75,6 +78,47 @@
 #define TOUCH_SCL 20
 
 #define BUTTON_PIN 0  // GPIO0 (BOOT button on Sunton board)
+
+// =========================
+// microSD card (SPI) – pins come from the board definition
+// (boards/esp32-8048S043C.json: TF_CS=10, TF_SPI_MOSI=11, TF_SPI_SCLK=12,
+//  TF_SPI_MISO=13). Guard with fallbacks so the file still compiles if the
+// board macros are ever absent.
+// =========================
+#ifndef TF_CS
+#define TF_CS 10
+#endif
+#ifndef TF_SPI_MOSI
+#define TF_SPI_MOSI 11
+#endif
+#ifndef TF_SPI_SCLK
+#define TF_SPI_SCLK 12
+#endif
+#ifndef TF_SPI_MISO
+#define TF_SPI_MISO 13
+#endif
+
+// Firmware-image filenames expected at the SD card root.
+#define SD_ESP32_FW_PATH "/esp32_firmware.bin"
+#define SD_STM32_FW_PATH "/stm32_firmware.bin"
+
+// =========================
+// STM32 remote-flash control lines (HARDWARE MOD – see notes)
+// -------------------------------------------------------------------------
+// ESP32 GPIO19 -> STM32 PB8 (bridged to BOOT0 on the WeAct module)
+// ESP32 GPIO20 -> STM32 NRST (active-low reset)
+//
+// ⚠ PIN CONFLICT: GPIO19/GPIO20 are ALSO the GT911 capacitive-touch I2C bus
+// (SDA=19, SCL=20, see TOUCH_SDA/TOUCH_SCL above). They are time-shared:
+//   * Normal operation : the GT911 driver owns them as I2C (touch works).
+//   * STM32 flashing    : we briefly drive them as plain GPIO for BOOT0/RESET
+//                         (touch is suspended), then REBOOT the ESP32 so the
+//                         I2C/touch driver is cleanly re-initialised.
+// A series resistor (~1 kΩ) on each tap to the STM32 is recommended so live
+// touch I2C traffic cannot disturb the STM32 NRST/BOOT0 nets in normal use.
+// =========================
+#define STM32_BOOT0_PIN 19  // -> STM32 PB8/BOOT0 (HIGH = enter ROM bootloader)
+#define STM32_RESET_PIN 20  // -> STM32 NRST (LOW pulse = reset)
 
 HardwareSerial STM32Serial(2);
 
@@ -3280,6 +3324,423 @@ static void onFactoryReset() {
     ESP.restart();
 }
 
+// ===========================================================================
+// DUAL FIRMWARE UPDATE  —  microSD card  ->  ESP32 (self-flash) & STM32G474
+// ---------------------------------------------------------------------------
+// Two independent flows, both driven from the CONFIG-tab "Firmware Update"
+// buttons:
+//
+//   1) updateESP32FromSD()  reads /esp32_firmware.bin and re-flashes THIS
+//      ESP32 with the Arduino Update.h API (same mechanism as OTA, using the
+//      spare OTA partition -> safe rollback). The RGB panel is HARD-BLANKED for
+//      the write because each flash erase/program disables the SPI-flash cache
+//      (the documented "color-loop" hazard); progress is reported over serial,
+//      and the device reboots into the new image on success.
+//
+//   2) flashSTM32FromSD()   reads /stm32_firmware.bin and programs the STM32
+//      over USART1 (the existing GPIO17/18 link) using the ST ROM bootloader
+//      protocol (AN3155). BOOT0/RESET are driven on GPIO19/GPIO20. Because the
+//      ESP32's own flash/PSRAM are untouched here, the panel stays ON and shows
+//      a live progress bar. GPIO19/20 are the GT911 touch I2C pins, so touch is
+//      suspended during the flash and the ESP32 reboots afterwards to cleanly
+//      re-initialise the touch driver.
+//
+// Both flows are REQUESTED from the LVGL button callback (which only sets a
+// flag) and EXECUTED from loop(), never from inside the LVGL event dispatch —
+// this avoids re-entrancy and keeps the long blocking transfer out of the
+// widget event path.
+// ===========================================================================
+
+// ---- SD card on a dedicated SPI bus (does not touch the display/UART pins) --
+static SPIClass g_sdSPI(HSPI);
+static bool g_sd_mounted = false;
+
+// Mount the microSD card once (idempotent). Returns true if a card is present
+// and the FAT filesystem mounted.
+static bool sdEnsureMounted() {
+    if (g_sd_mounted) return true;
+    g_sdSPI.begin(TF_SPI_SCLK, TF_SPI_MISO, TF_SPI_MOSI, TF_CS);
+    // 20 MHz is a conservative, reliable rate for the on-board slot.
+    if (SD.begin(TF_CS, g_sdSPI, 20000000)) {
+        g_sd_mounted = true;
+        Serial.printf("[SD] mounted (type=%u, size=%lluMB)\n",
+                      (unsigned)SD.cardType(),
+                      (unsigned long long)(SD.cardSize() / (1024ULL * 1024ULL)));
+        return true;
+    }
+    Serial.println("[SD] mount FAILED (no card inserted or wiring issue)");
+    return false;
+}
+
+// True if `path` exists on the SD card with a non-zero size; size returned via
+// out_size when provided.
+static bool sdFileExists(const char* path, size_t* out_size) {
+    if (!sdEnsureMounted()) return false;
+    File f = SD.open(path, FILE_READ);
+    if (!f) return false;
+    size_t sz = f.size();
+    f.close();
+    if (out_size) *out_size = sz;
+    return sz > 0;
+}
+
+// Deferred firmware-update request (set from the UI callback, run in loop()).
+enum { FW_REQ_NONE = 0, FW_REQ_ESP32 = 1, FW_REQ_STM32 = 2 };
+static volatile uint8_t g_fw_request = FW_REQ_NONE;
+
+// ===========================================================================
+// FLOW 1 — ESP32 self-flash from SD (Update.h)
+// ===========================================================================
+static bool updateESP32FromSD() {
+    ota_in_progress = true;  // gate normal loop() work (UI/UART/TCP)
+    ui_fw_show_progress(true);
+    ui_fw_set_progress(0);
+    ui_fw_set_status("ESP32: checking SD card...");
+    lv_refr_now(NULL);
+
+    size_t fw_size = 0;
+    if (!sdFileExists(SD_ESP32_FW_PATH, &fw_size)) {
+        ui_fw_set_status("ERROR: " SD_ESP32_FW_PATH " not found on SD card");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+    // Sanity: a real app image is at least a few KB and fits in the 16MB flash.
+    if (fw_size < 4096 || fw_size > (4u * 1024u * 1024u)) {
+        ui_fw_set_status("ERROR: ESP32 image size out of range");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    File f = SD.open(SD_ESP32_FW_PATH, FILE_READ);
+    if (!f) {
+        ui_fw_set_status("ERROR: cannot open ESP32 image");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+    // Header sanity: every ESP32 application image starts with magic byte 0xE9.
+    if (f.peek() != 0xE9) {
+        f.close();
+        ui_fw_set_status("ERROR: not a valid ESP32 image (magic != 0xE9)");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    if (!Update.begin(fw_size)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "ERROR: Update.begin failed (%s)",
+                 Update.errorString());
+        f.close();
+        ui_fw_set_status(msg);
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    ui_fw_set_status("Flashing ESP32 - screen goes DARK. Do NOT power off!");
+    lv_refr_now(NULL);
+    delay(600);  // give the operator time to read the warning
+
+    // Same SPI-flash-cache hazard as OTA -> hard-blank the panel for the write.
+    displayBlankForOta();
+
+    Update.onProgress([](size_t done, size_t total) {
+        Serial.printf("[SD->ESP32] %u%%\r",
+                      total ? (unsigned)((done * 100ULL) / total) : 0);
+    });
+
+    size_t written = Update.writeStream(f);
+    f.close();
+
+    if (written != fw_size || !Update.end(true)) {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "ERROR: ESP32 flash failed (%s)",
+                 Update.errorString());
+        displayUnblankAfterOta();  // bring the panel back to show the error
+        ui_fw_set_status(msg);
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    Serial.println("\n[SD->ESP32] flash OK - rebooting into new firmware");
+    delay(300);
+    ESP.restart();  // never returns
+    return true;
+}
+
+// ===========================================================================
+// FLOW 2 — STM32 flash from SD over the ST ROM bootloader (AN3155)
+// ===========================================================================
+
+// --- AN3155 / bootloader constants ---
+static const uint8_t STM_ACK = 0x79;
+static const uint8_t STM_NACK = 0x1F;
+static const uint8_t STM_INIT = 0x7F;
+#define STM32_FLASH_BASE 0x08000000UL
+
+// Read one byte with timeout (ms). Returns -1 on timeout.
+static int stmReadByte(uint32_t timeout_ms) {
+    uint32_t t0 = millis();
+    while (!STM32Serial.available()) {
+        if (millis() - t0 > timeout_ms) return -1;
+        yield();
+    }
+    return STM32Serial.read();
+}
+
+// Wait for an ACK (0x79). Logs NACK/timeout/unexpected bytes for diagnostics.
+static bool stmWaitAck(uint32_t timeout_ms) {
+    int b = stmReadByte(timeout_ms);
+    if (b == STM_ACK) return true;
+    if (b == STM_NACK)
+        Serial.println("[STM] NACK");
+    else if (b < 0)
+        Serial.println("[STM] timeout waiting for ACK");
+    else
+        Serial.printf("[STM] unexpected byte 0x%02X\n", b);
+    return false;
+}
+
+static void stmDrainRx() {
+    while (STM32Serial.available()) STM32Serial.read();
+}
+
+// Send command byte + its complement, wait for ACK.
+static bool stmSendCmd(uint8_t cmd) {
+    STM32Serial.write(cmd);
+    STM32Serial.write((uint8_t)(cmd ^ 0xFF));
+    STM32Serial.flush();
+    return stmWaitAck(800);
+}
+
+// Bootloader auto-baud handshake: send 0x7F until the device answers.
+static bool stmSync() {
+    for (int i = 0; i < 8; i++) {
+        stmDrainRx();
+        STM32Serial.write(STM_INIT);
+        STM32Serial.flush();
+        int b = stmReadByte(500);
+        if (b == STM_ACK) {
+            Serial.println("[STM] sync OK (ACK)");
+            return true;
+        }
+        if (b == STM_NACK) {
+            // Already initialised this power cycle -> treat as connected.
+            Serial.println("[STM] sync OK (NACK = already initialised)");
+            return true;
+        }
+        delay(50);
+    }
+    return false;
+}
+
+// Get ID command (0x02) -> 12-bit product ID (G474 = 0x469).
+static bool stmGetId(uint16_t* id) {
+    if (!stmSendCmd(0x02)) return false;
+    int n = stmReadByte(500);  // number-of-bytes-minus-1 (=1 for a 2-byte ID)
+    if (n < 0) return false;
+    int hi = stmReadByte(500);
+    int lo = stmReadByte(500);
+    if (hi < 0 || lo < 0) return false;
+    if (!stmWaitAck(500)) return false;
+    if (id) *id = (uint16_t)(((hi & 0xFF) << 8) | (lo & 0xFF));
+    return true;
+}
+
+// Extended Erase (0x44) global mass-erase (special code 0xFFFF, checksum 0x00).
+static bool stmMassErase() {
+    if (!stmSendCmd(0x44)) return false;
+    STM32Serial.write((uint8_t)0xFF);
+    STM32Serial.write((uint8_t)0xFF);
+    STM32Serial.write((uint8_t)0x00);  // checksum = 0xFF ^ 0xFF
+    STM32Serial.flush();
+    return stmWaitAck(30000);  // a full mass erase can take several seconds
+}
+
+// Write Memory (0x31): up to 256 bytes (len = 1..256) at `addr`.
+static bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len) {
+    if (len < 1 || len > 256) return false;
+    if (!stmSendCmd(0x31)) return false;
+    uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
+                    (uint8_t)(addr >> 8), (uint8_t)addr};
+    uint8_t acs = a[0] ^ a[1] ^ a[2] ^ a[3];
+    STM32Serial.write(a, 4);
+    STM32Serial.write(acs);
+    STM32Serial.flush();
+    if (!stmWaitAck(800)) return false;
+
+    uint8_t n = (uint8_t)(len - 1);  // device expects (count - 1)
+    uint8_t cs = n;
+    for (int i = 0; i < len; i++) cs ^= data[i];
+    STM32Serial.write(n);
+    STM32Serial.write(data, len);
+    STM32Serial.write(cs);
+    STM32Serial.flush();
+    return stmWaitAck(2000);
+}
+
+// Go (0x21): jump to and run the application at `addr`. Provided for
+// completeness (the AN3155 "Go" command); the flash flow uses a hardware
+// BOOT0-low + reset to launch the app instead, so this may be unused.
+static bool stmGo(uint32_t addr) __attribute__((unused));
+static bool stmGo(uint32_t addr) {
+    if (!stmSendCmd(0x21)) return false;
+    uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
+                    (uint8_t)(addr >> 8), (uint8_t)addr};
+    uint8_t cs = a[0] ^ a[1] ^ a[2] ^ a[3];
+    STM32Serial.write(a, 4);
+    STM32Serial.write(cs);
+    STM32Serial.flush();
+    return stmWaitAck(1000);
+}
+
+// Drive BOOT0 high and pulse NRST -> STM32 starts in the ROM bootloader.
+// NOTE: GPIO19/20 are the GT911 touch I2C pins; once this is called touch is
+// dead until the ESP32 reboots.
+static void enterSTM32Bootloader() {
+    pinMode(STM32_BOOT0_PIN, OUTPUT);
+    pinMode(STM32_RESET_PIN, OUTPUT);
+    digitalWrite(STM32_BOOT0_PIN, HIGH);  // BOOT0 = 1 -> system bootloader
+    digitalWrite(STM32_RESET_PIN, LOW);   // assert reset (NRST active-low)
+    delay(10);
+    digitalWrite(STM32_RESET_PIN, HIGH);  // release reset
+    delay(60);                            // bootloader samples BOOT0 & starts
+}
+
+// Drive BOOT0 low and pulse NRST -> STM32 boots the user application.
+static void exitSTM32Bootloader() {
+    digitalWrite(STM32_BOOT0_PIN, LOW);  // BOOT0 = 0 -> run user flash
+    digitalWrite(STM32_RESET_PIN, LOW);
+    delay(10);
+    digitalWrite(STM32_RESET_PIN, HIGH);
+    delay(20);
+}
+
+// Restore the normal 2 Mbaud 8N1 application link to the STM32.
+static void stm32RestoreAppLink() {
+    STM32Serial.end();
+    STM32Serial.setRxBufferSize(8192);
+    STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
+                      ESP32_TO_STM32_PIN);
+}
+
+static bool flashSTM32FromSD() {
+    ota_in_progress = true;
+    ui_fw_show_progress(true);
+    ui_fw_set_progress(0);
+    ui_fw_set_status("STM32: checking SD card...");
+    lv_refr_now(NULL);
+
+    size_t fw_size = 0;
+    if (!sdFileExists(SD_STM32_FW_PATH, &fw_size)) {
+        ui_fw_set_status("ERROR: " SD_STM32_FW_PATH " not found on SD card");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+    // STM32G474CE has 512 KB flash; sanity-check the image fits.
+    if (fw_size < 256 || fw_size > (512u * 1024u)) {
+        ui_fw_set_status("ERROR: STM32 image size out of range");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    File f = SD.open(SD_STM32_FW_PATH, FILE_READ);
+    if (!f) {
+        ui_fw_set_status("ERROR: cannot open STM32 image");
+        ui_fw_show_progress(false);
+        ota_in_progress = false;
+        return false;
+    }
+
+    // --- Enter bootloader and reopen the UART at 8E1 (bootloader format) ---
+    ui_fw_set_status("STM32: entering bootloader...");
+    lv_refr_now(NULL);
+    STM32Serial.end();
+    enterSTM32Bootloader();
+    // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
+    STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
+                      ESP32_TO_STM32_PIN);
+    delay(20);
+
+    bool ok = false;
+    const char* err = nullptr;
+    do {
+        if (!stmSync()) {
+            err = "ERROR: STM32 bootloader did not respond";
+            break;
+        }
+        uint16_t id = 0;
+        if (stmGetId(&id))
+            Serial.printf("[STM] product ID = 0x%03X%s\n", id,
+                          (id == 0x469) ? " (G474 OK)" : "");
+
+        ui_fw_set_status("STM32: erasing flash...");
+        lv_refr_now(NULL);
+        if (!stmMassErase()) {
+            err = "ERROR: STM32 mass-erase failed";
+            break;
+        }
+
+        ui_fw_set_status("STM32: writing firmware...");
+        lv_refr_now(NULL);
+        uint32_t addr = STM32_FLASH_BASE;
+        size_t done = 0;
+        uint8_t buf[256];
+        bool werr = false;
+        while (done < fw_size) {
+            size_t remain = fw_size - done;
+            int want = (remain > 256) ? 256 : (int)remain;
+            int r = f.read(buf, want);
+            if (r <= 0) break;
+            // Pad the final partial word up to a 4-byte boundary with 0xFF.
+            while (r % 4) buf[r++] = 0xFF;
+            if (!stmWriteChunk(addr, buf, r)) {
+                werr = true;
+                break;
+            }
+            addr += r;
+            done += r;
+            unsigned pct = (unsigned)((done * 100ULL) / fw_size);
+            if (pct > 100) pct = 100;
+            ui_fw_set_progress(pct);
+        }
+        if (werr) {
+            err = "ERROR: STM32 write failed";
+            break;
+        }
+        ui_fw_set_progress(100);
+        ok = true;
+    } while (0);
+
+    f.close();
+
+    // Return the STM32 to RUN mode (BOOT0 low + reset) and restore the link.
+    ui_fw_set_status(ok ? "STM32: launching new firmware..."
+                        : (err ? err : "ERROR: STM32 update failed"));
+    lv_refr_now(NULL);
+    exitSTM32Bootloader();
+    stm32RestoreAppLink();
+
+    // GPIO19/20 were driven as plain GPIO above, so the GT911 touch I2C bus is
+    // now broken. Reboot the ESP32 to cleanly re-initialise display + touch.
+    ui_fw_set_status(ok ? "STM32 updated OK - restarting display..."
+                        : (err ? err : "STM32 update failed - restarting..."));
+    lv_refr_now(NULL);
+    delay(ok ? 1500 : 3500);  // let the operator read the result
+    ESP.restart();            // never returns; restores touch on the clean boot
+    return ok;
+}
+
+// ---- UI button callbacks: only LATCH a request; loop() runs the transfer ----
+static void onUpdateEsp32FromSD() { g_fw_request = FW_REQ_ESP32; }
+static void onUpdateStm32FromSD() { g_fw_request = FW_REQ_STM32; }
+
 // =========================
 // Setup
 // =========================
@@ -3432,7 +3893,20 @@ void setup() {
     ui_set_wifi_reconfigure_cb(onWifiReconfigure);
     ui_set_restart_cb(onDeviceRestart);
     ui_set_factory_reset_cb(onFactoryReset);
+
+    // --- Firmware-update (SD card) callbacks ---
+    ui_set_fw_update_esp32_cb(onUpdateEsp32FromSD);
+    ui_set_fw_update_stm32_cb(onUpdateStm32FromSD);
     Serial.println("[Boot] UI callbacks registered");
+
+    // --- microSD card (firmware-update source) ---
+    if (sdEnsureMounted()) {
+        size_t sz = 0;
+        Serial.printf("[SD] esp32_firmware.bin present: %s\n",
+                      sdFileExists(SD_ESP32_FW_PATH, &sz) ? "yes" : "no");
+        Serial.printf("[SD] stm32_firmware.bin present: %s\n",
+                      sdFileExists(SD_STM32_FW_PATH, &sz) ? "yes" : "no");
+    }
 
     // --- Populate static System Info on the Setup tab ---
     ui_set_system_info(FW_VERSION, ESP.getChipModel(),
@@ -3475,6 +3949,21 @@ void loop() {
     }
     if (ota_in_progress) {
         delay(10);  // yield to WiFi/flash; no UI/UART/TCP during the update
+        return;
+    }
+
+    // --- Deferred firmware-update requests (run OUTSIDE the LVGL event path) -
+    // The CONFIG-tab buttons only latch g_fw_request; the actual (long,
+    // blocking) flash runs here so it never re-enters lv_timer_handler. Both
+    // flows reboot on completion; the ESP32 error path returns here with the
+    // panel/touch intact so the operator can read the message and retry.
+    if (g_fw_request != FW_REQ_NONE) {
+        uint8_t req = g_fw_request;
+        g_fw_request = FW_REQ_NONE;
+        if (req == FW_REQ_ESP32)
+            updateESP32FromSD();
+        else if (req == FW_REQ_STM32)
+            flashSTM32FromSD();
         return;
     }
 

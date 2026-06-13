@@ -82,6 +82,14 @@ static contact_delay_cb_t _contact_delay_cb = nullptr;
 static wifi_reconfigure_cb_t _wifi_reconfigure_cb = nullptr;
 static device_restart_cb_t _restart_cb = nullptr;
 static factory_reset_cb_t _factory_reset_cb = nullptr;
+static fw_update_cb_t _fw_esp32_cb = nullptr;
+static fw_update_cb_t _fw_stm32_cb = nullptr;
+
+// Firmware-update widgets (CONFIG tab). Created in build_config_tab().
+static lv_obj_t* _fw_status_label   = nullptr;  // status text line
+static lv_obj_t* _fw_progress_bar   = nullptr;  // 0..100 progress (hidden default)
+static lv_obj_t* _fw_btn_esp32      = nullptr;  // "Update ESP32 from SD"
+static lv_obj_t* _fw_btn_stm32      = nullptr;  // "Update STM32 from SD"
 
 // ============================================================
 // GLOBAL CONFIG STATE (Config tab v1)
@@ -1969,6 +1977,12 @@ static void confirm_yes_event(lv_event_t* e) {
         _restart_cb();
     } else if (act == 2 && _factory_reset_cb) {
         _factory_reset_cb();
+    } else if (act == 3 && _fw_esp32_cb) {
+        // Latch the ESP32 self-update request; flash runs from loop().
+        _fw_esp32_cb();
+    } else if (act == 4 && _fw_stm32_cb) {
+        // Latch the STM32 update request; flash runs from loop().
+        _fw_stm32_cb();
     }
 }
 
@@ -2037,6 +2051,23 @@ static void on_setup_factory_reset(lv_event_t* e) {
     show_confirm(2,
                  "FACTORY RESET erases WiFi credentials, recipes, config and "
                  "weld stats, then reboots into setup mode. Continue?");
+}
+
+// ---- Firmware-update button events (CONFIG tab) ----
+static void on_fw_update_esp32(lv_event_t* e) {
+    (void)e;
+    show_confirm(3,
+                 "Update ESP32 firmware from SD card?\n"
+                 "Reads /esp32_firmware.bin, the SCREEN WILL GO DARK during "
+                 "flashing, then the controller REBOOTS. Do not power off.");
+}
+
+static void on_fw_update_stm32(lv_event_t* e) {
+    (void)e;
+    show_confirm(4,
+                 "Update STM32 firmware from SD card?\n"
+                 "Reads /stm32_firmware.bin and programs the welder MCU via its "
+                 "bootloader. The controller REBOOTS afterwards. Do not power off.");
 }
 
 // ============================================================
@@ -2697,6 +2728,85 @@ static void build_config_tab(lv_obj_t* tab) {
     lv_obj_add_event_cb(btn_cfg_load_last, on_cfg_load_last, LV_EVENT_CLICKED,
                         nullptr);
     y += ROW_H + 16;
+
+    // ============================================================
+    // ---- Section: FIRMWARE UPDATE (from SD card) ----
+    // ============================================================
+    make_section_header(cont, "Firmware Update", LABEL_X, y);
+    y += 32;
+
+    // Helper text describing where the files come from.
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl,
+                          "Place esp32_firmware.bin / stm32_firmware.bin on the "
+                          "SD card root, then tap to flash.");
+        lv_obj_set_style_text_color(lbl, C_GREY, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+        lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(lbl, 740);
+        lv_obj_set_pos(lbl, LABEL_X, y);
+    }
+    y += 30;
+
+    // Row: ESP32 label + button
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "ESP32 (display controller)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    {
+        lv_obj_t* lbl_btn = nullptr;
+        _fw_btn_esp32 = make_cfg_button(cont, "UPDATE ESP32", &lbl_btn, BTN_X, y,
+                                        180, BTN_H, C_ACCENT);
+        lv_obj_add_event_cb(_fw_btn_esp32, on_fw_update_esp32, LV_EVENT_CLICKED,
+                            nullptr);
+    }
+    y += ROW_H;
+
+    // Row: STM32 label + button
+    {
+        lv_obj_t* lbl = lv_label_create(cont);
+        lv_label_set_text(lbl, "STM32 (welder controller)");
+        lv_obj_set_style_text_color(lbl, C_WHITE, 0);
+        lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+        lv_obj_set_pos(lbl, LABEL_X, y + 12);
+    }
+    {
+        lv_obj_t* lbl_btn = nullptr;
+        _fw_btn_stm32 = make_cfg_button(cont, "UPDATE STM32", &lbl_btn, BTN_X, y,
+                                        180, BTN_H, C_ACCENT);
+        lv_obj_add_event_cb(_fw_btn_stm32, on_fw_update_stm32, LV_EVENT_CLICKED,
+                            nullptr);
+    }
+    y += ROW_H;
+
+    // Status line (updated live during a flash operation).
+    _fw_status_label = lv_label_create(cont);
+    lv_label_set_text(_fw_status_label, "Ready.");
+    lv_obj_set_style_text_color(_fw_status_label, C_GREY, 0);
+    lv_obj_set_style_text_font(_fw_status_label, &lv_font_montserrat_16, 0);
+    lv_label_set_long_mode(_fw_status_label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(_fw_status_label, 740);
+    lv_obj_set_pos(_fw_status_label, LABEL_X, y);
+    y += 28;
+
+    // Progress bar (hidden by default; shown during STM32 flash).
+    _fw_progress_bar = lv_bar_create(cont);
+    lv_obj_set_size(_fw_progress_bar, 740, 18);
+    lv_obj_set_pos(_fw_progress_bar, LABEL_X, y);
+    lv_bar_set_range(_fw_progress_bar, 0, 100);
+    lv_bar_set_value(_fw_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(_fw_progress_bar, C_DARK_GREY, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(_fw_progress_bar, C_GREEN, LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(_fw_progress_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_MAIN);
+    lv_obj_set_style_radius(_fw_progress_bar, 4, LV_PART_INDICATOR);
+    lv_obj_add_flag(_fw_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    y += 18 + 16;
 
     // ============================================================
     // ---- Firmware info footer ----
@@ -3418,6 +3528,38 @@ void ui_set_wifi_reconfigure_cb(wifi_reconfigure_cb_t cb) {
 void ui_set_restart_cb(device_restart_cb_t cb) { _restart_cb = cb; }
 
 void ui_set_factory_reset_cb(factory_reset_cb_t cb) { _factory_reset_cb = cb; }
+
+// ============================================================
+// FIRMWARE UPDATE: callback registration + live progress/status
+// ============================================================
+void ui_set_fw_update_esp32_cb(fw_update_cb_t cb) { _fw_esp32_cb = cb; }
+void ui_set_fw_update_stm32_cb(fw_update_cb_t cb) { _fw_stm32_cb = cb; }
+
+void ui_fw_show_progress(bool show) {
+    if (!_fw_progress_bar) return;
+    if (show) {
+        lv_obj_clear_flag(_fw_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(_fw_progress_bar, LV_OBJ_FLAG_HIDDEN);
+    }
+    lv_refr_now(NULL);
+}
+
+void ui_fw_set_progress(int percent) {
+    if (!_fw_progress_bar) return;
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    lv_bar_set_value(_fw_progress_bar, percent, LV_ANIM_OFF);
+    // Force an immediate redraw: the flash routine blocks loop(), so the
+    // normal lv_timer_handler() cadence will not run until it returns.
+    lv_refr_now(NULL);
+}
+
+void ui_fw_set_status(const char* text) {
+    if (!_fw_status_label || !text) return;
+    lv_label_set_text(_fw_status_label, text);
+    lv_refr_now(NULL);
+}
 
 // ============================================================
 // SETUP TAB: live WiFi status
