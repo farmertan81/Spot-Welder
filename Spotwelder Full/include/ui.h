@@ -247,6 +247,18 @@ void ui_fw_set_progress(int percent);
 // Set the firmware-update status line text. Forces an immediate refresh.
 void ui_fw_set_status(const char* text);
 
+// Show a modal "firmware update complete" popup over the whole UI.
+//   success : true  -> green check icon + success styling
+//             false -> red cross icon + failure styling
+//   message : result detail line (e.g. "ESP32 updated OK - restarting...")
+//   device  : short device name shown as the title (e.g. "ESP32" or "STM32")
+// The popup is modal (blocks touch to everything behind it), has an "OK" button
+// that closes it immediately, and auto-dismisses after 5 seconds via an
+// lv_timer. All LVGL objects are cleaned up when it closes. Safe to call from
+// the same task that runs lv_timer_handler().
+void show_firmware_result_popup(bool success, const char* message,
+                                const char* device);
+
 // Update the live WiFi status shown on the Setup tab + the Status-tab
 // indicator. Call whenever WiFi state changes (connect / disconnect / AP).
 //   connected : true if associated to a STA network (or AP is up)

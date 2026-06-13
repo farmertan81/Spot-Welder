@@ -3557,6 +3557,128 @@ void ui_fw_set_status(const char* text) {
 }
 
 // ============================================================
+// FIRMWARE UPDATE COMPLETE: modal result popup
+// ============================================================
+// A single, full-screen modal overlay shown when an SD-card firmware update
+// finishes (success or failure). It blocks touch to the rest of the UI, shows a
+// big check/cross icon, the device name, the result message and an OK button,
+// and auto-dismisses itself after 5 s via an lv_timer. Only one popup can exist
+// at a time; a second call replaces the first.
+static lv_obj_t* _fw_popup_overlay = nullptr;  // the dimmed full-screen modal
+static lv_timer_t* _fw_popup_timer = nullptr;  // 5 s auto-dismiss timer
+
+// Tear down the popup and its auto-dismiss timer. Safe to call more than once.
+static void fw_popup_close(void) {
+    if (_fw_popup_timer) {
+        lv_timer_del(_fw_popup_timer);
+        _fw_popup_timer = nullptr;
+    }
+    if (_fw_popup_overlay) {
+        lv_obj_del(_fw_popup_overlay);  // deletes the whole child tree (card, etc.)
+        _fw_popup_overlay = nullptr;
+    }
+}
+
+// OK-button handler: close immediately on tap.
+static void fw_popup_ok_cb(lv_event_t* e) {
+    (void)e;
+    fw_popup_close();
+}
+
+// lv_timer callback: auto-dismiss after the 5 s timeout.
+static void fw_popup_timeout_cb(lv_timer_t* t) {
+    (void)t;
+    fw_popup_close();
+}
+
+void show_firmware_result_popup(bool success, const char* message,
+                                const char* device) {
+    // Replace any popup that is still on screen.
+    fw_popup_close();
+
+    const lv_color_t accent = success ? C_GREEN : C_RED;
+    const char* icon = success ? LV_SYMBOL_OK : LV_SYMBOL_CLOSE;
+
+    // --- Full-screen dimmed overlay (the modal scrim) -----------------------
+    // Placed on the top layer so it sits above ALL tabs/widgets. It is itself
+    // clickable, so touches on the dim area are swallowed (cannot reach the UI
+    // behind it) -> the popup is modal.
+    _fw_popup_overlay = lv_obj_create(lv_layer_top());
+    lv_obj_remove_style_all(_fw_popup_overlay);
+    lv_obj_set_size(_fw_popup_overlay, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(_fw_popup_overlay, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(_fw_popup_overlay, LV_OPA_60, 0);  // semi-transparent
+    lv_obj_add_flag(_fw_popup_overlay, LV_OBJ_FLAG_CLICKABLE);  // swallow taps
+    lv_obj_clear_flag(_fw_popup_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+    // --- Centered card ------------------------------------------------------
+    lv_obj_t* card = lv_obj_create(_fw_popup_overlay);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 460, 300);
+    lv_obj_center(card);
+    lv_obj_set_style_bg_color(card, C_CARD, 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(card, 18, 0);            // rounded corners
+    lv_obj_set_style_border_width(card, 3, 0);
+    lv_obj_set_style_border_color(card, accent, 0);  // colored frame
+    lv_obj_set_style_pad_all(card, 18, 0);
+    lv_obj_set_style_shadow_width(card, 30, 0);
+    lv_obj_set_style_shadow_color(card, lv_color_black(), 0);
+    lv_obj_set_style_shadow_opa(card, LV_OPA_50, 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    // Lay the card out as a vertical, centered stack.
+    lv_obj_set_flex_flow(card, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(card, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER,
+                          LV_FLEX_ALIGN_CENTER);
+
+    // Large status icon (check for success, cross for failure).
+    lv_obj_t* lbl_icon = lv_label_create(card);
+    lv_label_set_text(lbl_icon, icon);
+    lv_obj_set_style_text_font(lbl_icon, &lv_font_montserrat_48, 0);
+    lv_obj_set_style_text_color(lbl_icon, accent, 0);
+
+    // Device + outcome title, e.g. "ESP32 UPDATE OK" / "STM32 UPDATE FAILED".
+    char title[48];
+    snprintf(title, sizeof(title), "%s UPDATE %s",
+             (device && device[0]) ? device : "FIRMWARE",
+             success ? "OK" : "FAILED");
+    lv_obj_t* lbl_title = lv_label_create(card);
+    lv_label_set_text(lbl_title, title);
+    lv_obj_set_style_text_font(lbl_title, &lv_font_montserrat_24, 0);
+    lv_obj_set_style_text_color(lbl_title, C_WHITE, 0);
+
+    // Result message (wraps within the card width).
+    lv_obj_t* lbl_msg = lv_label_create(card);
+    lv_label_set_long_mode(lbl_msg, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lbl_msg, 410);
+    lv_label_set_text(lbl_msg, (message && message[0]) ? message : "");
+    lv_obj_set_style_text_font(lbl_msg, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(lbl_msg, C_GREY, 0);
+    lv_obj_set_style_text_align(lbl_msg, LV_TEXT_ALIGN_CENTER, 0);
+
+    // OK button: closes the popup immediately.
+    lv_obj_t* btn = lv_btn_create(card);
+    lv_obj_set_size(btn, 160, 52);
+    lv_obj_set_style_bg_color(btn, accent, 0);
+    lv_obj_set_style_radius(btn, 10, 0);
+    lv_obj_add_event_cb(btn, fw_popup_ok_cb, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* lbl_btn = lv_label_create(btn);
+    lv_label_set_text(lbl_btn, "OK");
+    lv_obj_set_style_text_font(lbl_btn, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(lbl_btn, C_WHITE, 0);
+    lv_obj_center(lbl_btn);
+
+    // Auto-dismiss after 5 s (one-shot).
+    _fw_popup_timer = lv_timer_create(fw_popup_timeout_cb, 5000, nullptr);
+    lv_timer_set_repeat_count(_fw_popup_timer, 1);
+
+    // Make sure it is on top and painted right away (the caller may block
+    // loop()/lv_timer_handler() for a while after this returns).
+    lv_obj_move_foreground(_fw_popup_overlay);
+    lv_refr_now(NULL);
+}
+
+// ============================================================
 // SETUP TAB: live WiFi status
 // ============================================================
 void ui_set_wifi_info(bool connected, bool ap_mode, const char* ssid,

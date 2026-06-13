@@ -3430,8 +3430,12 @@ static volatile uint8_t g_fw_request = FW_REQ_NONE;
 // ===========================================================================
 // FLOW 1 — ESP32 self-flash from SD (Update.h)
 // ===========================================================================
-static bool updateESP32FromSD() {
-    ota_in_progress = true;  // gate normal loop() work (UI/UART/TCP)
+// Inner worker: flashes THIS ESP32 from /esp32_firmware.bin on the SD card.
+// Returns true on success (new image written & verified, ready to run on the
+// next boot). Fills 'msg' with a short human-readable result in both cases.
+// Does NOT reboot and does NOT show the popup - the thin wrapper
+// updateESP32FromSD() owns the completion popup and the reboot.
+static bool esp32FlashFromSD(char* msg, size_t msgn) {
     ui_fw_show_progress(true);
     ui_fw_set_progress(0);
     ui_fw_set_status("ESP32: checking SD card...");
@@ -3439,43 +3443,30 @@ static bool updateESP32FromSD() {
 
     size_t fw_size = 0;
     if (!sdFileExists(SD_ESP32_FW_PATH, &fw_size)) {
-        ui_fw_set_status("ERROR: " SD_ESP32_FW_PATH " not found on SD card");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "%s not found on SD card", SD_ESP32_FW_PATH);
         return false;
     }
     // Sanity: a real app image is at least a few KB and fits in the 16MB flash.
     if (fw_size < 4096 || fw_size > (4u * 1024u * 1024u)) {
-        ui_fw_set_status("ERROR: ESP32 image size out of range");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "ESP32 image size out of range");
         return false;
     }
 
     File f = SD.open(SD_ESP32_FW_PATH, FILE_READ);
     if (!f) {
-        ui_fw_set_status("ERROR: cannot open ESP32 image");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "Cannot open ESP32 image");
         return false;
     }
     // Header sanity: every ESP32 application image starts with magic byte 0xE9.
     if (f.peek() != 0xE9) {
         f.close();
-        ui_fw_set_status("ERROR: not a valid ESP32 image (magic != 0xE9)");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "Not a valid ESP32 image (magic != 0xE9)");
         return false;
     }
 
     if (!Update.begin(fw_size)) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "ERROR: Update.begin failed (%s)",
-                 Update.errorString());
         f.close();
-        ui_fw_set_status(msg);
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "Update.begin failed (%s)", Update.errorString());
         return false;
     }
 
@@ -3495,20 +3486,44 @@ static bool updateESP32FromSD() {
     f.close();
 
     if (written != fw_size || !Update.end(true)) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "ERROR: ESP32 flash failed (%s)",
-                 Update.errorString());
-        displayUnblankAfterOta();  // bring the panel back to show the error
-        ui_fw_set_status(msg);
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "ESP32 flash failed (%s)", Update.errorString());
         return false;
     }
 
-    Serial.println("\n[SD->ESP32] flash OK - rebooting into new firmware");
-    delay(300);
-    ESP.restart();  // never returns
+    Serial.println("\n[SD->ESP32] flash OK");
+    snprintf(msg, msgn, "ESP32 firmware updated successfully. Restarting...");
     return true;
+}
+
+// Public entry (latched from the Setup-tab "UPDATE ESP32" button). Runs the
+// flash, shows the modal completion popup, and reboots into the new image on
+// success.
+static bool updateESP32FromSD() {
+    ota_in_progress = true;  // gate normal loop() work (UI/UART/TCP)
+    char msg[128] = {0};
+    bool ok = esp32FlashFromSD(msg, sizeof(msg));
+
+    ui_fw_show_progress(false);
+    // The panel is hard-blanked during the actual flash; bring it back so the
+    // popup is visible (success path, and the mid-flash failure path).
+    displayUnblankAfterOta();
+    ui_fw_set_status(ok ? "ESP32 updated OK - restarting..." : msg);
+
+    // Modal completion popup. On success we pump LVGL briefly so the operator
+    // sees the confirmation before the reboot into the new firmware; on failure
+    // we hand control back to loop(), which keeps pumping lv_timer_handler() so
+    // the popup lives its full 5 s (or until the operator taps OK).
+    show_firmware_result_popup(ok, msg, "ESP32");
+    if (ok) {
+        for (uint32_t t = 0; t < 3000; t += 10) {
+            lv_timer_handler();
+            delay(10);
+        }
+        delay(200);
+        ESP.restart();  // never returns
+    }
+    ota_in_progress = false;
+    return ok;
 }
 
 // ===========================================================================
@@ -3656,8 +3671,12 @@ static void stm32RestoreAppLink() {
                       ESP32_TO_STM32_PIN);
 }
 
-static bool flashSTM32FromSD() {
-    ota_in_progress = true;
+// Inner worker: flashes the STM32 from /stm32_firmware.bin over the AN3155 ROM
+// bootloader. Returns true on success and fills 'msg' with a short result in
+// both cases. Does NOT reboot and does NOT show the popup - the thin wrapper
+// flashSTM32FromSD() owns the completion popup and the (always-performed)
+// reboot.
+static bool stm32FlashFromSD(char* msg, size_t msgn) {
     ui_fw_show_progress(true);
     ui_fw_set_progress(0);
     ui_fw_set_status("STM32: checking SD card...");
@@ -3665,24 +3684,18 @@ static bool flashSTM32FromSD() {
 
     size_t fw_size = 0;
     if (!sdFileExists(SD_STM32_FW_PATH, &fw_size)) {
-        ui_fw_set_status("ERROR: " SD_STM32_FW_PATH " not found on SD card");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "%s not found on SD card", SD_STM32_FW_PATH);
         return false;
     }
     // STM32G474CE has 512 KB flash; sanity-check the image fits.
     if (fw_size < 256 || fw_size > (512u * 1024u)) {
-        ui_fw_set_status("ERROR: STM32 image size out of range");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "STM32 image size out of range");
         return false;
     }
 
     File f = SD.open(SD_STM32_FW_PATH, FILE_READ);
     if (!f) {
-        ui_fw_set_status("ERROR: cannot open STM32 image");
-        ui_fw_show_progress(false);
-        ota_in_progress = false;
+        snprintf(msg, msgn, "Cannot open STM32 image");
         return false;
     }
 
@@ -3704,7 +3717,7 @@ static bool flashSTM32FromSD() {
     const char* err = nullptr;
     do {
         if (!stmSync()) {
-            err = "ERROR: STM32 bootloader did not respond";
+            err = "STM32 bootloader did not respond";
             break;
         }
         uint16_t id = 0;
@@ -3715,7 +3728,7 @@ static bool flashSTM32FromSD() {
         ui_fw_set_status("STM32: erasing flash...");
         lv_refr_now(NULL);
         if (!stmMassErase()) {
-            err = "ERROR: STM32 mass-erase failed";
+            err = "STM32 mass-erase failed";
             break;
         }
 
@@ -3743,7 +3756,7 @@ static bool flashSTM32FromSD() {
             ui_fw_set_progress(pct);
         }
         if (werr) {
-            err = "ERROR: STM32 write failed";
+            err = "STM32 write failed";
             break;
         }
         ui_fw_set_progress(100);
@@ -3756,19 +3769,40 @@ static bool flashSTM32FromSD() {
     // (there is no NRST line to pulse in the software-bootloader approach),
     // then restore the normal 2 Mbaud 8N1 application link settings.
     ui_fw_set_status(ok ? "STM32: launching new firmware..."
-                        : (err ? err : "ERROR: STM32 update failed"));
+                        : (err ? err : "STM32 update failed"));
     lv_refr_now(NULL);
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
+    snprintf(msg, msgn, "%s",
+             ok ? "STM32 firmware updated successfully. Restarting..."
+                : (err ? err : "STM32 update failed"));
+    return ok;
+}
+
+// Public entry (latched from the Setup-tab "UPDATE STM32" button). Runs the
+// flash, shows the modal completion popup, then reboots the ESP32 so both sides
+// start from a clean, re-synced application link.
+static bool flashSTM32FromSD() {
+    ota_in_progress = true;
+    char msg[128] = {0};
+    bool ok = stm32FlashFromSD(msg, sizeof(msg));
+
+    ui_fw_show_progress(false);
     // Touch (GPIO19/20) was never disturbed, but the STM32 link was reopened at
-    // bootloader settings and the STM32 just rebooted into the new app. Reboot
-    // the ESP32 too so both sides start from a clean, re-synced app link/UI.
+    // bootloader settings and the STM32 just rebooted into the (new) app. We
+    // always reboot the ESP32 so both sides start from a clean, re-synced link.
     ui_fw_set_status(ok ? "STM32 updated OK - restarting..."
-                        : (err ? err : "STM32 update failed - restarting..."));
-    lv_refr_now(NULL);
-    delay(ok ? 1500 : 3500);  // let the operator read the result
-    ESP.restart();            // never returns; relaunches clean app link on boot
+                        : "STM32 update failed - restarting...");
+
+    // Modal completion popup. Pump LVGL so the operator sees it before we reboot
+    // (a little longer on failure so the error is readable).
+    show_firmware_result_popup(ok, msg, "STM32");
+    for (uint32_t t = 0; t < (ok ? 3000u : 4000u); t += 10) {
+        lv_timer_handler();
+        delay(10);
+    }
+    ESP.restart();  // never returns; relaunches clean app link on boot
     return ok;
 }
 
