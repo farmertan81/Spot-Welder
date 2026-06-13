@@ -374,6 +374,46 @@ static uint32_t config_sent_ms = 0;  // millis() when sendBootConfig() completed
 static uint32_t last_stm32_boot_sync_ms = 0;
 static const uint32_t STM32_BOOT_RESYNC_DEBOUNCE_MS = 1500;
 
+// =========================================================================
+// Firmware-update completion popup — deferred to the NEXT boot
+// -------------------------------------------------------------------------
+// A firmware update that succeeds (and the STM32 update in all cases) ends by
+// rebooting the ESP32. We must NOT paint the result popup right before the
+// reboot: that render lands while the panel/scan-out is about to be torn down,
+// and its leftover pixels in PSRAM produced a brief glitchy frame on the way
+// back up. Instead we stash the result in RTC memory (which survives a warm
+// ESP.restart() but not a power cycle), and the freshly-booted firmware shows
+// the popup ~1 s later — only AFTER displayBootStabilize() + the boot drift
+// re-syncs have fully settled the display. A magic sentinel guards against the
+// uninitialised RTC garbage present on a true cold power-on.
+#define FW_BOOT_POPUP_MAGIC 0xF09A57EDUL
+RTC_NOINIT_ATTR static uint32_t rtc_fw_popup_magic;
+RTC_NOINIT_ATTR static bool rtc_fw_popup_success;
+RTC_NOINIT_ATTR static char rtc_fw_popup_device[8];
+RTC_NOINIT_ATTR static char rtc_fw_popup_msg[96];
+
+// Latched in setup() from the RTC flag, consumed exactly once in loop() after
+// the display has settled. Plain RAM — only meaningful within one boot.
+static bool boot_fw_popup_pending = false;
+static bool boot_fw_popup_success = false;
+static char boot_fw_popup_device[8] = {0};
+static char boot_fw_popup_msg[96] = {0};
+// How long after setup() completes before the deferred popup is shown. By this
+// point the boot framebuffer clear, dual DMA restart and the first post-boot
+// drift re-syncs have run, so the panel is stable.
+static const uint32_t FW_BOOT_POPUP_DELAY_MS = 1000;
+
+// Stash a firmware-update result so the popup is shown on the next boot. Call
+// immediately before ESP.restart().
+static void armBootFirmwarePopup(bool success, const char* device,
+                                 const char* msg) {
+    rtc_fw_popup_success = success;
+    snprintf(rtc_fw_popup_device, sizeof(rtc_fw_popup_device), "%s",
+             device ? device : "");
+    snprintf(rtc_fw_popup_msg, sizeof(rtc_fw_popup_msg), "%s", msg ? msg : "");
+    rtc_fw_popup_magic = FW_BOOT_POPUP_MAGIC;  // set last: marks the data valid
+}
+
 // Forward declarations
 static void sendBootConfig();
 static void syncSettingsAfterUiReconnect();
@@ -3505,23 +3545,23 @@ static bool updateESP32FromSD() {
 
     ui_fw_show_progress(false);
     // The panel is hard-blanked during the actual flash; bring it back so the
-    // popup is visible (success path, and the mid-flash failure path).
+    // status/popup is visible.
     displayUnblankAfterOta();
     ui_fw_set_status(ok ? "ESP32 updated OK - restarting..." : msg);
 
-    // Modal completion popup. On success we pump LVGL briefly so the operator
-    // sees the confirmation before the reboot into the new firmware; on failure
-    // we hand control back to loop(), which keeps pumping lv_timer_handler() so
-    // the popup lives its full 5 s (or until the operator taps OK).
-    show_firmware_result_popup(ok, msg, "ESP32");
     if (ok) {
-        for (uint32_t t = 0; t < 3000; t += 10) {
-            lv_timer_handler();
-            delay(10);
-        }
+        // Success reboots into the new image. Do NOT paint the popup now (it
+        // would render mid-reboot and glitch the first boot frame); stash the
+        // result and let the freshly-booted firmware show it once the display
+        // has settled (see the boot-popup logic in loop()).
+        armBootFirmwarePopup(true, "ESP32", msg);
         delay(200);
         ESP.restart();  // never returns
     }
+    // Failure path stays in the running app (no reboot): show the popup right
+    // away so the operator can read the error and retry. This is normal
+    // operation, so it is NOT deferred.
+    show_firmware_result_popup(false, msg, "ESP32");
     ota_in_progress = false;
     return ok;
 }
@@ -3795,13 +3835,12 @@ static bool flashSTM32FromSD() {
     ui_fw_set_status(ok ? "STM32 updated OK - restarting..."
                         : "STM32 update failed - restarting...");
 
-    // Modal completion popup. Pump LVGL so the operator sees it before we reboot
-    // (a little longer on failure so the error is readable).
-    show_firmware_result_popup(ok, msg, "STM32");
-    for (uint32_t t = 0; t < (ok ? 3000u : 4000u); t += 10) {
-        lv_timer_handler();
-        delay(10);
-    }
+    // The STM32 flow always reboots the ESP32 (to re-sync the app link). Defer
+    // the result popup to the next boot rather than painting it now: showing it
+    // mid-reboot glitched the first boot frame. The freshly-booted firmware
+    // shows it once the display has settled (see boot-popup logic in loop()).
+    armBootFirmwarePopup(ok, "STM32", msg);
+    delay(200);
     ESP.restart();  // never returns; relaunches clean app link on boot
     return ok;
 }
@@ -4003,6 +4042,24 @@ void setup() {
     Serial.println("[Boot] 4/4 Starting WiFi provisioning + TCP services...");
     beginWifiProvisioning();
 
+    // Pick up a firmware-update result stashed before the last warm reboot.
+    // We only LATCH it here (and immediately consume the RTC flag so it can
+    // never show twice); the popup itself is shown later from loop(), once the
+    // display has fully settled. The magic check rejects the uninitialised RTC
+    // garbage seen on a true cold power-on.
+    if (rtc_fw_popup_magic == FW_BOOT_POPUP_MAGIC) {
+        boot_fw_popup_pending = true;
+        boot_fw_popup_success = rtc_fw_popup_success;
+        snprintf(boot_fw_popup_device, sizeof(boot_fw_popup_device), "%s",
+                 rtc_fw_popup_device);
+        snprintf(boot_fw_popup_msg, sizeof(boot_fw_popup_msg), "%s",
+                 rtc_fw_popup_msg);
+        rtc_fw_popup_magic = 0;  // consume: one-shot
+        Serial.printf("[Boot] Deferred firmware popup pending (%s, %s)\n",
+                      boot_fw_popup_device,
+                      boot_fw_popup_success ? "OK" : "FAIL");
+    }
+
     setup_done_ms = millis();
     Serial.println(
         "[Boot] Boot complete - waiting for STM32 BOOT/fallback sync");
@@ -4066,6 +4123,22 @@ void loop() {
             resyncDisplayPanel("post-boot");
             boot_resync_idx++;
         }
+    }
+
+    // --- Deferred firmware-update completion popup --------------------------
+    // A firmware update that rebooted the ESP32 stashed its result in RTC
+    // memory; setup() latched it into boot_fw_popup_pending. Show it ONCE, only
+    // after the display has had ~1 s to fully re-stabilize post-boot (the
+    // framebuffer clear + dual DMA restart already ran in setup(), and the first
+    // drift re-sync above has fired by now). Showing it any earlier produced a
+    // brief glitchy frame. This is gated to the boot window and runs at most
+    // once per boot, so it never interferes with updates while already running.
+    if (boot_fw_popup_pending && setup_done_ms > 0 &&
+        (now_ms - setup_done_ms) >= FW_BOOT_POPUP_DELAY_MS) {
+        boot_fw_popup_pending = false;  // one-shot
+        show_firmware_result_popup(boot_fw_popup_success, boot_fw_popup_msg,
+                                   boot_fw_popup_device);
+        Serial.println("[Boot] Showed deferred firmware-update popup");
     }
 
     // --- Phase 1: fallback timeout – send config if no BOOT msg received ---
