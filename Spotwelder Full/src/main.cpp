@@ -70,8 +70,12 @@
 // =========================
 // Sunton hardware mapping
 // =========================
-#define STM32_TO_ESP32_PIN 17  // ESP RX  <- STM32 TX
-#define ESP32_TO_STM32_PIN 18  // ESP TX  -> STM32 RX
+// STM32 data link now uses the dedicated RXD/TXD header (P1) on the Sunton
+// board, which breaks out the ESP32-S3 UART0 pins GPIO43/GPIO44. This frees
+// GPIO17/18 for the STM32 BOOT0/RESET control lines (see below) and leaves the
+// GT911 touch I2C bus (GPIO19/20) completely untouched.
+#define STM32_TO_ESP32_PIN 43  // ESP RX  <- STM32 TX  (P1 header "RXD")
+#define ESP32_TO_STM32_PIN 44  // ESP TX  -> STM32 RX  (P1 header "TXD")
 
 // Touch I2C (I2C_NUM_0) – managed by smartdisplay, DO NOT use Wire
 #define TOUCH_SDA 19
@@ -105,20 +109,19 @@
 // =========================
 // STM32 remote-flash control lines (HARDWARE MOD – see notes)
 // -------------------------------------------------------------------------
-// ESP32 GPIO19 -> STM32 PB8 (bridged to BOOT0 on the WeAct module)
-// ESP32 GPIO20 -> STM32 NRST (active-low reset)
+// ESP32 GPIO17 -> STM32 PB8 (bridged to BOOT0 on the WeAct module)
+// ESP32 GPIO18 -> STM32 NRST (active-low reset)
 //
-// ⚠ PIN CONFLICT: GPIO19/GPIO20 are ALSO the GT911 capacitive-touch I2C bus
-// (SDA=19, SCL=20, see TOUCH_SDA/TOUCH_SCL above). They are time-shared:
-//   * Normal operation : the GT911 driver owns them as I2C (touch works).
-//   * STM32 flashing    : we briefly drive them as plain GPIO for BOOT0/RESET
-//                         (touch is suspended), then REBOOT the ESP32 so the
-//                         I2C/touch driver is cleanly re-initialised.
-// A series resistor (~1 kΩ) on each tap to the STM32 is recommended so live
-// touch I2C traffic cannot disturb the STM32 NRST/BOOT0 nets in normal use.
+// These two pins were previously the STM32 UART (now moved to GPIO43/44 on the
+// P1 RXD/TXD header). With the UART relocated, GPIO17/18 are free to act as the
+// dedicated bootloader control lines. There is NO touch-bus conflict any more:
+// the GT911 capacitive-touch I2C bus stays on GPIO19/20 and is never disturbed,
+// so touch keeps working normally throughout an STM32 flash (no reboot needed
+// to recover touch). The ESP32 still reboots after a flash to cleanly relaunch
+// the STM32 application link, but that is for the data link, not for touch.
 // =========================
-#define STM32_BOOT0_PIN 19  // -> STM32 PB8/BOOT0 (HIGH = enter ROM bootloader)
-#define STM32_RESET_PIN 20  // -> STM32 NRST (LOW pulse = reset)
+#define STM32_BOOT0_PIN 17  // -> STM32 PB8/BOOT0 (HIGH = enter ROM bootloader)
+#define STM32_RESET_PIN 18  // -> STM32 NRST (LOW pulse = reset)
 
 HardwareSerial STM32Serial(2);
 
@@ -3338,12 +3341,12 @@ static void onFactoryReset() {
 //      and the device reboots into the new image on success.
 //
 //   2) flashSTM32FromSD()   reads /stm32_firmware.bin and programs the STM32
-//      over USART1 (the existing GPIO17/18 link) using the ST ROM bootloader
-//      protocol (AN3155). BOOT0/RESET are driven on GPIO19/GPIO20. Because the
-//      ESP32's own flash/PSRAM are untouched here, the panel stays ON and shows
-//      a live progress bar. GPIO19/20 are the GT911 touch I2C pins, so touch is
-//      suspended during the flash and the ESP32 reboots afterwards to cleanly
-//      re-initialise the touch driver.
+//      over the GPIO43/44 UART link (P1 RXD/TXD header) using the ST ROM
+//      bootloader protocol (AN3155). BOOT0/RESET are driven on GPIO17/GPIO18
+//      (dedicated control lines, no touch conflict). Because the ESP32's own
+//      flash/PSRAM are untouched here, the panel stays ON and shows a live
+//      progress bar, and touch keeps working throughout. The ESP32 reboots
+//      afterwards only to cleanly relaunch the STM32 application data link.
 //
 // Both flows are REQUESTED from the LVGL button callback (which only sets a
 // flag) and EXECUTED from loop(), never from inside the LVGL event dispatch —
@@ -3599,8 +3602,8 @@ static bool stmGo(uint32_t addr) {
 }
 
 // Drive BOOT0 high and pulse NRST -> STM32 starts in the ROM bootloader.
-// NOTE: GPIO19/20 are the GT911 touch I2C pins; once this is called touch is
-// dead until the ESP32 reboots.
+// BOOT0/RESET are on dedicated pins GPIO17/18 now, so touch (GPIO19/20) is
+// unaffected by this.
 static void enterSTM32Bootloader() {
     pinMode(STM32_BOOT0_PIN, OUTPUT);
     pinMode(STM32_RESET_PIN, OUTPUT);
@@ -3727,13 +3730,14 @@ static bool flashSTM32FromSD() {
     exitSTM32Bootloader();
     stm32RestoreAppLink();
 
-    // GPIO19/20 were driven as plain GPIO above, so the GT911 touch I2C bus is
-    // now broken. Reboot the ESP32 to cleanly re-initialise display + touch.
-    ui_fw_set_status(ok ? "STM32 updated OK - restarting display..."
+    // Touch (GPIO19/20) was never disturbed, but the STM32 data link was torn
+    // down and reopened at bootloader settings. Reboot the ESP32 to cleanly
+    // re-establish the normal application link and UI state.
+    ui_fw_set_status(ok ? "STM32 updated OK - restarting..."
                         : (err ? err : "STM32 update failed - restarting..."));
     lv_refr_now(NULL);
     delay(ok ? 1500 : 3500);  // let the operator read the result
-    ESP.restart();            // never returns; restores touch on the clean boot
+    ESP.restart();            // never returns; relaunches clean app link on boot
     return ok;
 }
 
