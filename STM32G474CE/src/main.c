@@ -20,6 +20,8 @@ static void MX_IWDG_Init(void);
 static void i2c_bus_recovery(void);
 
 static void uartSend(const char* s);
+static void jumpToBootloader(void);
+static void requestBootloaderReset(void);
 static inline void pwmOff(void);
 static inline void pwmOnDuty(uint16_t duty);
 static void clampParams(void);
@@ -223,6 +225,38 @@ IWDG_HandleTypeDef hiwdg;
 #define VREFINT_CAL_PTR \
     ((volatile uint16_t*)0x1FFF75AAUL) /* Factory cal value address    */
 static float measured_vdda = 3.3f; /* Updated periodically by measureVDDA() */
+
+/* ============================================================
+ * REMOTE FIRMWARE UPDATE: jump to the STM32G4 ROM (system-memory) bootloader
+ * ------------------------------------------------------------
+ * The "BOOTLOADER" UART command makes this MCU re-enter the factory ROM
+ * bootloader (AN3155 UART protocol) so the ESP32 can flash a new image WITHOUT
+ * the BOOT0/RESET hardware lines.
+ *
+ * Why a reset + flag instead of an immediate in-place jump:
+ *   This firmware arms the Independent Watchdog (IWDG, ~800 ms, software mode -
+ *   see MX_IWDG_Init).  Once started the IWDG CANNOT be stopped by software, and
+ *   the ROM bootloader never refreshes it.  A direct in-place jump would
+ *   therefore be killed by an IWDG reset ~800 ms later - far too short to flash
+ *   a multi-second image - and that reset would drop straight back into the
+ *   user app (BOOT0 low), aborting the update.
+ *   The robust software-only method is:
+ *     1) "BOOTLOADER" cmd -> stash a magic value in a backup register (survives
+ *        a warm reset) and call NVIC_SystemReset().
+ *     2) A system reset STOPS the IWDG (software mode) and clears it.
+ *     3) Very early in main() - BEFORE MX_IWDG_Init() re-arms the watchdog - we
+ *        detect the magic value and call jumpToBootloader().  The ROM bootloader
+ *        then runs with NO active watchdog and can flash for as long as needed.
+ *   jumpToBootloader() itself performs the proper ARM Cortex-M4 entry sequence
+ *   (mask IRQs, stop SysTick, deinit clocks/peripherals, set VTOR + MSP, jump).
+ * ============================================================ */
+#define SYSTEM_BOOTLOADER_ADDR 0x1FFF0000UL /* STM32G4 system memory base */
+#define BOOTLOADER_REQUEST_MAGIC 0xB00710ADUL /* "BOOT LOAD" sentinel value  */
+/* TAMP backup register used as the warm-reset request flag. Backup registers
+ * keep their contents across a system reset (only a power-on / backup-domain
+ * reset clears them), which is exactly what we need to pass the request through
+ * NVIC_SystemReset(). BKP0R is otherwise unused by this firmware. */
+#define BOOTLOADER_FLAG_REG (TAMP->BKP0R)
 
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;
@@ -4011,6 +4045,18 @@ static void parseCommand(char* line) {
         if (*p == '\0') return;
     }
 
+    /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
+     * can flash a new image over UART (AN3155) without the BOOT0/RESET lines.
+     * Accept both the bare and CMD-prefixed forms. We acknowledge first, give
+     * the UART time to drain the ACK, then request a bootloader reset (which
+     * does not return - the early-boot check in main() performs the jump). */
+    if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
+        uartSend("ACK,BOOTLOADER");
+        HAL_Delay(50);              /* ensure the ACK is fully transmitted */
+        requestBootloaderReset();   /* does not return */
+        return;
+    }
+
     if (strncmp(line, "READY,", 6) == 0) {
         int v = atoi(line + 6);
         if (v == 1) {
@@ -4486,8 +4532,93 @@ static void pollContactTrigger(void) {
     }
 }
 
+/* ============================================================
+ * Software bootloader-jump support (remote firmware update)
+ * ============================================================ */
+
+/* Unlock the backup domain so TAMP->BKPxR registers are readable/writable.
+ * Needed both to set the warm-reset request flag and to read it back early in
+ * main(). Safe to call multiple times. */
+static void bootloaderEnableBackupAccess(void) {
+    __HAL_RCC_PWR_CLK_ENABLE();      /* PWR peripheral clock              */
+    __HAL_RCC_RTCAPB_CLK_ENABLE();   /* RTC/TAMP APB clock (backup regs)  */
+    HAL_PWR_EnableBkUpAccess();      /* clear PWR_CR1_DBP write-protect   */
+}
+
+/* Perform the actual ARM Cortex-M4 jump into the STM32G4 factory ROM
+ * bootloader located in system memory at SYSTEM_BOOTLOADER_ADDR. This does NOT
+ * return. It must only be called very early in main(), before the IWDG is
+ * re-armed, so the bootloader runs with no active watchdog. */
+static void jumpToBootloader(void) {
+    /* First word = initial stack pointer, second word = reset/entry vector. */
+    uint32_t bootStack = *(volatile uint32_t*)(SYSTEM_BOOTLOADER_ADDR);
+    uint32_t bootEntry = *(volatile uint32_t*)(SYSTEM_BOOTLOADER_ADDR + 4U);
+    void (*bootJump)(void) = (void (*)(void))bootEntry;
+
+    /* Mask all interrupts while we tear the system down. */
+    __disable_irq();
+
+    /* Stop SysTick so it cannot fire after we move the stack/vector table. */
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+
+    /* Return clocks and every initialised peripheral to their reset state so
+     * the ROM bootloader starts from a clean, well-defined configuration. */
+    HAL_RCC_DeInit();
+    HAL_DeInit();
+
+    /* Disable and clear all NVIC interrupts that the application enabled. */
+    for (uint32_t i = 0; i < (sizeof(NVIC->ICER) / sizeof(NVIC->ICER[0])); i++) {
+        NVIC->ICER[i] = 0xFFFFFFFFUL;
+        NVIC->ICPR[i] = 0xFFFFFFFFUL;
+    }
+
+    /* Point the vector table at the system-memory bootloader. */
+    SCB->VTOR = SYSTEM_BOOTLOADER_ADDR;
+
+    /* Load the bootloader's stack pointer and ensure it takes effect. */
+    __set_MSP(bootStack);
+    __DSB();
+    __ISB();
+
+    /* Re-enable interrupts and hand control to the bootloader. */
+    __enable_irq();
+    bootJump();
+
+    /* Should never get here. */
+    while (1) {
+    }
+}
+
+/* Request entry into the ROM bootloader on the next boot. Stores the magic
+ * sentinel in a backup register (survives the reset) and issues a system reset.
+ * The reset also stops the software-mode IWDG; the early-boot check in main()
+ * then detects the flag and calls jumpToBootloader(). This does NOT return. */
+static void requestBootloaderReset(void) {
+    bootloaderEnableBackupAccess();
+    BOOTLOADER_FLAG_REG = BOOTLOADER_REQUEST_MAGIC;
+    __DSB();
+    NVIC_SystemReset();
+    while (1) {
+    }
+}
+
 int main(void) {
     HAL_Init();
+
+    /* Software bootloader entry: if the "BOOTLOADER" UART command requested an
+     * update, requestBootloaderReset() stored a magic value in a backup register
+     * and reset the MCU (which also stopped the IWDG). Detect that here - BEFORE
+     * the clocks/peripherals are configured and BEFORE MX_IWDG_Init() re-arms the
+     * watchdog - clear the flag, and jump straight into the ROM bootloader. */
+    bootloaderEnableBackupAccess();
+    if (BOOTLOADER_FLAG_REG == BOOTLOADER_REQUEST_MAGIC) {
+        BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear so we boot normally next time */
+        __DSB();
+        jumpToBootloader();        /* does not return */
+    }
+
     SystemClock_Config();
     SystemCoreClockUpdate();
     HAL_InitTick(TICK_INT_PRIORITY);
