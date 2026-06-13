@@ -44,6 +44,11 @@
 // LCD stops streaming the (about-to-be-garbage) PSRAM framebuffer during the
 // flash-cache-disabled windows of an OTA write. Used by the OTA hard-blank fix.
 #include <esp_lcd_panel_ops.h>
+// esp_cache_msync() writes the CPU data cache back to PSRAM. After we memset the
+// framebuffer(s) the cleared bytes may still be sitting in cache; the RGB panel
+// DMA reads PSRAM directly (bypassing cache), so we must flush cache->PSRAM
+// before restarting the scan-out or the DMA can still fetch stale garbage.
+#include <esp_cache.h>
 #endif
 #include <esp_wifi.h>
 #include <lv_conf.h>
@@ -2468,11 +2473,20 @@ static void resyncDisplayPanel(const char* reason) {
 //   3) LVGL then renders the UI on top of a drifted/garbage scan-out -> the
 //      "garbled, overlapping, misaligned" first screen.
 //
-// Fix: BEFORE any UI is created, (a) zero the PSRAM framebuffer so there is no
-// garbage to scan out, (b) esp_lcd_rgb_panel_restart() to re-align the DMA to a
-// clean VSYNC, then (c) a short settle delay so the panel is streaming a stable
-// (black) frame by the time LVGL starts drawing the real UI. The caller keeps
-// the backlight OFF across this window so the operator never sees the garbage.
+// Fix (hardened): BEFORE any UI is created, (a) zero BOTH PSRAM framebuffers so
+// there is no garbage to scan out, (b) flush the CPU cache back to PSRAM so the
+// DMA (which reads PSRAM directly) actually sees the cleared bytes, then
+// (c) restart the scan-out DMA TWICE (10 ms apart) to reliably re-align to a
+// clean VSYNC even if the first restart lands inside a still-drifting frame.
+// The caller keeps the backlight OFF across this window AND across the first
+// LVGL render, so the operator never sees the power-on garbage.
+//
+// Why this is stronger than the previous single-restart version: on some cold
+// boots a single esp_lcd_rgb_panel_restart() could be issued while the panel
+// was still mid-drift, so the scan-out re-locked onto a shifted line offset and
+// the UI came up rotated/garbled. memset alone also was not always visible to
+// the DMA because the zeros could still be sitting in the CPU cache. Flushing
+// the cache and restarting the DMA twice removes both of those race windows.
 // =========================================================================
 static void displayBootStabilize() {
     esp_lcd_panel_handle_t panel = getRgbPanelHandle();
@@ -2481,34 +2495,53 @@ static void displayBootStabilize() {
         return;
     }
 
-    // (a) Zero the PSRAM framebuffer(s) so the panel scans out solid black
-    //     instead of random power-on garbage. The RGB driver may keep 1+ frame
-    //     buffers; clear whichever it hands back.
+    // (a) Zero BOTH PSRAM framebuffers so the panel scans out solid black
+    //     instead of random power-on garbage. The RGB driver keeps two frame
+    //     buffers in the double-buffered (bounce) config used here; clear both
+    //     so neither buffer can ever be scanned out as garbage.
     void* fb0 = nullptr;
     void* fb1 = nullptr;
     const size_t fb_bytes = (size_t)DISPLAY_WIDTH * DISPLAY_HEIGHT * 2;  // RGB565
+    bool have_fb0 = false, have_fb1 = false;
     // Try two buffers first (double-buffered configs); fall back to one.
     if (esp_lcd_rgb_panel_get_frame_buffer(panel, 2, &fb0, &fb1) == ESP_OK) {
-        if (fb0) memset(fb0, 0, fb_bytes);
-        if (fb1) memset(fb1, 0, fb_bytes);
+        if (fb0) { memset(fb0, 0, fb_bytes); have_fb0 = true; }
+        if (fb1) { memset(fb1, 0, fb_bytes); have_fb1 = true; }
         Serial.println("[Display] boot stabilize: cleared 2 framebuffers");
     } else if (esp_lcd_rgb_panel_get_frame_buffer(panel, 1, &fb0) == ESP_OK &&
                fb0) {
         memset(fb0, 0, fb_bytes);
+        have_fb0 = true;
         Serial.println("[Display] boot stabilize: cleared 1 framebuffer");
     } else {
         Serial.println("[Display] boot stabilize: framebuffer fetch failed");
     }
 
-    // (b) Re-align the scan-out DMA to a clean VSYNC now that the buffer is
-    //     black, clearing any drift from the flash-heavy early-boot window.
-    esp_err_t err = esp_lcd_rgb_panel_restart(panel);
-    Serial.printf("[Display] boot stabilize: DMA restart: %s\n",
-                  esp_err_to_name(err));
+    // (b) Flush the CPU data cache back to PSRAM. memset() above writes through
+    //     the cache, but the RGB panel DMA reads PSRAM directly and bypasses the
+    //     cache, so without this write-back the DMA could still fetch stale
+    //     pre-clear garbage. esp_cache_msync(..., C2M) pushes the zeros out to
+    //     PSRAM before we restart the scan-out.
+    if (have_fb0 && fb0) {
+        esp_cache_msync(fb0, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
+    if (have_fb1 && fb1) {
+        esp_cache_msync(fb1, fb_bytes, ESP_CACHE_MSYNC_FLAG_DIR_C2M);
+    }
+    Serial.println("[Display] boot stabilize: PSRAM cache flushed (C2M)");
 
-    // (c) Let the panel stream a couple of stable black frames before LVGL
-    //     starts drawing the real UI (panel runs ~29 Hz -> ~35 ms/frame).
-    delay(80);
+    // (c) Re-align the scan-out DMA to a clean VSYNC now that the buffer is
+    //     black and flushed. Do it TWICE, 10 ms apart: a single restart can land
+    //     while the panel is still mid-drift and re-lock onto a shifted offset,
+    //     so a second restart after the panel has had a frame to settle makes
+    //     the re-alignment reliable.
+    esp_err_t err1 = esp_lcd_rgb_panel_restart(panel);
+    Serial.printf("[Display] boot stabilize: DMA restart #1: %s\n",
+                  esp_err_to_name(err1));
+    delay(10);
+    esp_err_t err2 = esp_lcd_rgb_panel_restart(panel);
+    Serial.printf("[Display] boot stabilize: DMA restart #2: %s\n",
+                  esp_err_to_name(err2));
 }
 
 // =========================================================================
@@ -3813,15 +3846,28 @@ void setup() {
     ui_init(onArmToggle, onRecipeApply);
     Serial.println("✅ UI created (5-tab shell + Pulse tab)");
 
-    // Render the real UI into the (already-cleared) framebuffer ONCE, then turn
-    // the backlight back on. Because the framebuffer was zeroed and the DMA
-    // re-synced in displayBootStabilize(), the very first thing the operator
-    // sees is the fully-drawn, correctly-aligned UI — never the power-on
-    // garbage or a half-drawn frame.
+    // Render the real UI into the (already-cleared) framebuffer, then turn the
+    // backlight back on. The backlight is still OFF here, so everything below
+    // happens off-screen. We render TWICE with a settle delay in between:
+    //
+    //   * First render: draws the freshly-created widgets into the framebuffer.
+    //   * 150 ms settle (was 50 ms): gives the just-restarted scan-out DMA
+    //     several full panel frames (~29 Hz => ~35 ms/frame) to lock onto the
+    //     clean buffer before anything is shown. The longer delay is what fixes
+    //     the *intermittent* corruption — 50 ms was sometimes too short for the
+    //     DMA to fully re-align on a cold boot.
+    //   * Second render: repaints the whole UI over the now-settled, correctly
+    //     aligned scan-out, guaranteeing the first visible frame is clean even
+    //     if the first render raced an in-flight re-alignment.
+    //
+    // Only after both renders is the backlight enabled, so the operator never
+    // sees the power-on garbage, a half-drawn frame, or a shifted/rotated UI.
     lv_timer_handler();        // let LVGL process the freshly-created widgets
-    lv_refr_now(NULL);         // synchronous full-frame flush to the panel
+    lv_refr_now(NULL);         // first synchronous full-frame flush to the panel
+    delay(150);                // settle: let the re-aligned DMA lock on (was 50)
+    lv_refr_now(NULL);         // second flush over the now-stable scan-out
     smartdisplay_lcd_set_backlight(1.0f);
-    Serial.println("✅ Backlight on (UI rendered into clean framebuffer)");
+    Serial.println("✅ Backlight on (UI dual-rendered into clean framebuffer)");
 
     // --- Config: Load settings from NVS into memory (Phase 1: NO STM32 sends
     // here) ---
