@@ -4039,10 +4039,33 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef* huart) {
 static void parseCommand(char* line) {
     char response[256];
 
+    /* Sanitise the incoming line BEFORE any strcmp(). The RX ISR normally
+     * splits on \r/\n, but be defensive: skip leading whitespace (and actually
+     * advance 'line' past it), then trim any trailing \r, \n or spaces. This
+     * guarantees "BOOTLOADER\r\n" (or " BOOTLOADER ") becomes exactly
+     * "BOOTLOADER" so the comparisons below match. */
     {
         char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '\0') return;
+        while (*p == ' ' || *p == '\t') p++;  /* skip leading whitespace */
+        line = p;
+
+        size_t len = strlen(line);
+        while (len > 0 &&
+               (line[len - 1] == '\r' || line[len - 1] == '\n' ||
+                line[len - 1] == ' ' || line[len - 1] == '\t')) {
+            line[--len] = '\0';
+        }
+
+        if (len == 0) return;  /* nothing left after trimming */
+    }
+
+    /* Debug: echo exactly what we are about to compare, with its length, so the
+     * host can confirm there are no stray characters defeating the strcmp. */
+    {
+        char debugbuf[64];
+        snprintf(debugbuf, sizeof(debugbuf), "DBG,parseCommand: '%s' (len=%d)",
+                 line, (int)strlen(line));
+        uartSend(debugbuf);
     }
 
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
