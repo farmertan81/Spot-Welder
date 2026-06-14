@@ -22,6 +22,8 @@ static void i2c_bus_recovery(void);
 static void uartSend(const char* s);
 static void jumpToBootloader(void);
 static void requestBootloaderReset(void);
+static void forceBootloaderViaOptionBytes(void);
+static void restoreNormalBootIfNeeded(void);
 static inline void pwmOff(void);
 static inline void pwmOnDuty(uint16_t duty);
 static void clampParams(void);
@@ -4105,26 +4107,25 @@ static void parseCommand(char* line) {
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
      * can flash a new image over UART (AN3155).
      *
-     * HARDWARE BOOT0 ENTRY (reliable on STM32G4):
+     * OPTION-BYTE ENTRY (reliable on STM32G4, needs NO control wire):
      * The software jump-to-system-memory approach (jumpToBootloader()) does NOT
-     * bring up a USART-responsive ROM bootloader on the G4 - the ROM expects to
-     * start from a true power-on reset with BOOT0 asserted, not a warm jump from
-     * a running app. So instead we rely on the ESP32 holding the STM32 BOOT0 pin
-     * (PB8) HIGH over a dedicated control wire, then we issue a clean
-     * NVIC_SystemReset(). On the ensuing reset the chip samples BOOT0=1 and the
-     * factory ROM bootloader starts exactly as it would with a hardware reset -
-     * fully USART-responsive. The ESP32 drops BOOT0 LOW again after flashing so
-     * the next reset boots the application. Accept both the bare and
+     * bring up a USART-responsive ROM bootloader on the G4, and this board has
+     * no free GPIO broken out to drive BOOT0. So we reprogram the boot option
+     * bytes (nSWBOOT0=0, nBOOT0=1, nBOOT1=1) and launch them, which resets the
+     * MCU into the factory ROM bootloader exactly as a hardware reset with BOOT0
+     * high would - fully USART-responsive on PA9/PA10 at 8E1. The freshly
+     * flashed app restores the option bytes on its next boot (see
+     * restoreNormalBootIfNeeded() in main()). Accept both the bare and
      * CMD-prefixed command forms. */
     if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
-        uartSend("DBG,BOOTLOADER command received -> resetting into ROM "
-                 "bootloader (BOOT0 held high by ESP32)");
+        uartSend("DBG,BOOTLOADER command received -> programming option bytes "
+                 "for ROM bootloader entry");
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
-        uartSend("DBG,Resetting now (hardware BOOT0 entry)");
+        uartSend("DBG,Setting option bytes + resetting into ROM bootloader");
         HAL_Delay(100);             /* give the UART time to send before reset */
-        NVIC_SystemReset();         /* clean reset; BOOT0=high -> ROM bootloader */
+        forceBootloaderViaOptionBytes(); /* reprograms OB + resets into ROM; no return */
         return;
     }
 
@@ -4616,6 +4617,80 @@ static void bootloaderEnableBackupAccess(void) {
     HAL_PWR_EnableBkUpAccess();      /* clear PWR_CR1_DBP write-protect   */
 }
 
+/* ============================================================================
+ * OPTION-BYTE BOOTLOADER ENTRY (the reliable, wire-free method)
+ * ============================================================================
+ * This board (ESP32-8048S043C) has NO free GPIO broken out to drive the STM32
+ * BOOT0 pin, and the software jump-to-system-memory does NOT bring up a
+ * USART-responsive ROM bootloader on the STM32G4. The robust alternative is to
+ * reprogram the boot option bytes so the chip boots the factory ROM bootloader
+ * from a REAL reset - electrically identical to holding BOOT0 high - then have
+ * the freshly-flashed application restore the option bytes on its next boot.
+ *
+ * Boot selection on the G4:
+ *   - nSWBOOT0 = 1 (factory): BOOT0 taken from the PB8/BOOT0 pin (floats low
+ *                             on this board -> boots main flash / the app).
+ *   - nSWBOOT0 = 0:           BOOT0 taken from the nBOOT0 option bit instead.
+ *   - With BOOT0 = 1 and nBOOT1 = 1 -> system memory (ROM bootloader) is booted.
+ *
+ * So to FORCE the bootloader we set: nSWBOOT0=0, nBOOT0=1, nBOOT1=1.
+ * To RESTORE normal app boot we set:  nSWBOOT0=1 (back to factory default).
+ * HAL_FLASH_OB_Launch() reloads the option bytes and triggers a reset, so each
+ * of these calls does NOT return - the MCU restarts with the new boot config.
+ */
+
+/* Reprogram the option bytes to boot the factory ROM bootloader on reset, then
+ * launch (which resets the MCU into the bootloader). Does NOT return. */
+static void forceBootloaderViaOptionBytes(void) {
+    FLASH_OBProgramInitTypeDef ob = {0};
+
+    HAL_FLASH_Unlock();
+    HAL_FLASH_OB_Unlock();
+
+    ob.OptionType  = OPTIONBYTE_USER;
+    ob.USERType    = OB_USER_nSWBOOT0 | OB_USER_nBOOT0 | OB_USER_nBOOT1;
+    /* nSWBOOT0=0 (BOOT0 from OB bit), nBOOT0=1 (BOOT0 high),
+     * nBOOT1=1 (system memory when BOOT0=1) -> ROM bootloader on next reset. */
+    ob.USERConfig  = OB_BOOT0_FROM_OB | OB_nBOOT0_SET | OB_BOOT1_SYSTEM;
+
+    if (HAL_FLASHEx_OBProgram(&ob) == HAL_OK) {
+        HAL_FLASH_OB_Launch();   /* reloads OB + resets into the bootloader */
+    }
+
+    /* Only reached if programming/launch failed. */
+    HAL_FLASH_OB_Lock();
+    HAL_FLASH_Lock();
+}
+
+/* Called very early in main(): if the option bytes are still in the
+ * "force bootloader" state (nSWBOOT0=0), this is the first boot of a freshly
+ * flashed app reached via the AN3155 "Go" command - restore the factory boot
+ * config (nSWBOOT0=1) so every future reset boots the application. The OB
+ * launch resets the MCU; the guard makes this strictly one-shot. Safe no-op in
+ * normal operation. */
+static void restoreNormalBootIfNeeded(void) {
+    /* nSWBOOT0 bit SET (=1) means BOOT0 comes from the pin = normal/factory.
+     * If it is CLEAR (=0) we are still in the forced-bootloader config. */
+    if ((FLASH->OPTR & FLASH_OPTR_nSWBOOT0) != 0U) {
+        return;  /* already normal - nothing to do */
+    }
+
+    FLASH_OBProgramInitTypeDef ob = {0};
+    HAL_FLASH_Unlock();
+    HAL_FLASH_OB_Unlock();
+
+    ob.OptionType = OPTIONBYTE_USER;
+    ob.USERType   = OB_USER_nSWBOOT0;
+    ob.USERConfig = OB_BOOT0_FROM_PIN;   /* nSWBOOT0=1 -> factory default */
+
+    if (HAL_FLASHEx_OBProgram(&ob) == HAL_OK) {
+        HAL_FLASH_OB_Launch();   /* reloads OB + resets into the app */
+    }
+
+    HAL_FLASH_OB_Lock();
+    HAL_FLASH_Lock();
+}
+
 /* Perform the actual ARM Cortex-M4 jump into the STM32G4 factory ROM
  * bootloader located in system memory at SYSTEM_BOOTLOADER_ADDR. This does NOT
  * return. It must only be called very early in main(), before the IWDG is
@@ -4755,6 +4830,14 @@ static uint32_t g_boot_tamp_value = 0;
 
 int main(void) {
     HAL_Init();
+
+    /* If we just came back from a firmware flash (the app was launched via the
+     * AN3155 "Go" command while the option bytes were still set to force the ROM
+     * bootloader), restore the factory boot config now so every future reset
+     * boots the application. One-shot + guarded; resets the MCU if it acts, and
+     * is a harmless no-op in normal operation. Must run before anything else
+     * touches FLASH. */
+    restoreNormalBootIfNeeded();
 
     /* Software bootloader entry: if the "BOOTLOADER" UART command requested an
      * update, requestBootloaderReset() stored a magic value in a backup register
