@@ -3655,8 +3655,12 @@ static IRAM_ATTR bool stmSync() {
                           drained, drained == 1 ? "" : "s");
         Serial.printf("[STM32-BOOT] Sync attempt %d/%d: sending 0x7F...\n",
                       i + 1, kAttempts);
-        stmWriteByte(STM_INIT);
-        stmFlushTx();
+        // --- TX debug: confirm bytes actually leave the ESP-IDF UART -------
+        Serial.println("[DEBUG] About to write 0x7F...");
+        int written = uart_write_bytes(STM_BOOT_UART, "\x7F", 1);
+        Serial.printf("[DEBUG] Wrote %d bytes\n", written);
+        uart_wait_tx_done(STM_BOOT_UART, 100 / portTICK_PERIOD_MS);  // wait TX complete
+        Serial.println("[DEBUG] TX done");
         Serial.println("[STM32-BOOT] Waiting for ACK (0x79)...");
         int b = stmReadByte(500);
         if (b < 0) {
@@ -3862,7 +3866,14 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // Same pins as Serial2: TX=GPIO18 -> STM32 RX, RX=GPIO17 <- STM32 TX.
     uart_set_pin(STM_BOOT_UART, ESP32_TO_STM32_PIN, STM32_TO_ESP32_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    // --- Debug: confirm the ESP-IDF driver is installed + which pins -------
+    Serial.println("[DEBUG] ESP-IDF UART driver installed");
+    Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", ESP32_TO_STM32_PIN,
+                  STM32_TO_ESP32_PIN);
+    delay(1000);  // long settling time before first transmit
+    Serial.println("[DEBUG] Driver ready, flushing...");
     uart_flush(STM_BOOT_UART);   // clear any RX/TX residue
+    delay(500);
 
     // The STM32 ROM bootloader needs plenty of settling time after the reset
     // before it is ready to auto-baud from the first 0x7F. Sending it too early
