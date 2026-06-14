@@ -393,6 +393,24 @@ RTC_NOINIT_ATTR static bool rtc_fw_popup_success;
 RTC_NOINIT_ATTR static char rtc_fw_popup_device[8];
 RTC_NOINIT_ATTR static char rtc_fw_popup_msg[96];
 
+// --- Boot-loop recovery for a stuck FAILURE popup --------------------------
+// A failed firmware flash arms a FAIL popup in RTC memory (above) and reboots.
+// If the freshly-booted firmware crashes (e.g. watchdog timeout) BEFORE it can
+// consume that flag and show the popup, the flag survives the reset and the
+// device wedges in a boot loop, re-showing "firmware popup pending (…, FAIL)"
+// on every boot. To self-heal, we keep a small persistent counter of how many
+// consecutive boots have started with the SAME pending FAIL popup. Checked at
+// the very top of setup() (before the crash-prone display/WiFi init), so it
+// still increments even when the boot never reaches the normal latch/consume.
+// After FW_FAIL_BOOTLOOP_LIMIT consecutive FAIL boots we force-clear every
+// firmware-result flag so the next boot comes up clean. SUCCESS popups are
+// never counted or cleared. A separate magic guards the counter against the
+// uninitialised RTC garbage present on a true cold power-on.
+#define FW_BOOT_LOOP_MAGIC 0xB007C0DEUL
+#define FW_FAIL_BOOTLOOP_LIMIT 3
+RTC_NOINIT_ATTR static uint32_t rtc_fw_bootloop_magic;
+RTC_NOINIT_ATTR static uint32_t rtc_fw_fail_boot_count;
+
 // Latched in setup() from the RTC flag, consumed exactly once in loop() after
 // the display has settled. Plain RAM — only meaningful within one boot.
 static bool boot_fw_popup_pending = false;
@@ -3833,6 +3851,46 @@ void setup() {
     Serial.println("===========================================");
     Serial.println("[Boot] 1/4 Initializing firmware...");
 
+    // ==========================================================
+    // BOOT-LOOP RECOVERY (run FIRST, before any crash-prone init)
+    // ----------------------------------------------------------
+    // Detect a FAILURE firmware popup that has been stuck across multiple
+    // boots and force-clear it so the device can come up clean. This runs
+    // before display/WiFi/STM32 init so the counter still advances even if a
+    // later stage crashes (watchdog) before the popup is ever consumed/shown.
+    // Safety: only FAIL popups are counted/cleared; SUCCESS popups are left
+    // untouched. A dedicated magic guards the counter against cold-boot RTC
+    // garbage.
+    if (rtc_fw_bootloop_magic != FW_BOOT_LOOP_MAGIC) {
+        // First valid boot (or cold power-on garbage) -> initialise counter.
+        rtc_fw_bootloop_magic = FW_BOOT_LOOP_MAGIC;
+        rtc_fw_fail_boot_count = 0;
+    }
+    if (rtc_fw_popup_magic == FW_BOOT_POPUP_MAGIC && !rtc_fw_popup_success) {
+        // A FAIL popup is still pending at the start of this boot -> count it.
+        rtc_fw_fail_boot_count++;
+        Serial.printf("[Boot] Pending FAIL firmware popup detected "
+                      "(consecutive boot %u/%u)\n",
+                      (unsigned)rtc_fw_fail_boot_count,
+                      (unsigned)FW_FAIL_BOOTLOOP_LIMIT);
+        if (rtc_fw_fail_boot_count >= FW_FAIL_BOOTLOOP_LIMIT) {
+            // Same failure popup has wedged the boot FW_FAIL_BOOTLOOP_LIMIT
+            // times in a row -> assume it is causing the loop and wipe ALL
+            // firmware-result flags so the next stages start from clean state.
+            rtc_fw_popup_magic = 0;
+            rtc_fw_popup_success = false;
+            rtc_fw_popup_device[0] = '\0';
+            rtc_fw_popup_msg[0] = '\0';
+            rtc_fw_fail_boot_count = 0;
+            Serial.println("[Boot] Cleared stuck firmware result flags "
+                           "(boot loop recovery)");
+        }
+    } else {
+        // No pending FAIL popup (success popup, or nothing pending) -> the loop
+        // is not active, so reset the consecutive-FAIL counter.
+        rtc_fw_fail_boot_count = 0;
+    }
+
     // --- UART to STM32 ---
     STM32Serial.setRxBufferSize(
         8192);  // LAMBO buffer for large waveform bursts
@@ -4102,7 +4160,26 @@ void loop() {
         boot_fw_popup_pending = false;  // one-shot
         show_firmware_result_popup(boot_fw_popup_success, boot_fw_popup_msg,
                                    boot_fw_popup_device);
+        // Boot-loop recovery: the popup was successfully shown, so this boot is
+        // healthy. Reset the consecutive-FAIL counter so a later genuine
+        // failure starts counting from zero again.
+        rtc_fw_fail_boot_count = 0;
         Serial.println("[Boot] Showed deferred firmware-update popup");
+    }
+
+    // --- Boot-loop recovery: 60 s timeout safety net ------------------------
+    // Defence in depth alongside the boot-counter check in setup(): if a popup
+    // is somehow still pending 60 s after boot (it should be shown ~300 ms in),
+    // assume the show path is wedged and force-clear the latched + RTC flags so
+    // nothing can accumulate. Only clears a stuck FAIL; a success popup is left
+    // alone (it will already have been shown well before 60 s).
+    if (boot_fw_popup_pending && !boot_fw_popup_success && setup_done_ms > 0 &&
+        (now_ms - setup_done_ms) >= 60000UL) {
+        boot_fw_popup_pending = false;
+        rtc_fw_popup_magic = 0;
+        rtc_fw_fail_boot_count = 0;
+        Serial.println("[Boot] Cleared stuck firmware result flags "
+                       "(boot loop recovery)");
     }
 
     // --- Phase 1: fallback timeout – send config if no BOOT msg received ---
