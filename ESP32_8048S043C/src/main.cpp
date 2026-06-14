@@ -3682,16 +3682,32 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
         }
 
         show_firmware_progress("STM32", 0, "Writing firmware...");
-        int last_drawn_pct = -1;  // throttle: only repaint on >= 2% advance
+        // STM32-ONLY throttle: repaint only every >= 10% (vs 2% for ESP32 OTA /
+        // ESP32 SD flash). The SD card and the 800x480 PSRAM->LCD flush share
+        // the SPI bus; repainting too often during the fast (10-20 s) STM32
+        // write starves the SD card ("no token received"), drops WiFi, and can
+        // crash/reboot the ESP32. Fewer, coarser repaints keep the bus free.
+        int last_drawn_pct = -1;  // throttle: only repaint on >= 10% advance
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
-        uint8_t buf[256];
+        // Smaller 128-byte reads (the AN3155 write chunk is also 128 here) keep
+        // each SD/SPI transaction short so the display + WiFi can interleave.
+        uint8_t buf[128];
         bool werr = false;
+        bool readErr = false;
         while (done < fw_size) {
             size_t remain = fw_size - done;
-            int want = (remain > 256) ? 256 : (int)remain;
+            int want = (remain > sizeof(buf)) ? (int)sizeof(buf) : (int)remain;
             int r = f.read(buf, want);
-            if (r <= 0) break;
+            if (r <= 0) {
+                // SD read failed/short before EOF -> real error, not success.
+                readErr = true;
+                break;
+            }
+            // Let the SPI bus recover after each SD read so the display/WiFi
+            // tasks get a turn; also feeds the task watchdog (delay() yields).
+            delay(2);
+            yield();
             // Pad the final partial word up to a 4-byte boundary with 0xFF.
             while (r % 4) buf[r++] = 0xFF;
             if (!stmWriteChunk(addr, buf, r)) {
@@ -3702,17 +3718,22 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             done += r;
             int pct = (int)((done * 100ULL) / fw_size);
             if (pct > 100) pct = 100;
-            // THROTTLE the repaint: each show_firmware_progress() is a full-frame
-            // PSRAM->LCD flush. The STM32 image is written in 256-byte chunks
-            // (2000+ for a 512 KB image), so painting every chunk would dominate
-            // the transfer time. Repaint only every >= 2% (always draw 100%).
-            if (pct >= last_drawn_pct + 2 || pct >= 100) {
+            // THROTTLE the repaint (STM32: every >= 10%, always draw 100%).
+            if (pct >= last_drawn_pct + 10 || pct >= 100) {
                 last_drawn_pct = pct;
                 show_firmware_progress("STM32", pct, "Writing firmware...");
             }
         }
+        if (readErr) {
+            err = "SD card read error during STM32 write";
+            break;
+        }
         if (werr) {
             err = "STM32 write failed";
+            break;
+        }
+        if (done < fw_size) {
+            err = "STM32 write incomplete";
             break;
         }
         show_firmware_progress("STM32", 100, "Verifying...");
