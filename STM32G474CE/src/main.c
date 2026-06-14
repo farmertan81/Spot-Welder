@@ -4632,6 +4632,19 @@ static void jumpToBootloader(void) {
     IWDG->RLR = 0x0FFFU;            /* max reload -> longest timeout         */
     IWDG->KR  = 0xAAAAU;            /* refresh counter with the new reload   */
 
+    /* --------------------------------------------------------------------
+     * Deinitialize USART1 BEFORE jumping so the ROM bootloader inherits a
+     * clean UART peripheral. The running application has USART1 configured
+     * for 2 Mbaud 8N1 with RX interrupts; if we leave that in place the ROM
+     * bootloader's own USART1 init can collide with the stale config and the
+     * 0x7F auto-baud / RX never works. HAL_UART_DeInit() resets the registers
+     * and runs MspDeInit (GPIO + NVIC), then we kill the peripheral clock so
+     * the bootloader brings USART1 up from a true power-on state. Done while
+     * clocks/ticks are still alive (before __disable_irq), as the HAL calls
+     * expect a running SysTick. ------------------------------------------ */
+    HAL_UART_DeInit(&huart1);
+    __HAL_RCC_USART1_CLK_DISABLE();
+
     /* Mask all interrupts while we tear the system down. */
     __disable_irq();
 
