@@ -3499,7 +3499,14 @@ static const uint8_t STM_INIT = 0x7F;
 #define STM32_FLASH_BASE 0x08000000UL
 
 // Read one byte with timeout (ms). Returns -1 on timeout.
-static int stmReadByte(uint32_t timeout_ms) {
+// NOTE on IRAM_ATTR (applies to every AN3155 helper below + stm32FlashFromSD):
+// the build runs code from PSRAM (CONFIG_SPIRAM_XIP_FROM_PSRAM). PSRAM fetches
+// are slower and can stall under bus contention, which delayed the UART2 RX path
+// enough to drop the timing-sensitive STM32 ROM-bootloader ACK bytes (handshake
+// failed -> "bootloader did not respond" / mid-write errors). Forcing these
+// functions into fast internal IRAM removes that PSRAM-fetch jitter so the
+// handshake and writes are reliable again.
+static IRAM_ATTR int stmReadByte(uint32_t timeout_ms) {
     uint32_t t0 = millis();
     while (!STM32Serial.available()) {
         if (millis() - t0 > timeout_ms) return -1;
@@ -3509,7 +3516,7 @@ static int stmReadByte(uint32_t timeout_ms) {
 }
 
 // Wait for an ACK (0x79). Logs NACK/timeout/unexpected bytes for diagnostics.
-static bool stmWaitAck(uint32_t timeout_ms) {
+static IRAM_ATTR bool stmWaitAck(uint32_t timeout_ms) {
     int b = stmReadByte(timeout_ms);
     if (b == STM_ACK) return true;
     if (b == STM_NACK)
@@ -3521,12 +3528,12 @@ static bool stmWaitAck(uint32_t timeout_ms) {
     return false;
 }
 
-static void stmDrainRx() {
+static IRAM_ATTR void stmDrainRx() {
     while (STM32Serial.available()) STM32Serial.read();
 }
 
 // Send command byte + its complement, wait for ACK.
-static bool stmSendCmd(uint8_t cmd) {
+static IRAM_ATTR bool stmSendCmd(uint8_t cmd) {
     STM32Serial.write(cmd);
     STM32Serial.write((uint8_t)(cmd ^ 0xFF));
     STM32Serial.flush();
@@ -3534,7 +3541,7 @@ static bool stmSendCmd(uint8_t cmd) {
 }
 
 // Bootloader auto-baud handshake: send 0x7F until the device answers.
-static bool stmSync() {
+static IRAM_ATTR bool stmSync() {
     for (int i = 0; i < 8; i++) {
         stmDrainRx();
         STM32Serial.write(STM_INIT);
@@ -3555,7 +3562,7 @@ static bool stmSync() {
 }
 
 // Get ID command (0x02) -> 12-bit product ID (G474 = 0x469).
-static bool stmGetId(uint16_t* id) {
+static IRAM_ATTR bool stmGetId(uint16_t* id) {
     if (!stmSendCmd(0x02)) return false;
     int n = stmReadByte(500);  // number-of-bytes-minus-1 (=1 for a 2-byte ID)
     if (n < 0) return false;
@@ -3568,7 +3575,7 @@ static bool stmGetId(uint16_t* id) {
 }
 
 // Extended Erase (0x44) global mass-erase (special code 0xFFFF, checksum 0x00).
-static bool stmMassErase() {
+static IRAM_ATTR bool stmMassErase() {
     if (!stmSendCmd(0x44)) return false;
     STM32Serial.write((uint8_t)0xFF);
     STM32Serial.write((uint8_t)0xFF);
@@ -3578,7 +3585,7 @@ static bool stmMassErase() {
 }
 
 // Write Memory (0x31): up to 256 bytes (len = 1..256) at `addr`.
-static bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len) {
+static IRAM_ATTR bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len) {
     if (len < 1 || len > 256) return false;
     if (!stmSendCmd(0x31)) return false;
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
@@ -3602,7 +3609,7 @@ static bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len) {
 // Go (0x21): jump to and run the application at `addr`. In the software-
 // bootloader flow this is how the freshly written STM32 application is launched
 // (there is no NRST line to pulse), so it is called at the end of a flash.
-static bool stmGo(uint32_t addr) {
+static IRAM_ATTR bool stmGo(uint32_t addr) {
     if (!stmSendCmd(0x21)) return false;
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
                     (uint8_t)(addr >> 8), (uint8_t)addr};
@@ -3619,14 +3626,14 @@ static bool stmGo(uint32_t addr) {
 // firmware must implement a matching handler that, on receiving this line,
 // calls its jump-to-system-memory routine (see the notes returned to the user).
 // There is no hardware BOOT0/NRST line, so this command is the only way in.
-static void sendBootloaderCommand() {
+static IRAM_ATTR void sendBootloaderCommand() {
     STM32Serial.print("BOOTLOADER");
     STM32Serial.print("\r\n");
     STM32Serial.flush();
 }
 
 // Restore the normal 2 Mbaud 8N1 application link to the STM32.
-static void stm32RestoreAppLink() {
+static IRAM_ATTR void stm32RestoreAppLink() {
     STM32Serial.end();
     STM32Serial.setRxBufferSize(8192);
     STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
@@ -3658,23 +3665,23 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     }
 
     // ------------------------------------------------------------------------
-    // HARD BLANK for the STM32 flash (the proven-stable approach)
+    // Timing-safe flash with a live progress bar (the IRAM_ATTR approach)
     // ------------------------------------------------------------------------
-    // The 800x480 RGB panel streams its framebuffer continuously out of PSRAM.
-    // Every attempt to keep the display alive (progress modal / LVGL refreshes)
-    // during the STM32 flash made the panel scan-out, the SD card and the STM32
-    // UART all fight for the SoC bus and crashed the ESP32 mid-write. The fix
-    // that always worked: tear down any modal, turn the BACKLIGHT OFF, and run
-    // the flash with ZERO UI activity. With the screen dark and no LVGL/display
-    // calls the bus is free, so we can flash fast (256-byte chunks, no throttle)
-    // and reliably. The backlight is turned back on after the flash, and the
-    // wrapper (flashSTM32FromSD) reboots the ESP32 anyway. We intentionally do
-    // NOT disable WiFi here — blanking the display alone removed the contention
-    // in the known-good build. (If a board ever still needs it, re-add a
-    // WiFi.mode(WIFI_OFF) here and a startStaConnect() at the end.)
-    hide_firmware_progress();
-    smartdisplay_lcd_set_backlight(0.0f);
-    delay(20);  // let the panel go dark before we hammer the bus
+    // Root cause of the earlier instability was NOT the display - it was that
+    // with XIP-from-PSRAM enabled the AN3155 handshake helpers executed from
+    // (slow, bus-contended) PSRAM, which delayed the UART2 RX servicing enough
+    // to drop the timing-sensitive STM32 bootloader ACK (0x79) bytes. The fix
+    // is to pin all of those helpers in fast internal RAM with IRAM_ATTR (done
+    // above), so the protocol meets timing even while the panel keeps scanning
+    // out of PSRAM. That lets us keep the display ON and show a real progress
+    // bar again. We still disable WiFi for the duration of the flash to remove
+    // its (bursty) bus/IRQ contention, and reconnect afterwards.
+    bool wifi_was_connected = (WiFi.status() == WL_CONNECTED);
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    delay(100);
+
+    show_firmware_progress("STM32", 0, "Entering bootloader...");
 
     // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
@@ -3700,22 +3707,25 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             Serial.printf("[STM] product ID = 0x%03X%s\n", id,
                           (id == 0x469) ? " (G474 OK)" : "");
 
+        show_firmware_progress("STM32", 5, "Erasing...");
         if (!stmMassErase()) {
             err = "STM32 mass-erase failed";
             break;
         }
 
         // -------------------------------------------------------------------
-        // FAST WRITE LOOP (display is OFF -> no bus contention)
+        // WRITE LOOP (display stays ON; IRAM-pinned helpers keep timing safe)
         // -------------------------------------------------------------------
-        // No progress UI, no LVGL, no display refresh. 256-byte chunks with
-        // only a watchdog feed + yield() between writes keep this as fast as
-        // the STM32 bootloader can take it.
+        // 256-byte chunks with a watchdog feed + yield() between writes. The
+        // progress modal is repainted in ~10% steps so the UI stays responsive
+        // without flooding LVGL with a refresh on every single chunk.
+        show_firmware_progress("STM32", 10, "Writing...");
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
         uint8_t buf[256];
         bool werr = false;
         bool readErr = false;
+        int last_drawn_pct = 10;
         while (done < fw_size) {
             size_t remain = fw_size - done;
             int want = (remain > sizeof(buf)) ? (int)sizeof(buf) : (int)remain;
@@ -3733,6 +3743,13 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             }
             addr += r;
             done += r;
+            // Map write progress into the 10..95% band of the bar.
+            int pct = 10 + (int)((done * 85) / fw_size);
+            if (pct > 95) pct = 95;
+            if (pct >= last_drawn_pct + 10 || done >= fw_size) {
+                last_drawn_pct = pct;
+                show_firmware_progress("STM32", pct, "Writing...");
+            }
             esp_task_wdt_reset();  // cheap WDT feed (no-op if not subscribed)
             yield();               // let other FreeRTOS tasks run
         }
@@ -3753,14 +3770,20 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     f.close();
 
+    if (ok) show_firmware_progress("STM32", 98, "Launching...");
+
     // Launch the freshly written application with the AN3155 "Go" command
     // (there is no NRST line to pulse in the software-bootloader approach),
     // then restore the normal 2 Mbaud 8N1 application link settings.
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
-    // --- Restore the display now that the bus-heavy flash is done ------------
-    smartdisplay_lcd_set_backlight(1.0f);
+    // Reconnect WiFi if it was up before the flash (the wrapper reboots the
+    // ESP32 shortly after, but restore the radio so nothing is left disabled
+    // if that path ever changes).
+    if (wifi_was_connected && wifi_ssid.length() > 0) {
+        startStaConnect();
+    }
 
     snprintf(msg, msgn, "%s",
              ok ? "STM32 firmware updated successfully. Restarting..."
