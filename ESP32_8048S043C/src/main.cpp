@@ -2352,10 +2352,17 @@ static void startApPortal() {
 static void startStaConnect() {
     Serial.printf("[WiFi] Connecting (STA) to '%s'\n", wifi_ssid.c_str());
     WiFi.mode(WIFI_STA);
+    // Set the DHCP hostname BEFORE WiFi.begin() so the router registers the
+    // device as "spotwelder" (otherwise it falls back to the default
+    // "esp32s3-XXXXXX"). This is what makes "spotwelder.local" resolve and what
+    // shows up in the router's DHCP lease table. Must be set after WIFI_STA mode
+    // and before begin() for the ESP32 Arduino core to apply it.
+    WiFi.setHostname(OTA_HOSTNAME);
     esp_wifi_set_protocol(
         WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
     WiFi.disconnect(true);
     delay(100);
+    WiFi.setHostname(OTA_HOSTNAME);  // re-assert after disconnect() (core quirk)
     WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
     wifi_prov_state = WIFI_PROV_STA_CONNECTING;
     wifi_sta_attempt_start_ms = millis();
