@@ -3632,8 +3632,7 @@ static void stm32RestoreAppLink() {
 // flashSTM32FromSD() owns the completion popup and the (always-performed)
 // reboot.
 static bool stm32FlashFromSD(char* msg, size_t msgn) {
-    show_firmware_progress("STM32", 0, "Checking SD card...");
-
+    // -- Pre-flight checks (display still ON; these are fast and may fail) -----
     size_t fw_size = 0;
     if (!sdFileExists(SD_STM32_FW_PATH, &fw_size)) {
         snprintf(msg, msgn, "%s not found on SD card", SD_STM32_FW_PATH);
@@ -3651,23 +3650,26 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
         return false;
     }
 
-    // --- Disable WiFi for the duration of the STM32 flash ---------------------
-    // The SD card, STM32 UART, the 800x480 RGB display and the WiFi radio all
-    // contend for the SoC/SPI bus. With WiFi active this contention starves the
-    // SD card and crashes the ESP32 (~14 s into the write, with a WiFi
-    // disconnect "reason 8" logged right before the crash). The STM32 flash is
-    // fast (10-20 s), so we shut the radio down for the duration to remove the
-    // contention entirely, then reconnect afterwards. We remember whether WiFi
-    // was connected so we only reconnect if it actually was.
-    bool wifi_was_connected = (WiFi.status() == WL_CONNECTED);
-    show_firmware_progress("STM32", 0,
-                           "Flashing STM32... (WiFi temporarily disabled)");
-    WiFi.disconnect(true);  // drop association AND power down the radio
-    WiFi.mode(WIFI_OFF);
-    delay(100);             // let WiFi cleanly shut down before we hit the bus
+    // ------------------------------------------------------------------------
+    // HARD BLANK for the STM32 flash (the proven-stable approach)
+    // ------------------------------------------------------------------------
+    // The 800x480 RGB panel streams its framebuffer continuously out of PSRAM.
+    // Every attempt to keep the display alive (progress modal / LVGL refreshes)
+    // during the STM32 flash made the panel scan-out, the SD card and the STM32
+    // UART all fight for the SoC bus and crashed the ESP32 mid-write. The fix
+    // that always worked: tear down any modal, turn the BACKLIGHT OFF, and run
+    // the flash with ZERO UI activity. With the screen dark and no LVGL/display
+    // calls the bus is free, so we can flash fast (256-byte chunks, no throttle)
+    // and reliably. The backlight is turned back on after the flash, and the
+    // wrapper (flashSTM32FromSD) reboots the ESP32 anyway. We intentionally do
+    // NOT disable WiFi here — blanking the display alone removed the contention
+    // in the known-good build. (If a board ever still needs it, re-add a
+    // WiFi.mode(WIFI_OFF) here and a startStaConnect() at the end.)
+    hide_firmware_progress();
+    smartdisplay_lcd_set_backlight(0.0f);
+    delay(20);  // let the panel go dark before we hammer the bus
 
     // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
-    show_firmware_progress("STM32", 0, "Requesting bootloader...");
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
     // is still open, then give the STM32 time to reboot into system memory
     // before we switch the ESP32 UART to AN3155 bootloader settings.
@@ -3691,51 +3693,23 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             Serial.printf("[STM] product ID = 0x%03X%s\n", id,
                           (id == 0x469) ? " (G474 OK)" : "");
 
-        show_firmware_progress("STM32", 0, "Erasing flash...");
         if (!stmMassErase()) {
             err = "STM32 mass-erase failed";
             break;
         }
 
-        show_firmware_progress("STM32", 0,
-                               "Flashing STM32... (WiFi temporarily disabled)");
         // -------------------------------------------------------------------
-        // SLOW-BUT-STABLE STM32 WRITE LOOP
+        // FAST WRITE LOOP (display is OFF -> no bus contention)
         // -------------------------------------------------------------------
-        // Earlier "fast" attempts (128-byte chunks, 2 ms delays, repaint every
-        // 10%) still crashed mid-flash with an RTCWDT_RTC_RST watchdog reset
-        // (~16 s in) and "netstack cb reg failed with 12308" noise: the tight
-        // SD-read + UART-write loop starved the idle task long enough that the
-        // watchdog fired. We deliberately trade speed for reliability here:
-        //
-        //   * 64-byte chunks   -> shortest possible SD/SPI transactions
-        //   * 10 ms delay/chunk-> long bus-idle gap so SD + idle task breathe
-        //   * yield()          -> hand the CPU to other FreeRTOS tasks
-        //   * esp_task_wdt_reset() -> explicitly feed the task watchdog
-        //   * repaint every 20%-> only ~5 full-frame LCD flushes total
-        //
-        // Net effect: a 256-512 KB image takes ~30-60 s instead of ~15 s, but
-        // the flash runs to completion without a watchdog reset or crash.
-        int last_drawn_pct = -1;  // throttle: only repaint on >= 20% advance
+        // No progress UI, no LVGL, no display refresh. 256-byte chunks with
+        // only a watchdog feed + yield() between writes keep this as fast as
+        // the STM32 bootloader can take it.
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
-        // 64-byte reads keep each SD/SPI transaction as short as possible so the
-        // SD card and the idle/WiFi tasks never wait long for the bus.
-        uint8_t buf[64];
+        uint8_t buf[256];
         bool werr = false;
         bool readErr = false;
-        bool timedOut = false;
-        // Abort guard: if the whole write hasn't finished within this budget,
-        // something has stalled (flaky SD / unresponsive STM32) — bail out
-        // gracefully instead of looping until the hardware watchdog resets us.
-        const uint32_t WRITE_DEADLINE_MS = 180000;  // 3 min hard cap
-        const uint32_t write_start_ms = millis();
         while (done < fw_size) {
-            // --- timeout / stall detection ---
-            if (millis() - write_start_ms > WRITE_DEADLINE_MS) {
-                timedOut = true;
-                break;
-            }
             size_t remain = fw_size - done;
             int want = (remain > sizeof(buf)) ? (int)sizeof(buf) : (int)remain;
             int r = f.read(buf, want);
@@ -3752,22 +3726,8 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             }
             addr += r;
             done += r;
-            // --- keep the system alive: feed WDT, yield, then idle the bus ---
-            esp_task_wdt_reset();  // explicit task-watchdog feed (no-op if !subscribed)
+            esp_task_wdt_reset();  // cheap WDT feed (no-op if not subscribed)
             yield();               // let other FreeRTOS tasks run
-            delay(10);             // long bus-idle gap (also feeds idle WDT)
-            int pct = (int)((done * 100ULL) / fw_size);
-            if (pct > 100) pct = 100;
-            // THROTTLE the repaint (STM32: every >= 20%, always draw 100%).
-            // Only ~5 full-frame PSRAM->LCD flushes for the whole image.
-            if (pct >= last_drawn_pct + 20 || pct >= 100) {
-                last_drawn_pct = pct;
-                show_firmware_progress("STM32", pct, "Writing firmware...");
-            }
-        }
-        if (timedOut) {
-            err = "STM32 write timed out (aborted)";
-            break;
         }
         if (readErr) {
             err = "SD card read error during STM32 write";
@@ -3781,7 +3741,6 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             err = "STM32 write incomplete";
             break;
         }
-        show_firmware_progress("STM32", 100, "Verifying...");
         ok = true;
     } while (0);
 
@@ -3790,22 +3749,11 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // Launch the freshly written application with the AN3155 "Go" command
     // (there is no NRST line to pulse in the software-bootloader approach),
     // then restore the normal 2 Mbaud 8N1 application link settings.
-    show_firmware_progress("STM32", 100,
-                           ok ? "Launching new firmware..."
-                              : (err ? err : "STM32 update failed"));
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
-    // --- Re-enable WiFi now that the bus-heavy flash is done ------------------
-    // Only reconnect if WiFi was up before we started. startStaConnect() puts
-    // the radio back into STA mode and kicks off the association; it finishes in
-    // the background (the wrapper reboots the ESP32 shortly after, which also
-    // re-establishes a clean link, so this mainly keeps the radio sane in the
-    // interim and covers any future non-rebooting caller).
-    if (wifi_was_connected && wifi_ssid.length() > 0) {
-        show_firmware_progress("STM32", 100, "Reconnecting WiFi...");
-        startStaConnect();
-    }
+    // --- Restore the display now that the bus-heavy flash is done ------------
+    smartdisplay_lcd_set_backlight(1.0f);
 
     snprintf(msg, msgn, "%s",
              ok ? "STM32 firmware updated successfully. Restarting..."
