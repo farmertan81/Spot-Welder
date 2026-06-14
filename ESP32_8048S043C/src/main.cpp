@@ -2392,6 +2392,14 @@ static void beginWifiProvisioning() {
 // all normal UI/UART/TCP work while a transfer is running.
 volatile bool ota_in_progress = false;  // set while an OTA transfer is running
 
+// Progress-UI throttle. Each show_firmware_progress() call forces a full-frame
+// 800x480 PSRAM->LCD flush (lv_refr_now); doing that on EVERY OTA packet (1000+
+// times) serialises hundreds of slow synchronous flushes against the flash
+// writes and stretched a 30-60 s update to 5+ minutes. We instead repaint only
+// when the integer percent advances by >= 2 (plus a forced 0% and 100%), cutting
+// it to ~50 flushes while still looking smooth. -1 = "nothing drawn yet".
+static int ota_last_drawn_pct = -1;
+
 // The live OTA progress UI is now the shared full-screen modal
 // show_firmware_progress() / hide_firmware_progress() (defined in ui.cpp). With
 // XIP-from-PSRAM enabled the CPU + RGB panel keep running while SPI flash is
@@ -2576,6 +2584,7 @@ void setupOTA() {
         // Show the live progress modal. The screen stays ON for the whole
         // transfer now (XIP-from-PSRAM), so the operator watches a real bar
         // instead of a black screen.
+        ota_last_drawn_pct = -1;  // reset throttle for this transfer
         show_firmware_progress("ESP32", 0, "Downloading...");
     });
 
@@ -2587,12 +2596,16 @@ void setupOTA() {
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-        unsigned int percent =
-            (total > 0) ? (unsigned int)((progress * 100ULL) / total) : 0;
-        Serial.printf("[OTA] Progress: %u%%\r", percent);
-        // Live bar. ArduinoOTA fires this per packet; the modal forces a paint
-        // each call, which LVGL renders directly (loop() is frozen during OTA).
-        show_firmware_progress("ESP32", (int)percent, "Writing firmware...");
+        int percent =
+            (total > 0) ? (int)((progress * 100ULL) / total) : 0;
+        Serial.printf("[OTA] Progress: %d%%\r", percent);
+        // THROTTLE: ArduinoOTA fires this per packet (1000+ times). Each repaint
+        // is a full-frame PSRAM->LCD flush that fights the flash writes, so only
+        // repaint when the percent advances by >= 2 (always draw the final 100%).
+        if (percent >= ota_last_drawn_pct + 2 || percent >= 100) {
+            ota_last_drawn_pct = percent;
+            show_firmware_progress("ESP32", percent, "Writing firmware...");
+        }
     });
 
     ArduinoOTA.onError([](ota_error_t error) {
@@ -3410,17 +3423,22 @@ static bool esp32FlashFromSD(char* msg, size_t msgn) {
         return false;
     }
 
+    ota_last_drawn_pct = -1;  // reset throttle for this transfer
     show_firmware_progress("ESP32", 0, "Writing firmware - do NOT power off!");
     delay(600);  // give the operator time to read the warning
 
     // Live progress during the write. With XIP-from-PSRAM the panel keeps
     // running while flash is programmed, so the bar updates in real time (no
-    // more hard-blanking the screen). The callback is a captureless lambda, so
-    // it can call the global modal helper directly.
+    // more hard-blanking the screen). THROTTLE the repaint to >= 2% steps: each
+    // repaint is a full-frame PSRAM->LCD flush that competes with the flash
+    // writes, so painting every chunk would massively slow the update.
     Update.onProgress([](size_t done, size_t total) {
-        unsigned pct = total ? (unsigned)((done * 100ULL) / total) : 0;
-        Serial.printf("[SD->ESP32] %u%%\r", pct);
-        show_firmware_progress("ESP32", (int)pct, "Writing firmware...");
+        int pct = total ? (int)((done * 100ULL) / total) : 0;
+        Serial.printf("[SD->ESP32] %d%%\r", pct);
+        if (pct >= ota_last_drawn_pct + 2 || pct >= 100) {
+            ota_last_drawn_pct = pct;
+            show_firmware_progress("ESP32", pct, "Writing firmware...");
+        }
     });
 
     size_t written = Update.writeStream(f);
@@ -3664,6 +3682,7 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
         }
 
         show_firmware_progress("STM32", 0, "Writing firmware...");
+        int last_drawn_pct = -1;  // throttle: only repaint on >= 2% advance
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
         uint8_t buf[256];
@@ -3681,9 +3700,16 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             }
             addr += r;
             done += r;
-            unsigned pct = (unsigned)((done * 100ULL) / fw_size);
+            int pct = (int)((done * 100ULL) / fw_size);
             if (pct > 100) pct = 100;
-            show_firmware_progress("STM32", (int)pct, "Writing firmware...");
+            // THROTTLE the repaint: each show_firmware_progress() is a full-frame
+            // PSRAM->LCD flush. The STM32 image is written in 256-byte chunks
+            // (2000+ for a 512 KB image), so painting every chunk would dominate
+            // the transfer time. Repaint only every >= 2% (always draw 100%).
+            if (pct >= last_drawn_pct + 2 || pct >= 100) {
+                last_drawn_pct = pct;
+                show_firmware_progress("STM32", pct, "Writing firmware...");
+            }
         }
         if (werr) {
             err = "STM32 write failed";
