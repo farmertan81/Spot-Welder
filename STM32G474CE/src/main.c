@@ -4066,6 +4066,22 @@ static void parseCommand(char* line) {
         snprintf(debugbuf, sizeof(debugbuf), "DBG,parseCommand: '%s' (len=%d)",
                  line, (int)strlen(line));
         uartSend(debugbuf);
+        HAL_Delay(5);
+    }
+
+    /* Debug: dump the raw bytes of the line in hex. If the line LOOKS like
+     * "BOOTLOADER" in the text print above but strcmp() still fails, a
+     * non-printable byte is hiding in here. This makes it visible. */
+    {
+        char hexbuf[96];
+        size_t n = strlen(line);
+        int off = snprintf(hexbuf, sizeof(hexbuf), "DBG,hex:");
+        for (size_t i = 0; i < n && off < (int)(sizeof(hexbuf) - 4); i++) {
+            off += snprintf(hexbuf + off, sizeof(hexbuf) - off, " %02X",
+                            (unsigned char)line[i]);
+        }
+        uartSend(hexbuf);
+        HAL_Delay(5);
     }
 
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
@@ -4075,8 +4091,11 @@ static void parseCommand(char* line) {
      * does not return - the early-boot check in main() performs the jump). */
     if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
         uartSend("DBG,BOOTLOADER command received -> entering ROM bootloader");
+        HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
+        uartSend("DBG,About to call requestBootloaderReset()");
+        HAL_Delay(100);             /* give the UART time to send before the call */
         requestBootloaderReset();   /* does not return */
         return;
     }
@@ -4622,7 +4641,13 @@ static void jumpToBootloader(void) {
 static void requestBootloaderReset(void) {
     char dbg[80];
 
+    /* Prove we actually entered this function. If this line never appears the
+     * call site itself is not being reached. */
+    uartSend("DBG,Inside requestBootloaderReset() - START");
+    HAL_Delay(50);
+
     uartSend("DBG,Setting TAMP register...");
+    HAL_Delay(10);
 
     /* Unlock the backup domain (PWR + RTC/TAMP APB clock + DBP) so the backup
      * register is actually writable. Without this the write is silently
@@ -4639,13 +4664,15 @@ static void requestBootloaderReset(void) {
     snprintf(dbg, sizeof(dbg), "DBG,TAMP register set to 0x%08lX",
              (unsigned long)BOOTLOADER_FLAG_REG);
     uartSend(dbg);
+    HAL_Delay(10);
 
     snprintf(dbg, sizeof(dbg), "DBG,Expected magic    = 0x%08lX",
              (unsigned long)BOOTLOADER_REQUEST_MAGIC);
     uartSend(dbg);
+    HAL_Delay(10);
 
     uartSend("DBG,Calling NVIC_SystemReset()...");
-    HAL_Delay(30);  /* let the debug lines flush out of the UART before reset */
+    HAL_Delay(50);  /* let the debug lines flush out of the UART before reset */
 
     NVIC_SystemReset();
 
