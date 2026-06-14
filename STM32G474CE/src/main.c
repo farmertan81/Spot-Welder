@@ -4051,6 +4051,7 @@ static void parseCommand(char* line) {
      * the UART time to drain the ACK, then request a bootloader reset (which
      * does not return - the early-boot check in main() performs the jump). */
     if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
+        uartSend("DBG,BOOTLOADER command received -> entering ROM bootloader");
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
         requestBootloaderReset();   /* does not return */
@@ -4596,9 +4597,12 @@ static void jumpToBootloader(void) {
  * The reset also stops the software-mode IWDG; the early-boot check in main()
  * then detects the flag and calls jumpToBootloader(). This does NOT return. */
 static void requestBootloaderReset(void) {
+    uartSend("DBG,setting bootloader flag in TAMP->BKP0R");
     bootloaderEnableBackupAccess();
     BOOTLOADER_FLAG_REG = BOOTLOADER_REQUEST_MAGIC;
     __DSB();
+    uartSend("DBG,flag set -> NVIC_SystemReset() now");
+    HAL_Delay(20);  /* let the debug line flush before the reset */
     NVIC_SystemReset();
     while (1) {
     }
