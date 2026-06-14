@@ -3769,10 +3769,18 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     delay(200);  // wait for the STM32 reset + ROM bootloader entry
 
     Serial.println("[STM32-BOOT] Switching UART to 115200 8E1...");
-    STM32Serial.end();
+    // Force a FULL UART peripheral reset so the parity change from 8N1 to 8E1
+    // actually takes effect. Simply re-calling begin() can leave the old parity
+    // latched in the UART hardware; end() + settle + begin() guarantees the
+    // peripheral fully reconfigures from scratch instead of just changing baud.
+    STM32Serial.end();          // stop UART completely
+    delay(100);                 // let the hardware settle
     // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
     STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
+    delay(100);                 // let the new 8E1 config settle
+    STM32Serial.flush();        // clear TX buffer
+    while (STM32Serial.available()) STM32Serial.read();  // clear RX buffer
     // The STM32 ROM bootloader needs plenty of settling time after the reset
     // before it is ready to auto-baud from the first 0x7F. Sending it too early
     // is the #1 cause of "bootloader did not respond". Wait generously:
