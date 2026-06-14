@@ -4901,7 +4901,14 @@ int main(void) {
 
     HAL_UART_Receive_IT(&huart1, &rx_byte, 1);
 
-    MX_IWDG_Init();
+    /* TEMPORARY: IWDG disabled to allow the software bootloader jump.
+     * Once the IWDG is started it can NEVER be stopped by software - it runs
+     * until a hardware reset. With the new DIRECT jump to the ROM bootloader
+     * (no NVIC_SystemReset), a running IWDG would fire mid-flash and reset the
+     * chip out of the bootloader. Not starting it at all is the clean fix.
+     * The HAL_IWDG_Refresh() below is harmless when the IWDG was never started
+     * (it just writes the key register), so it is left in place. */
+    /* MX_IWDG_Init(); */
 
     while (1) {
         HAL_IWDG_Refresh(&hiwdg);
