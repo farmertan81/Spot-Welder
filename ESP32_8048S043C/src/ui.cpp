@@ -3557,6 +3557,122 @@ void ui_fw_set_status(const char* text) {
 }
 
 // ============================================================
+// FIRMWARE UPDATE: live full-screen progress modal
+// ============================================================
+// One full-screen modal shown DURING a firmware update — OTA over WiFi, or an
+// SD-card flash of the ESP32 / STM32. Now that the ESP32 executes from PSRAM
+// (XIP) while its SPI flash is being written, the CPU + display keep running
+// through the transfer, so the panel no longer has to be hard-blanked: we can
+// paint a live progress bar the whole time. Layout (top -> bottom):
+//   - device-name title       e.g. "ESP32 Firmware Update"
+//   - large percentage text   e.g. "42%"
+//   - wide progress bar (0..100)
+//   - status line             e.g. "Writing firmware..."
+// It lives on the top layer (above every tab/widget) and swallows touches so
+// the operator cannot interact with the UI mid-update.
+static lv_obj_t* _fwp_overlay = nullptr;  // dimmed full-screen scrim
+static lv_obj_t* _fwp_title   = nullptr;  // "<device> Firmware Update"
+static lv_obj_t* _fwp_percent = nullptr;  // big "NN%" label
+static lv_obj_t* _fwp_bar     = nullptr;  // 0..100 progress bar
+static lv_obj_t* _fwp_status  = nullptr;  // status line
+
+void show_firmware_progress(const char* device, int percent,
+                            const char* status_text) {
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+
+    // Build the modal lazily on the first call of an update.
+    if (!_fwp_overlay) {
+        _fwp_overlay = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(_fwp_overlay);
+        lv_obj_set_size(_fwp_overlay, LV_PCT(100), LV_PCT(100));
+        lv_obj_set_style_bg_color(_fwp_overlay, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(_fwp_overlay, LV_OPA_80, 0);  // semi-transparent
+        lv_obj_add_flag(_fwp_overlay, LV_OBJ_FLAG_CLICKABLE);  // swallow taps
+        lv_obj_clear_flag(_fwp_overlay, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Centered card.
+        lv_obj_t* card = lv_obj_create(_fwp_overlay);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, 600, 280);
+        lv_obj_center(card);
+        lv_obj_set_style_bg_color(card, C_CARD, 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(card, 12, 0);
+        lv_obj_set_style_border_width(card, 2, 0);
+        lv_obj_set_style_border_color(card, C_ACCENT, 0);
+        lv_obj_set_style_pad_all(card, 24, 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        // Device-name title.
+        _fwp_title = lv_label_create(card);
+        lv_obj_set_style_text_font(_fwp_title, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(_fwp_title, C_WHITE, 0);
+        lv_obj_align(_fwp_title, LV_ALIGN_TOP_MID, 0, 0);
+
+        // Big percentage text above the bar.
+        _fwp_percent = lv_label_create(card);
+        lv_obj_set_style_text_font(_fwp_percent, &lv_font_montserrat_24, 0);
+        lv_obj_set_style_text_color(_fwp_percent, C_GREEN, 0);
+        lv_obj_align(_fwp_percent, LV_ALIGN_TOP_MID, 0, 50);
+
+        // Large progress bar.
+        _fwp_bar = lv_bar_create(card);
+        lv_obj_set_size(_fwp_bar, 540, 28);
+        lv_obj_align(_fwp_bar, LV_ALIGN_CENTER, 0, 18);
+        lv_bar_set_range(_fwp_bar, 0, 100);
+        lv_bar_set_value(_fwp_bar, 0, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(_fwp_bar, C_DARK_GREY, LV_PART_MAIN);
+        lv_obj_set_style_bg_opa(_fwp_bar, LV_OPA_COVER, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(_fwp_bar, C_GREEN, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_opa(_fwp_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_radius(_fwp_bar, 6, LV_PART_MAIN);
+        lv_obj_set_style_radius(_fwp_bar, 6, LV_PART_INDICATOR);
+
+        // Status line below the bar.
+        _fwp_status = lv_label_create(card);
+        lv_obj_set_style_text_font(_fwp_status, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(_fwp_status, C_GREY, 0);
+        lv_label_set_long_mode(_fwp_status, LV_LABEL_LONG_WRAP);
+        lv_obj_set_width(_fwp_status, 540);
+        lv_obj_set_style_text_align(_fwp_status, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(_fwp_status, LV_ALIGN_BOTTOM_MID, 0, 0);
+    }
+
+    // Device title.
+    char title[48];
+    snprintf(title, sizeof(title), "%s Firmware Update",
+             (device && device[0]) ? device : "Firmware");
+    lv_label_set_text(_fwp_title, title);
+
+    // Percentage text + bar value.
+    char pctbuf[8];
+    snprintf(pctbuf, sizeof(pctbuf), "%d%%", percent);
+    lv_label_set_text(_fwp_percent, pctbuf);
+    lv_bar_set_value(_fwp_bar, percent, LV_ANIM_OFF);
+
+    // Status line (only update when provided).
+    if (status_text && status_text[0])
+        lv_label_set_text(_fwp_status, status_text);
+
+    // Force an immediate paint: the flash/OTA routine blocks loop(), so the
+    // normal lv_timer_handler() cadence will not run until it returns.
+    lv_refr_now(NULL);
+}
+
+void hide_firmware_progress(void) {
+    if (_fwp_overlay) {
+        lv_obj_del(_fwp_overlay);  // deletes the whole child tree (card, labels)
+        _fwp_overlay = nullptr;
+        _fwp_title = nullptr;
+        _fwp_percent = nullptr;
+        _fwp_bar = nullptr;
+        _fwp_status = nullptr;
+        lv_refr_now(NULL);
+    }
+}
+
+// ============================================================
 // FIRMWARE UPDATE COMPLETE: modal result popup
 // ============================================================
 // A single, full-screen modal overlay shown when an SD-card firmware update

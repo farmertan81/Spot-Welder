@@ -247,6 +247,23 @@ void ui_fw_set_progress(int percent);
 // Set the firmware-update status line text. Forces an immediate refresh.
 void ui_fw_set_status(const char* text);
 
+// Live full-screen firmware-update progress modal (shown DURING an update —
+// OTA over WiFi, or an SD-card flash of the ESP32 / STM32). Builds itself on the
+// first call and updates in place on subsequent calls. Now that the ESP32 runs
+// from PSRAM (XIP) during flash writes, the panel stays live so the bar can be
+// painted throughout the transfer (no more hard-blanking the screen).
+//   device      : short device name shown as the title ("ESP32" / "STM32")
+//   percent     : 0..100 progress (clamped); drives the bar + the "NN%" text
+//   status_text : status line under the bar (e.g. "Writing firmware..."); pass
+//                 NULL/"" to leave the current status unchanged.
+// Forces an immediate refresh so progress is visible even while the flash/OTA
+// routine blocks loop(). Call hide_firmware_progress() when finished.
+void show_firmware_progress(const char* device, int percent,
+                            const char* status_text);
+
+// Tear down the live firmware-update progress modal. Safe to call more than once.
+void hide_firmware_progress(void);
+
 // Show a modal "firmware update complete" popup over the whole UI.
 //   success : true  -> green check icon + success styling
 //             false -> red cross icon + failure styling

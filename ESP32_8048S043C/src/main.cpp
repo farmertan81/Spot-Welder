@@ -399,9 +399,10 @@ static bool boot_fw_popup_success = false;
 static char boot_fw_popup_device[8] = {0};
 static char boot_fw_popup_msg[96] = {0};
 // How long after setup() completes before the deferred popup is shown. By this
-// point the boot framebuffer clear, dual DMA restart and the first post-boot
-// drift re-syncs have run, so the panel is stable.
-static const uint32_t FW_BOOT_POPUP_DELAY_MS = 1000;
+// point the boot framebuffer clear + dual DMA restart have run, so the panel is
+// stable. Reduced from 1000ms -> 300ms now that the display is solid from the
+// first frame (XIP-from-PSRAM): the operator sees the result almost immediately.
+static const uint32_t FW_BOOT_POPUP_DELAY_MS = 300;
 
 // Stash a firmware-update result so the popup is shown on the next boot. Call
 // immediately before ESP.restart().
@@ -2387,72 +2388,17 @@ static void beginWifiProvisioning() {
 // (2) flush the progress bar only every ~5%, keeping bus contention minimal
 // while still showing live progress.
 
-static lv_obj_t* ota_overlay = nullptr;
-static lv_obj_t* ota_label = nullptr;
-static lv_obj_t* ota_bar = nullptr;
 // volatile: written from the ArduinoOTA callbacks and read in loop() to gate
 // all normal UI/UART/TCP work while a transfer is running.
 volatile bool ota_in_progress = false;  // set while an OTA transfer is running
 
-// Create/show the OTA overlay. `repaint` triggers exactly ONE full-frame flush
-// (lv_refr_now is a synchronous 800x480 PSRAM->LCD transfer). We deliberately
-// keep these flushes RARE during OTA: every flush competes with the WiFi RX +
-// flash write for the PSRAM/SoC bus, which is the root cause of the glitching
-// the operator sees on the progress screen. So we repaint only on overlay
-// creation and on text changes, NOT on every progress tick.
-void showOTAOverlay(const char* message, bool repaint = true) {
-    if (!ota_overlay) {
-        // Create full-screen modal overlay on the active screen.
-        ota_overlay = lv_obj_create(lv_scr_act());
-        lv_obj_set_size(ota_overlay, 800, 480);
-        lv_obj_set_style_bg_color(ota_overlay, lv_color_hex(0x000000), 0);
-        lv_obj_set_style_bg_opa(ota_overlay, LV_OPA_COVER, 0);  // fully opaque
-        lv_obj_set_style_border_width(ota_overlay, 0, 0);
-        lv_obj_clear_flag(ota_overlay, LV_OBJ_FLAG_SCROLLABLE);
-
-        ota_label = lv_label_create(ota_overlay);
-        lv_obj_set_style_text_font(ota_label, &lv_font_montserrat_24, 0);
-        lv_obj_set_style_text_color(ota_label, lv_color_hex(0xFFFFFF), 0);
-        lv_obj_align(ota_label, LV_ALIGN_CENTER, 0, -40);
-
-        ota_bar = lv_bar_create(ota_overlay);
-        lv_obj_set_size(ota_bar, 400, 20);
-        lv_obj_align(ota_bar, LV_ALIGN_CENTER, 0, 20);
-        lv_bar_set_range(ota_bar, 0, 100);
-        lv_bar_set_value(ota_bar, 0, LV_ANIM_OFF);
-    }
-    lv_label_set_text(ota_label, message);
-    if (repaint) {
-        lv_refr_now(NULL);  // single synchronous flush (loop is blocked in OTA)
-    }
-}
-
-// Update the progress bar. The actual screen flush is THROTTLED: we only force a
-// redraw every 5% so the bar still animates visibly while minimising the number
-// of PSRAM->LCD transfers that fight the firmware download for bus bandwidth.
-void updateOTAProgress(unsigned int percent) {
-    if (!ota_bar) return;
-    if (percent > 100) percent = 100;
-
-    lv_bar_set_value(ota_bar, (int32_t)percent, LV_ANIM_OFF);
-
-    static int last_drawn_pct = -1;
-    if (last_drawn_pct < 0 || (int)percent - last_drawn_pct >= 5 ||
-        percent >= 100) {
-        last_drawn_pct = (int)percent;
-        lv_refr_now(NULL);  // sparse: ~20 flushes across the whole transfer
-    }
-}
-
-void hideOTAOverlay() {
-    if (ota_overlay) {
-        lv_obj_del(ota_overlay);
-        ota_overlay = nullptr;
-        ota_label = nullptr;
-        ota_bar = nullptr;
-        lv_refr_now(NULL);
-    }
-}
+// The live OTA progress UI is now the shared full-screen modal
+// show_firmware_progress() / hide_firmware_progress() (defined in ui.cpp). With
+// XIP-from-PSRAM enabled the CPU + RGB panel keep running while SPI flash is
+// written, so we no longer hard-blank the screen during a transfer — the
+// operator sees a real "ESP32 Firmware Update" progress bar instead of a black
+// screen. The modal itself throttles nothing; the OTA callbacks below decide how
+// often to push an update (we update per progress tick, which LVGL coalesces).
 
 // =========================================================================
 // RGB-panel drift / glitch recovery helpers
@@ -2486,7 +2432,10 @@ static esp_lcd_panel_handle_t getRgbPanelHandle() {
 }
 
 // Re-align the panel scan-out DMA and repaint a full clean frame. Use after a
-// flash-heavy window (boot, OTA abort) to clear any drift in software.
+// flash-heavy window (boot, OTA abort) to clear any drift in software. Retained
+// for manual recovery; the automatic post-boot resyncs were removed once XIP
+// made boot drift a non-issue (hence the possibly-unused attribute).
+static void resyncDisplayPanel(const char* reason) __attribute__((unused));
 static void resyncDisplayPanel(const char* reason) {
     esp_lcd_panel_handle_t panel = getRgbPanelHandle();
     if (!panel) return;
@@ -2585,57 +2534,24 @@ static void displayBootStabilize() {
 }
 
 // =========================================================================
-// OTA HARD-BLANK  (the real fix for the OTA "color loop" crash)
+// NOTE: the old OTA "hard-blank" workaround has been REMOVED.
 // -------------------------------------------------------------------------
-// During an OTA flash write, esp_ota_write() erases/programs flash, and EACH
-// erase/program op momentarily DISABLES the SPI-flash cache. While the cache is
-// off the RGB panel cannot fetch its framebuffer out of PSRAM, and the (non-
-// IRAM) RGB refill ISR cannot run from flash -> the panel scans out garbage
-// (cycling solid colors: black/white/yellow/red/blue) and can fault, so the OTA
-// never completes and needs a manual reset.
+// Historically, an OTA / SD flash write would momentarily DISABLE the SPI-flash
+// cache on every erase/program op. With code running from flash, the non-IRAM
+// RGB refill ISR could not run during those windows and the panel scanned out
+// garbage (the "color loop" crash), so we used to turn the backlight off and
+// halt panel scan-out (displayBlankForOta/displayUnblankAfterOta) for the whole
+// transfer — leaving the operator staring at a black screen.
 //
-// The robust fix is to STOP the panel scanning out entirely for the duration of
-// the transfer: turn the backlight off AND halt the panel scan-out via
-// esp_lcd_panel_disp_on_off(panel,false). With the panel quiescent there is no
-// PSRAM read demand and no refill ISR to fire during the cache-disable windows,
-// so the flash writes complete cleanly. The screen is intentionally black while
-// flashing; it is fully restored on completion (onEnd reboots -> clean boot) or
-// on abort (onError -> blank off + resync).
+// That is no longer necessary: the firmware now executes from PSRAM (XIP) with
+// an IRAM-safe RGB refill path, so the CPU and panel keep running normally while
+// SPI flash is being written. We can therefore paint a LIVE progress bar
+// throughout the update (see show_firmware_progress()/hide_firmware_progress()).
 // =========================================================================
-static void displayBlankForOta() {
-    // 1) Backlight off first so the operator never sees the garbage frame that
-    //    a half-written framebuffer would otherwise show.
-    smartdisplay_lcd_set_backlight(0.0f);
-    // 2) Halt the RGB panel scan-out so DMA stops reading PSRAM. This is what
-    //    removes the cache-disable contention/fault during flash writes.
-    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
-    if (panel) {
-        esp_err_t err = esp_lcd_panel_disp_on_off(panel, false);
-        Serial.printf("[Display] OTA blank: panel off: %s\n",
-                      esp_err_to_name(err));
-    }
-}
-
-// Bring the panel back after an aborted OTA (onError). On success the device
-// reboots from onEnd, so this is only needed on the abort path.
-static void displayUnblankAfterOta() {
-    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
-    if (panel) {
-        esp_err_t err = esp_lcd_panel_disp_on_off(panel, true);
-        Serial.printf("[Display] OTA unblank: panel on: %s\n",
-                      esp_err_to_name(err));
-    }
-    // Re-align the scan-out DMA and repaint a full clean frame before the
-    // backlight comes back, so the operator sees a correct picture immediately.
-    resyncDisplayPanel("ota-unblank");
-    smartdisplay_lcd_set_backlight(1.0f);
-}
 #else
 // Non-RGB panel build: these are no-ops so the call sites stay clean.
 static inline void resyncDisplayPanel(const char*) {}
 static inline void displayBootStabilize() {}
-static inline void displayBlankForOta() {}
-static inline void displayUnblankAfterOta() {}
 #endif
 
 void setupOTA() {
@@ -2647,43 +2563,36 @@ void setupOTA() {
         // FREEZE the normal UI. From here until reboot/error, loop() does no
         // tab rendering, no UART polling and no TCP work (see the ota_in_progress
         // guard in loop()), so the firmware download gets the PSRAM/SoC bus to
-        // itself. This is what stops the glitching on the update screen.
+        // itself.
         ota_in_progress = true;
 
         String type =
             (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
-        Serial.println("[OTA] Start updating " + type + " - display blanked");
+        Serial.println("[OTA] Start updating " + type);
 
         // Stop the TCP bridge so it cannot fight for time/heap/bus mid-update.
         if (client) client.stop();
 
-        // HARD BLANK the display for the whole transfer. This is the real fix
-        // for the "color loop" crash: each flash erase/program disables the
-        // SPI-flash cache, during which the RGB panel cannot fetch its PSRAM
-        // framebuffer and the non-IRAM refill ISR cannot run -> garbage scan-out
-        // + fault. Turning the backlight off and halting panel scan-out removes
-        // all PSRAM read demand and the refill ISR during those windows, so the
-        // flash writes complete cleanly. The screen stays black until reboot
-        // (success) or unblank (abort). NOTE: do this BEFORE any LVGL flush so
-        // we never push a frame to a panel we are about to stop.
-        displayBlankForOta();
+        // Show the live progress modal. The screen stays ON for the whole
+        // transfer now (XIP-from-PSRAM), so the operator watches a real bar
+        // instead of a black screen.
+        show_firmware_progress("ESP32", 0, "Downloading...");
     });
 
     ArduinoOTA.onEnd([]() {
         Serial.println("\n[OTA] Update complete - rebooting");
-        // Bring the panel/backlight back so the (very brief) pre-reboot moment
-        // and the upcoming clean boot are not left on a powered-off panel. The
-        // device reboots automatically after this callback returns, and the
-        // clean boot re-initialises the display + restores the full UI/status
-        // bar from scratch (matching a manual power-cycle).
-        displayUnblankAfterOta();
+        show_firmware_progress("ESP32", 100, "Update complete - rebooting...");
+        // The device reboots automatically after this callback returns; the
+        // clean boot re-initialises the display + restores the full UI.
     });
 
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         unsigned int percent =
             (total > 0) ? (unsigned int)((progress * 100ULL) / total) : 0;
         Serial.printf("[OTA] Progress: %u%%\r", percent);
-        updateOTAProgress(percent);
+        // Live bar. ArduinoOTA fires this per packet; the modal forces a paint
+        // each call, which LVGL renders directly (loop() is frozen during OTA).
+        show_firmware_progress("ESP32", (int)percent, "Writing firmware...");
     });
 
     ArduinoOTA.onError([](ota_error_t error) {
@@ -2706,17 +2615,11 @@ void setupOTA() {
             Serial.println("End Failed");
             msg = "End Failed!";
         }
-        // OTA aborted: the device keeps running, so bring the panel back BEFORE
-        // we try to draw anything. displayUnblankAfterOta() turns the panel
-        // scan-out + backlight back on and re-aligns the DMA, so the error
-        // message below renders on a live, correctly-scanned panel. (The OTA
-        // overlay was never created this cycle, but hard-blank turned the panel
-        // off, so without this the message would draw to a stopped panel.)
-        displayUnblankAfterOta();
-        showOTAOverlay(msg);
+        // OTA aborted: the device keeps running. Show the error on the live
+        // progress modal briefly, then tear it down and return to the UI.
+        show_firmware_progress("ESP32", 0, msg);
         delay(3000);
-        hideOTAOverlay();
-        resyncDisplayPanel("ota-error");
+        hide_firmware_progress();
     });
 
     ArduinoOTA.begin();
@@ -3476,10 +3379,7 @@ static volatile uint8_t g_fw_request = FW_REQ_NONE;
 // Does NOT reboot and does NOT show the popup - the thin wrapper
 // updateESP32FromSD() owns the completion popup and the reboot.
 static bool esp32FlashFromSD(char* msg, size_t msgn) {
-    ui_fw_show_progress(true);
-    ui_fw_set_progress(0);
-    ui_fw_set_status("ESP32: checking SD card...");
-    lv_refr_now(NULL);
+    show_firmware_progress("ESP32", 0, "Checking SD card...");
 
     size_t fw_size = 0;
     if (!sdFileExists(SD_ESP32_FW_PATH, &fw_size)) {
@@ -3510,16 +3410,17 @@ static bool esp32FlashFromSD(char* msg, size_t msgn) {
         return false;
     }
 
-    ui_fw_set_status("Flashing ESP32 - screen goes DARK. Do NOT power off!");
-    lv_refr_now(NULL);
+    show_firmware_progress("ESP32", 0, "Writing firmware - do NOT power off!");
     delay(600);  // give the operator time to read the warning
 
-    // Same SPI-flash-cache hazard as OTA -> hard-blank the panel for the write.
-    displayBlankForOta();
-
+    // Live progress during the write. With XIP-from-PSRAM the panel keeps
+    // running while flash is programmed, so the bar updates in real time (no
+    // more hard-blanking the screen). The callback is a captureless lambda, so
+    // it can call the global modal helper directly.
     Update.onProgress([](size_t done, size_t total) {
-        Serial.printf("[SD->ESP32] %u%%\r",
-                      total ? (unsigned)((done * 100ULL) / total) : 0);
+        unsigned pct = total ? (unsigned)((done * 100ULL) / total) : 0;
+        Serial.printf("[SD->ESP32] %u%%\r", pct);
+        show_firmware_progress("ESP32", (int)pct, "Writing firmware...");
     });
 
     size_t written = Update.writeStream(f);
@@ -3543,24 +3444,19 @@ static bool updateESP32FromSD() {
     char msg[128] = {0};
     bool ok = esp32FlashFromSD(msg, sizeof(msg));
 
-    ui_fw_show_progress(false);
-    // The panel is hard-blanked during the actual flash; bring it back so the
-    // status/popup is visible.
-    displayUnblankAfterOta();
-    ui_fw_set_status(ok ? "ESP32 updated OK - restarting..." : msg);
-
     if (ok) {
-        // Success reboots into the new image. Do NOT paint the popup now (it
-        // would render mid-reboot and glitch the first boot frame); stash the
-        // result and let the freshly-booted firmware show it once the display
-        // has settled (see the boot-popup logic in loop()).
+        // Success reboots into the new image. Show 100% briefly, then stash the
+        // result and let the freshly-booted firmware show the completion popup
+        // once the display has settled (see the boot-popup logic in loop()).
+        show_firmware_progress("ESP32", 100, "Update complete - restarting...");
         armBootFirmwarePopup(true, "ESP32", msg);
         delay(200);
         ESP.restart();  // never returns
     }
-    // Failure path stays in the running app (no reboot): show the popup right
-    // away so the operator can read the error and retry. This is normal
-    // operation, so it is NOT deferred.
+    // Failure path stays in the running app (no reboot): tear down the progress
+    // modal and show the result popup right away so the operator can read the
+    // error and retry. This is normal operation, so it is NOT deferred.
+    hide_firmware_progress();
     show_firmware_result_popup(false, msg, "ESP32");
     ota_in_progress = false;
     return ok;
@@ -3717,10 +3613,7 @@ static void stm32RestoreAppLink() {
 // flashSTM32FromSD() owns the completion popup and the (always-performed)
 // reboot.
 static bool stm32FlashFromSD(char* msg, size_t msgn) {
-    ui_fw_show_progress(true);
-    ui_fw_set_progress(0);
-    ui_fw_set_status("STM32: checking SD card...");
-    lv_refr_now(NULL);
+    show_firmware_progress("STM32", 0, "Checking SD card...");
 
     size_t fw_size = 0;
     if (!sdFileExists(SD_STM32_FW_PATH, &fw_size)) {
@@ -3740,8 +3633,7 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     }
 
     // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
-    ui_fw_set_status("STM32: requesting bootloader...");
-    lv_refr_now(NULL);
+    show_firmware_progress("STM32", 0, "Requesting bootloader...");
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
     // is still open, then give the STM32 time to reboot into system memory
     // before we switch the ESP32 UART to AN3155 bootloader settings.
@@ -3765,15 +3657,13 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             Serial.printf("[STM] product ID = 0x%03X%s\n", id,
                           (id == 0x469) ? " (G474 OK)" : "");
 
-        ui_fw_set_status("STM32: erasing flash...");
-        lv_refr_now(NULL);
+        show_firmware_progress("STM32", 0, "Erasing flash...");
         if (!stmMassErase()) {
             err = "STM32 mass-erase failed";
             break;
         }
 
-        ui_fw_set_status("STM32: writing firmware...");
-        lv_refr_now(NULL);
+        show_firmware_progress("STM32", 0, "Writing firmware...");
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
         uint8_t buf[256];
@@ -3793,13 +3683,13 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             done += r;
             unsigned pct = (unsigned)((done * 100ULL) / fw_size);
             if (pct > 100) pct = 100;
-            ui_fw_set_progress(pct);
+            show_firmware_progress("STM32", (int)pct, "Writing firmware...");
         }
         if (werr) {
             err = "STM32 write failed";
             break;
         }
-        ui_fw_set_progress(100);
+        show_firmware_progress("STM32", 100, "Verifying...");
         ok = true;
     } while (0);
 
@@ -3808,9 +3698,9 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // Launch the freshly written application with the AN3155 "Go" command
     // (there is no NRST line to pulse in the software-bootloader approach),
     // then restore the normal 2 Mbaud 8N1 application link settings.
-    ui_fw_set_status(ok ? "STM32: launching new firmware..."
-                        : (err ? err : "STM32 update failed"));
-    lv_refr_now(NULL);
+    show_firmware_progress("STM32", 100,
+                           ok ? "Launching new firmware..."
+                              : (err ? err : "STM32 update failed"));
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
@@ -3828,12 +3718,12 @@ static bool flashSTM32FromSD() {
     char msg[128] = {0};
     bool ok = stm32FlashFromSD(msg, sizeof(msg));
 
-    ui_fw_show_progress(false);
     // Touch (GPIO19/20) was never disturbed, but the STM32 link was reopened at
     // bootloader settings and the STM32 just rebooted into the (new) app. We
     // always reboot the ESP32 so both sides start from a clean, re-synced link.
-    ui_fw_set_status(ok ? "STM32 updated OK - restarting..."
-                        : "STM32 update failed - restarting...");
+    show_firmware_progress("STM32", 100,
+                           ok ? "Update complete - restarting..."
+                              : "Update failed - restarting...");
 
     // The STM32 flow always reboots the ESP32 (to re-sync the app link). Defer
     // the result popup to the next boot rather than painting it now: showing it
@@ -4109,30 +3999,23 @@ void loop() {
     // --- Normal UI servicing (only when NOT doing OTA) ---
     lv_timer_handler();
 
-    // --- Post-boot display drift recovery -----------------------------------
-    // The flash-heavy early-boot window (NVS reads + WiFi RF-calibration loads)
-    // can briefly starve the non-IRAM-safe RGB refill ISR and leave the panel
-    // scan-out drifted ("image shifted / spilling off the edge" on a plain
-    // reboot). Re-align the panel a few times over the first ~9 s, after that
-    // activity settles, so the picture self-corrects WITHOUT a power cycle.
-    {
-        static uint8_t boot_resync_idx = 0;
-        static const uint32_t kBootResyncDelaysMs[] = {2000, 5000, 9000};
-        if (boot_resync_idx < 3 && setup_done_ms > 0 &&
-            (now_ms - setup_done_ms) >= kBootResyncDelaysMs[boot_resync_idx]) {
-            resyncDisplayPanel("post-boot");
-            boot_resync_idx++;
-        }
-    }
+    // --- Post-boot display drift recovery (REMOVED) -------------------------
+    // Previously the panel was re-aligned 3x over the first ~9 s (at 2/5/9 s) to
+    // recover from the scan-out "drift" caused by the non-IRAM-safe RGB refill
+    // ISR being starved during the flash-heavy early boot (NVS + WiFi RF cal).
+    // That root cause is now fixed: the firmware executes from PSRAM (XIP) with
+    // an IRAM-safe refill path, so the panel no longer drifts on boot. The three
+    // periodic resyncs were therefore redundant and each caused a brief visible
+    // flicker, so they have been removed for a clean, flicker-free startup. The
+    // resyncDisplayPanel() helper is retained for manual recovery if ever needed.
 
     // --- Deferred firmware-update completion popup --------------------------
     // A firmware update that rebooted the ESP32 stashed its result in RTC
-    // memory; setup() latched it into boot_fw_popup_pending. Show it ONCE, only
-    // after the display has had ~1 s to fully re-stabilize post-boot (the
-    // framebuffer clear + dual DMA restart already ran in setup(), and the first
-    // drift re-sync above has fired by now). Showing it any earlier produced a
-    // brief glitchy frame. This is gated to the boot window and runs at most
-    // once per boot, so it never interferes with updates while already running.
+    // memory; setup() latched it into boot_fw_popup_pending. Show it ONCE, after
+    // a short settle (FW_BOOT_POPUP_DELAY_MS, now 300ms) post-boot — the
+    // framebuffer clear + dual DMA restart already ran in setup() and the panel
+    // is solid from the first frame (XIP). This is gated to the boot window and
+    // runs at most once per boot, so it never interferes with a running update.
     if (boot_fw_popup_pending && setup_done_ms > 0 &&
         (now_ms - setup_done_ms) >= FW_BOOT_POPUP_DELAY_MS) {
         boot_fw_popup_pending = false;  // one-shot
