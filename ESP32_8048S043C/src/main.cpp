@@ -3615,7 +3615,7 @@ static IRAM_ATTR bool stmSync() {
                 "[STM32-BOOT] sync OK (NACK = already initialised)");
             return true;
         }
-        delay(50);
+        delay(200);  // give the ROM bootloader more time between sync attempts
     }
     Serial.printf("[STM32-BOOT] No response after %d attempts\n", kAttempts);
     Serial.printf("[STM32-BOOT] RX bytes available: %d\n",
@@ -3773,11 +3773,17 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
     STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
-    delay(50);  // let the reopened UART settle before the first 0x7F
+    // The STM32 ROM bootloader needs plenty of settling time after the reset
+    // before it is ready to auto-baud from the first 0x7F. Sending it too early
+    // is the #1 cause of "bootloader did not respond". Wait generously:
+    //   500 ms after the UART reconfigure + 500 ms after draining the RX
+    //   buffer = 1000 ms total before the first sync attempt.
+    delay(500);  // let the reopened UART + ROM bootloader fully settle
     int pre_drained = stmDrainRx();
     Serial.printf("[STM32-BOOT] UART configured, draining RX buffer... "
                   "(%d byte%s discarded)\n",
                   pre_drained, pre_drained == 1 ? "" : "s");
+    delay(500);  // additional settle after draining RX, before first 0x7F
 
     bool ok = false;
     const char* err = nullptr;
