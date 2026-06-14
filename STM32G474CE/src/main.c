@@ -4597,16 +4597,45 @@ static void jumpToBootloader(void) {
  * The reset also stops the software-mode IWDG; the early-boot check in main()
  * then detects the flag and calls jumpToBootloader(). This does NOT return. */
 static void requestBootloaderReset(void) {
-    uartSend("DBG,setting bootloader flag in TAMP->BKP0R");
+    char dbg[80];
+
+    uartSend("DBG,Setting TAMP register...");
+
+    /* Unlock the backup domain (PWR + RTC/TAMP APB clock + DBP) so the backup
+     * register is actually writable. Without this the write is silently
+     * ignored and the magic never survives the reset. */
     bootloaderEnableBackupAccess();
+
+    /* Write the magic sentinel and force the store to complete. */
     BOOTLOADER_FLAG_REG = BOOTLOADER_REQUEST_MAGIC;
     __DSB();
-    uartSend("DBG,flag set -> NVIC_SystemReset() now");
-    HAL_Delay(20);  /* let the debug line flush before the reset */
+
+    /* Read the register straight back to prove the write actually stuck. If
+     * this does NOT show 0xB00710AD then the backup domain is still locked or
+     * the wrong register is being used. */
+    snprintf(dbg, sizeof(dbg), "DBG,TAMP register set to 0x%08lX",
+             (unsigned long)BOOTLOADER_FLAG_REG);
+    uartSend(dbg);
+
+    snprintf(dbg, sizeof(dbg), "DBG,Expected magic    = 0x%08lX",
+             (unsigned long)BOOTLOADER_REQUEST_MAGIC);
+    uartSend(dbg);
+
+    uartSend("DBG,Calling NVIC_SystemReset()...");
+    HAL_Delay(30);  /* let the debug lines flush out of the UART before reset */
+
     NVIC_SystemReset();
+
+    /* If we are still alive here the reset did NOT take effect. */
+    uartSend("DBG,ERROR: NVIC_SystemReset() returned - reset FAILED!");
     while (1) {
     }
 }
+
+/* Boot-time snapshot of the TAMP backup register, captured before it is
+ * cleared. Emitted over UART once the UART is initialised so the host can see
+ * exactly what value survived the reset on a normal (no-magic) boot. */
+static uint32_t g_boot_tamp_value = 0;
 
 int main(void) {
     HAL_Init();
@@ -4617,9 +4646,29 @@ int main(void) {
      * the clocks/peripherals are configured and BEFORE MX_IWDG_Init() re-arms the
      * watchdog - clear the flag, and jump straight into the ROM bootloader. */
     bootloaderEnableBackupAccess();
-    if (BOOTLOADER_FLAG_REG == BOOTLOADER_REQUEST_MAGIC) {
+    g_boot_tamp_value = BOOTLOADER_FLAG_REG;   /* snapshot for later logging */
+    if (g_boot_tamp_value == BOOTLOADER_REQUEST_MAGIC) {
         BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear so we boot normally next time */
         __DSB();
+
+        /* Bring up just enough (clock + GPIO + UART) to emit the boot debug
+         * lines BEFORE jumping. jumpToBootloader() fully de-inits the clocks
+         * and peripherals afterwards, so the ROM bootloader still starts from a
+         * clean state. This happens before MX_IWDG_Init(), so the watchdog is
+         * not yet armed and these few extra milliseconds are safe. */
+        SystemClock_Config();
+        SystemCoreClockUpdate();
+        HAL_InitTick(TICK_INT_PRIORITY);
+        MX_GPIO_Init();
+        MX_USART1_UART_Init();
+
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "DBG,Boot: TAMP register = 0x%08lX",
+                 (unsigned long)g_boot_tamp_value);
+        uartSend(dbg);
+        uartSend("DBG,Boot: Magic match - jumping to bootloader!");
+        HAL_Delay(30);             /* flush the UART before tearing down clocks */
+
         jumpToBootloader();        /* does not return */
     }
 
@@ -4648,6 +4697,17 @@ int main(void) {
 
     MX_I2C1_Init(); /* I2C1 for INA226 sensors – graceful, no hang */
     MX_USART1_UART_Init();
+
+    /* Report the boot-time TAMP value now that the UART is up. On a normal
+     * power-on this should be 0x00000000 (no bootloader request). If it shows
+     * the magic 0xB00710AD here it means the early-boot jump was skipped. */
+    {
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "DBG,Boot: TAMP register = 0x%08lX",
+                 (unsigned long)g_boot_tamp_value);
+        uartSend(dbg);
+        uartSend("DBG,Boot: No magic - normal boot");
+    }
 
     persistent_defaults(&g_persistent_settings);
     flash_settings_init();
