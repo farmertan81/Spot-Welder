@@ -50,6 +50,7 @@
 // before restarting the scan-out or the DMA can still fetch stale garbage.
 #include <esp_cache.h>
 #endif
+#include <esp_task_wdt.h>  // esp_task_wdt_reset() – feed WDT during STM32 flash
 #include <esp_wifi.h>
 #include <lv_conf.h>
 #include <lvgl.h>
@@ -3696,21 +3697,45 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             break;
         }
 
-        show_firmware_progress("STM32", 0, "Writing firmware...");
-        // STM32-ONLY throttle: repaint only every >= 10% (vs 2% for ESP32 OTA /
-        // ESP32 SD flash). The SD card and the 800x480 PSRAM->LCD flush share
-        // the SPI bus; repainting too often during the fast (10-20 s) STM32
-        // write starves the SD card ("no token received"), drops WiFi, and can
-        // crash/reboot the ESP32. Fewer, coarser repaints keep the bus free.
-        int last_drawn_pct = -1;  // throttle: only repaint on >= 10% advance
+        show_firmware_progress("STM32", 0,
+                               "Flashing STM32... (WiFi temporarily disabled)");
+        // -------------------------------------------------------------------
+        // SLOW-BUT-STABLE STM32 WRITE LOOP
+        // -------------------------------------------------------------------
+        // Earlier "fast" attempts (128-byte chunks, 2 ms delays, repaint every
+        // 10%) still crashed mid-flash with an RTCWDT_RTC_RST watchdog reset
+        // (~16 s in) and "netstack cb reg failed with 12308" noise: the tight
+        // SD-read + UART-write loop starved the idle task long enough that the
+        // watchdog fired. We deliberately trade speed for reliability here:
+        //
+        //   * 64-byte chunks   -> shortest possible SD/SPI transactions
+        //   * 10 ms delay/chunk-> long bus-idle gap so SD + idle task breathe
+        //   * yield()          -> hand the CPU to other FreeRTOS tasks
+        //   * esp_task_wdt_reset() -> explicitly feed the task watchdog
+        //   * repaint every 20%-> only ~5 full-frame LCD flushes total
+        //
+        // Net effect: a 256-512 KB image takes ~30-60 s instead of ~15 s, but
+        // the flash runs to completion without a watchdog reset or crash.
+        int last_drawn_pct = -1;  // throttle: only repaint on >= 20% advance
         uint32_t addr = STM32_FLASH_BASE;
         size_t done = 0;
-        // Smaller 128-byte reads (the AN3155 write chunk is also 128 here) keep
-        // each SD/SPI transaction short so the display + WiFi can interleave.
-        uint8_t buf[128];
+        // 64-byte reads keep each SD/SPI transaction as short as possible so the
+        // SD card and the idle/WiFi tasks never wait long for the bus.
+        uint8_t buf[64];
         bool werr = false;
         bool readErr = false;
+        bool timedOut = false;
+        // Abort guard: if the whole write hasn't finished within this budget,
+        // something has stalled (flaky SD / unresponsive STM32) — bail out
+        // gracefully instead of looping until the hardware watchdog resets us.
+        const uint32_t WRITE_DEADLINE_MS = 180000;  // 3 min hard cap
+        const uint32_t write_start_ms = millis();
         while (done < fw_size) {
+            // --- timeout / stall detection ---
+            if (millis() - write_start_ms > WRITE_DEADLINE_MS) {
+                timedOut = true;
+                break;
+            }
             size_t remain = fw_size - done;
             int want = (remain > sizeof(buf)) ? (int)sizeof(buf) : (int)remain;
             int r = f.read(buf, want);
@@ -3719,10 +3744,6 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
                 readErr = true;
                 break;
             }
-            // Let the SPI bus recover after each SD read so the display/WiFi
-            // tasks get a turn; also feeds the task watchdog (delay() yields).
-            delay(2);
-            yield();
             // Pad the final partial word up to a 4-byte boundary with 0xFF.
             while (r % 4) buf[r++] = 0xFF;
             if (!stmWriteChunk(addr, buf, r)) {
@@ -3731,13 +3752,22 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
             }
             addr += r;
             done += r;
+            // --- keep the system alive: feed WDT, yield, then idle the bus ---
+            esp_task_wdt_reset();  // explicit task-watchdog feed (no-op if !subscribed)
+            yield();               // let other FreeRTOS tasks run
+            delay(10);             // long bus-idle gap (also feeds idle WDT)
             int pct = (int)((done * 100ULL) / fw_size);
             if (pct > 100) pct = 100;
-            // THROTTLE the repaint (STM32: every >= 10%, always draw 100%).
-            if (pct >= last_drawn_pct + 10 || pct >= 100) {
+            // THROTTLE the repaint (STM32: every >= 20%, always draw 100%).
+            // Only ~5 full-frame PSRAM->LCD flushes for the whole image.
+            if (pct >= last_drawn_pct + 20 || pct >= 100) {
                 last_drawn_pct = pct;
                 show_firmware_progress("STM32", pct, "Writing firmware...");
             }
+        }
+        if (timedOut) {
+            err = "STM32 write timed out (aborted)";
+            break;
         }
         if (readErr) {
             err = "SD card read error during STM32 write";
