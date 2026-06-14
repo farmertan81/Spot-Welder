@@ -3540,8 +3540,40 @@ static IRAM_ATTR bool stmWaitAck(uint32_t timeout_ms) {
     return false;
 }
 
-static IRAM_ATTR void stmDrainRx() {
-    while (STM32Serial.available()) STM32Serial.read();
+// Drain (discard) any pending RX bytes. Returns how many bytes were dropped so
+// the caller can log it during the verbose bootloader handshake.
+static IRAM_ATTR int stmDrainRx() {
+    int n = 0;
+    while (STM32Serial.available()) {
+        STM32Serial.read();
+        n++;
+    }
+    return n;
+}
+
+// Verbose debug helper: read up to `max` bytes currently in the RX buffer and
+// print them as a hex dump. Used when the bootloader handshake fails so we can
+// see whether the STM32 sent ANYTHING (and what). Does not block long: it only
+// waits a short moment for stragglers.
+static void stmDumpRx(const char* tag, int max) {
+    int count = 0;
+    uint32_t t0 = millis();
+    Serial.printf("[STM32-BOOT] %s: ", tag);
+    // Give late bytes ~50 ms to arrive so we capture a full (slow) response.
+    while (count < max && (millis() - t0 < 50)) {
+        if (STM32Serial.available()) {
+            int b = STM32Serial.read();
+            Serial.printf("0x%02X ", b & 0xFF);
+            count++;
+            t0 = millis();  // reset window after each received byte
+        } else {
+            yield();
+        }
+    }
+    if (count == 0)
+        Serial.println("(no bytes)");
+    else
+        Serial.printf("  (%d byte%s)\n", count, count == 1 ? "" : "s");
 }
 
 // Send command byte + its complement, wait for ACK.
@@ -3553,23 +3585,42 @@ static IRAM_ATTR bool stmSendCmd(uint8_t cmd) {
 }
 
 // Bootloader auto-baud handshake: send 0x7F until the device answers.
+// Verbose per-attempt logging so we can see exactly what (if anything) the
+// STM32 ROM bootloader is sending back.
 static IRAM_ATTR bool stmSync() {
-    for (int i = 0; i < 8; i++) {
-        stmDrainRx();
+    const int kAttempts = 10;
+    for (int i = 0; i < kAttempts; i++) {
+        int drained = stmDrainRx();
+        if (drained > 0)
+            Serial.printf("[STM32-BOOT] (drained %d stale byte%s before sync)\n",
+                          drained, drained == 1 ? "" : "s");
+        Serial.printf("[STM32-BOOT] Sync attempt %d/%d: sending 0x7F...\n",
+                      i + 1, kAttempts);
         STM32Serial.write(STM_INIT);
         STM32Serial.flush();
+        Serial.println("[STM32-BOOT] Waiting for ACK (0x79)...");
         int b = stmReadByte(500);
+        if (b < 0) {
+            Serial.println("[STM32-BOOT] Received: (timeout, no byte)");
+        } else {
+            Serial.printf("[STM32-BOOT] Received: 0x%02X\n", b & 0xFF);
+        }
         if (b == STM_ACK) {
-            Serial.println("[STM] sync OK (ACK)");
+            Serial.println("[STM32-BOOT] sync OK (ACK)");
             return true;
         }
         if (b == STM_NACK) {
             // Already initialised this power cycle -> treat as connected.
-            Serial.println("[STM] sync OK (NACK = already initialised)");
+            Serial.println(
+                "[STM32-BOOT] sync OK (NACK = already initialised)");
             return true;
         }
         delay(50);
     }
+    Serial.printf("[STM32-BOOT] No response after %d attempts\n", kAttempts);
+    Serial.printf("[STM32-BOOT] RX bytes available: %d\n",
+                  STM32Serial.available());
+    stmDumpRx("Dumping RX buffer", 64);
     return false;
 }
 
@@ -3699,8 +3750,15 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
     // is still open, then give the STM32 time to reboot into system memory
     // before we switch the ESP32 UART to AN3155 bootloader settings.
+    Serial.println("[STM32-BOOT] Sending BOOTLOADER command at 2Mbaud...");
     sendBootloaderCommand();
+    Serial.println("[STM32-BOOT] Command sent, waiting for STM32 reset...");
     delay(100);  // let the STM32 receive + ACK the command over the 2 Mbaud link
+
+    // Capture whatever the STM32 app replied over the 2 Mbaud link (it should
+    // echo "ACK,BOOTLOADER" before it resets). Seeing this confirms the command
+    // was received and the app is about to jump to its ROM bootloader.
+    stmDumpRx("App-link reply to BOOTLOADER cmd", 32);
 
     // The STM32 app acknowledges, waits ~50 ms, then issues NVIC_SystemReset()
     // and reboots into its ROM bootloader. The reset itself plus the ROM
@@ -3710,11 +3768,16 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // cause of "bootloader did not respond".
     delay(200);  // wait for the STM32 reset + ROM bootloader entry
 
+    Serial.println("[STM32-BOOT] Switching UART to 115200 8E1...");
     STM32Serial.end();
     // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
     STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
     delay(50);  // let the reopened UART settle before the first 0x7F
+    int pre_drained = stmDrainRx();
+    Serial.printf("[STM32-BOOT] UART configured, draining RX buffer... "
+                  "(%d byte%s discarded)\n",
+                  pre_drained, pre_drained == 1 ? "" : "s");
 
     bool ok = false;
     const char* err = nullptr;
