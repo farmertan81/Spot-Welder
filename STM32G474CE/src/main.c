@@ -4103,18 +4103,28 @@ static void parseCommand(char* line) {
     }
 
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
-     * can flash a new image over UART (AN3155) without the BOOT0/RESET lines.
-     * Accept both the bare and CMD-prefixed forms. We acknowledge first, give
-     * the UART time to drain the ACK, then request a bootloader reset (which
-     * does not return - the early-boot check in main() performs the jump). */
+     * can flash a new image over UART (AN3155).
+     *
+     * HARDWARE BOOT0 ENTRY (reliable on STM32G4):
+     * The software jump-to-system-memory approach (jumpToBootloader()) does NOT
+     * bring up a USART-responsive ROM bootloader on the G4 - the ROM expects to
+     * start from a true power-on reset with BOOT0 asserted, not a warm jump from
+     * a running app. So instead we rely on the ESP32 holding the STM32 BOOT0 pin
+     * (PB8) HIGH over a dedicated control wire, then we issue a clean
+     * NVIC_SystemReset(). On the ensuing reset the chip samples BOOT0=1 and the
+     * factory ROM bootloader starts exactly as it would with a hardware reset -
+     * fully USART-responsive. The ESP32 drops BOOT0 LOW again after flashing so
+     * the next reset boots the application. Accept both the bare and
+     * CMD-prefixed command forms. */
     if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
-        uartSend("DBG,BOOTLOADER command received -> entering ROM bootloader");
+        uartSend("DBG,BOOTLOADER command received -> resetting into ROM "
+                 "bootloader (BOOT0 held high by ESP32)");
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
-        uartSend("DBG,About to call jumpToBootloader() (direct, no reset)");
-        HAL_Delay(100);             /* give the UART time to send before the call */
-        jumpToBootloader();         /* DIRECT jump - does not return, no reset */
+        uartSend("DBG,Resetting now (hardware BOOT0 entry)");
+        HAL_Delay(100);             /* give the UART time to send before reset */
+        NVIC_SystemReset();         /* clean reset; BOOT0=high -> ROM bootloader */
         return;
     }
 

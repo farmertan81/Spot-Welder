@@ -85,6 +85,25 @@
 #define STM32_TO_ESP32_PIN 17  // ESP RX  <- STM32 TX
 #define ESP32_TO_STM32_PIN 18  // ESP TX  -> STM32 RX
 
+// -------------------------------------------------------------------------
+// STM32 BOOT0 control wire (HARDWARE bootloader entry)
+// -------------------------------------------------------------------------
+// The software jump-to-system-memory trick does NOT bring up a USART-
+// responsive ROM bootloader on the STM32G4 (the ROM wants a real reset with
+// BOOT0 asserted). So we drive the STM32 BOOT0 pin (PB8) directly: pull it
+// HIGH, ask the STM32 app to NVIC_SystemReset(), and on the ensuing reset the
+// chip samples BOOT0=1 and starts the factory ROM bootloader exactly as a
+// hardware reset would - fully responsive on USART1 (PA9/PA10) at 8E1. After
+// flashing we drop BOOT0 LOW so the next reset (AN3155 "Go") boots the new app.
+//
+// GPIO38 is the chosen control line: it is the only ESP32-S3 GPIO on this board
+// that is NOT consumed by the RGB LCD (1-9,14-16,21,39-42,45-48), the GT911
+// touch I2C (19/20), the STM32 UART (17/18), the microSD SPI bus (10-13), the
+// USB-serial debug UART0 (43/44), the BOOT button (0) or the flash/PSRAM
+// (26-37). Wire ESP32 GPIO38 -> STM32 PB8 (BOOT0). If your board breaks out a
+// different free pin, change ONLY this define.
+#define STM32_BOOT0_PIN 38     // ESP TX -> STM32 PB8 (BOOT0)
+
 // Touch I2C (I2C_NUM_0) – managed by smartdisplay, DO NOT use Wire
 #define TOUCH_SDA 19
 #define TOUCH_SCL 20
@@ -3813,10 +3832,19 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
-    // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
+    // --- Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader --
+    // The STM32 samples BOOT0 (PB8) only at reset. Drive it HIGH now, BEFORE we
+    // ask the app to reset, and hold it for the whole flash. With BOOT0=1 the
+    // reset enters the factory ROM bootloader (hardware entry) instead of the
+    // app - this is the reliable path the software jump could not achieve.
+    Serial.printf("[STM32-BOOT] Asserting BOOT0 HIGH (GPIO%d)\n", STM32_BOOT0_PIN);
+    digitalWrite(STM32_BOOT0_PIN, HIGH);
+    delay(20);   // let the line settle before triggering the reset
+
+    // --- Ask the STM32 app to reset into its ROM bootloader --------------------
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
-    // is still open, then give the STM32 time to reboot into system memory
-    // before we switch the ESP32 UART to AN3155 bootloader settings.
+    // is still open. The app ACKs and issues NVIC_SystemReset(); because BOOT0 is
+    // held HIGH the chip comes back up in the ROM bootloader, not the app.
     Serial.println("[STM32-BOOT] Sending BOOTLOADER command at 2Mbaud...");
     sendBootloaderCommand();
     Serial.println("[STM32-BOOT] Command sent, waiting for STM32 reset...");
@@ -3962,11 +3990,19 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     f.close();
 
+    // --- Release BOOT0 (drive LOW) so the STM32 runs the app from now on ------
+    // Done unconditionally (success OR failure) before we relaunch: with BOOT0
+    // back LOW, the AN3155 "Go" below and every future STM32 reset boot the
+    // application, not the bootloader.
+    Serial.printf("[STM32-BOOT] Releasing BOOT0 LOW (GPIO%d)\n", STM32_BOOT0_PIN);
+    digitalWrite(STM32_BOOT0_PIN, LOW);
+    delay(20);
+
     if (ok) show_firmware_progress("STM32", 98, "Launching...");
 
-    // Launch the freshly written application with the AN3155 "Go" command
-    // (there is no NRST line to pulse in the software-bootloader approach),
-    // then restore the normal 2 Mbaud 8N1 application link settings.
+    // Launch the freshly written application with the AN3155 "Go" command, then
+    // restore the normal 2 Mbaud 8N1 application link settings. (BOOT0 is now
+    // LOW, so even if the chip resets instead of taking the Go, it boots the app.)
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
@@ -4053,6 +4089,15 @@ void setup() {
     STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
     Serial.println("✅ STM32 UART bridge ready (Serial2 @ 2000000)");
+
+    // --- STM32 BOOT0 control line ---
+    // Hold BOOT0 LOW in normal operation so every reset boots the STM32 app.
+    // It is driven HIGH only momentarily during a firmware flash (see
+    // stm32FlashFromSD) to force the chip into its ROM bootloader on reset.
+    pinMode(STM32_BOOT0_PIN, OUTPUT);
+    digitalWrite(STM32_BOOT0_PIN, LOW);
+    Serial.printf("✅ STM32 BOOT0 control on GPIO%d (held LOW = run app)\n",
+                  STM32_BOOT0_PIN);
 
     // --- Front button ---
     pinMode(BUTTON_PIN, INPUT_PULLUP);
