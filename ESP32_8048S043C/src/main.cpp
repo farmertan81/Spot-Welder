@@ -3650,6 +3650,21 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
         return false;
     }
 
+    // --- Disable WiFi for the duration of the STM32 flash ---------------------
+    // The SD card, STM32 UART, the 800x480 RGB display and the WiFi radio all
+    // contend for the SoC/SPI bus. With WiFi active this contention starves the
+    // SD card and crashes the ESP32 (~14 s into the write, with a WiFi
+    // disconnect "reason 8" logged right before the crash). The STM32 flash is
+    // fast (10-20 s), so we shut the radio down for the duration to remove the
+    // contention entirely, then reconnect afterwards. We remember whether WiFi
+    // was connected so we only reconnect if it actually was.
+    bool wifi_was_connected = (WiFi.status() == WL_CONNECTED);
+    show_firmware_progress("STM32", 0,
+                           "Flashing STM32... (WiFi temporarily disabled)");
+    WiFi.disconnect(true);  // drop association AND power down the radio
+    WiFi.mode(WIFI_OFF);
+    delay(100);             // let WiFi cleanly shut down before we hit the bus
+
     // --- Ask the STM32 app to jump to its ROM bootloader (software trigger) --
     show_firmware_progress("STM32", 0, "Requesting bootloader...");
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
@@ -3750,6 +3765,17 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
                               : (err ? err : "STM32 update failed"));
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
+
+    // --- Re-enable WiFi now that the bus-heavy flash is done ------------------
+    // Only reconnect if WiFi was up before we started. startStaConnect() puts
+    // the radio back into STA mode and kicks off the association; it finishes in
+    // the background (the wrapper reboots the ESP32 shortly after, which also
+    // re-establishes a clean link, so this mainly keeps the radio sane in the
+    // interim and covers any future non-rebooting caller).
+    if (wifi_was_connected && wifi_ssid.length() > 0) {
+        show_firmware_progress("STM32", 100, "Reconnecting WiFi...");
+        startStaConnect();
+    }
 
     snprintf(msg, msgn, "%s",
              ok ? "STM32 firmware updated successfully. Restarting..."
