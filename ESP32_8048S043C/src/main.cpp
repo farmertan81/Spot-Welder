@@ -3700,12 +3700,21 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // is still open, then give the STM32 time to reboot into system memory
     // before we switch the ESP32 UART to AN3155 bootloader settings.
     sendBootloaderCommand();
-    delay(100);  // STM32 resets into the ROM bootloader
+    delay(100);  // let the STM32 receive + ACK the command over the 2 Mbaud link
+
+    // The STM32 app acknowledges, waits ~50 ms, then issues NVIC_SystemReset()
+    // and reboots into its ROM bootloader. The reset itself plus the ROM
+    // start-up must FULLY complete before we switch the ESP32 UART and start the
+    // 0x7F auto-baud, otherwise the very first sync bytes are lost while the MCU
+    // is still resetting. Wait generously here - this is the single most common
+    // cause of "bootloader did not respond".
+    delay(200);  // wait for the STM32 reset + ROM bootloader entry
+
     STM32Serial.end();
     // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
     STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
-    delay(20);
+    delay(50);  // let the reopened UART settle before the first 0x7F
 
     bool ok = false;
     const char* err = nullptr;
