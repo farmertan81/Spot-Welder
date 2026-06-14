@@ -50,6 +50,22 @@ PANEL_SRC = os.path.join(
 # Markers
 INCLUDE_ANCHOR = "#include <esp_lcd_panel_ops.h>\n"
 INCLUDE_LINE = "#include <esp_idf_version.h>  // [patched] for ESP_IDF_VERSION guard below\n"
+# IRAM_ATTR lives in esp_attr.h. It is normally pulled in transitively by the
+# esp_lcd headers, but include it explicitly so the IRAM_ATTR patch below never
+# fails to compile if the transitive include ever changes.
+ATTR_INCLUDE_LINE = "#include <esp_attr.h>          // [patched] for IRAM_ATTR on the frame-done callback\n"
+
+# --- IRAM-safe frame-done callback (fixes the XIP boot loop) ---------------
+# When CONFIG_LCD_RGB_ISR_IRAM_SAFE=y (enabled together with XIP-from-PSRAM in
+# platformio.ini), esp_lcd_rgb_panel_register_event_callbacks() VALIDATES that
+# the on_color_trans_done callback pointer resides in IRAM. The smartdisplay
+# driver defines direct_io_frame_trans_done() in flash, so that check fails,
+# ESP_ERROR_CHECK() aborts, and the board boot-loops with:
+#   "on_color_trans_done callback not in IRAM"
+# Marking the callback IRAM_ATTR places it in internal RAM so registration
+# succeeds and the ISR can also run while the flash cache is disabled.
+IRAM_CB_OLD = "bool direct_io_frame_trans_done("
+IRAM_CB_NEW = "bool IRAM_ATTR direct_io_frame_trans_done("
 
 # Fix 1 is wrapped in an IDF>=5.0 guard (the field does not exist on IDF 4.4).
 BOUNCE_BLOCK = (
@@ -123,6 +139,23 @@ def patch_panel(*args, **kwargs):
     # --- ensure esp_idf_version.h is included --------------------------------
     if "esp_idf_version.h" not in src and INCLUDE_ANCHOR in src:
         src = src.replace(INCLUDE_ANCHOR, INCLUDE_ANCHOR + INCLUDE_LINE, 1)
+
+    # --- ensure esp_attr.h is included (for IRAM_ATTR) -----------------------
+    if "esp_attr.h" not in src and INCLUDE_ANCHOR in src:
+        src = src.replace(INCLUDE_ANCHOR, INCLUDE_ANCHOR + ATTR_INCLUDE_LINE, 1)
+        changed.append("added #include <esp_attr.h> for IRAM_ATTR")
+
+    # --- Fix 0: IRAM_ATTR on the frame-done callback (XIP boot-loop fix) ------
+    # Matches ONLY the function definition ("bool direct_io_frame_trans_done(")
+    # not the two references to it (the IDF4 config field and the IDF5 cast),
+    # because neither reference is preceded by the "bool " return type.
+    if IRAM_CB_NEW in src:
+        changed.append("Fix0 IRAM_ATTR on frame-done callback already present (skipped)")
+    elif IRAM_CB_OLD in src:
+        src = src.replace(IRAM_CB_OLD, IRAM_CB_NEW, 1)
+        changed.append("Fix0 added IRAM_ATTR to direct_io_frame_trans_done (fixes 'callback not in IRAM' boot loop)")
+    else:
+        print("[patch_display] WARNING: could not find direct_io_frame_trans_done definition for IRAM_ATTR patch")
 
     # --- Fix 1: bounce buffer (IDF>=5.0, guarded) ----------------------------
     if "bounce_buffer_size_px" not in src:
