@@ -32,6 +32,7 @@
 #include <WiFi.h>
 #include <esp32_smartdisplay.h>
 #include <driver/i2c.h>  // raw GT911 register access for touch-sensitivity
+#include <driver/uart.h>  // low-level ESP-IDF UART for STM32 bootloader (8E1 parity)
 #if defined(DISPLAY_ST7262_PAR)
 // RGB-panel runtime controls used for the display-drift / OTA-glitch fix:
 //   esp_lcd_rgb_panel_set_pclk()  -> slow the pixel clock during OTA so the
@@ -3510,21 +3511,57 @@ static const uint8_t STM_NACK = 0x1F;
 static const uint8_t STM_INIT = 0x7F;
 #define STM32_FLASH_BASE 0x08000000UL
 
-// Read one byte with timeout (ms). Returns -1 on timeout.
+// ===========================================================================
+// LOW-LEVEL ESP-IDF UART I/O FOR BOOTLOADER MODE ONLY (UART_NUM_2, 115200 8E1)
+// ===========================================================================
+// Why ESP-IDF instead of Arduino HardwareSerial here:
+//   The Arduino HardwareSerial (Serial2 / STM32Serial) wrapper did NOT reliably
+//   transmit EVEN-parity bytes to the STM32 ROM bootloader, so the AN3155 0x7F
+//   auto-baud + every command failed even though the STM32 was correctly sitting
+//   in its ROM bootloader. The ESP-IDF uart driver lets us set UART_PARITY_EVEN
+//   explicitly and feed bytes through the hardware FIFO + driver ISR + ring
+//   buffer, which produces correct 8E1 framing. We use ESP-IDF ONLY for the
+//   bootloader handshake/flash; the normal 2 Mbaud 8N1 application link still
+//   uses Arduino STM32Serial. stm32FlashFromSD() installs the ESP-IDF driver on
+//   UART_NUM_2 (after STM32Serial.end()) and stm32RestoreAppLink() removes it
+//   and hands UART2 back to Arduino.
+//
+// The ESP-IDF UART number that maps to Arduino Serial2 / STM32Serial.
+#define STM_BOOT_UART UART_NUM_2
+
+// Write a buffer of bytes to the bootloader UART.
+static IRAM_ATTR void stmWrite(const uint8_t* data, size_t len) {
+    uart_write_bytes(STM_BOOT_UART, (const char*)data, len);
+}
+
+// Write a single byte to the bootloader UART.
+static IRAM_ATTR void stmWriteByte(uint8_t b) {
+    uart_write_bytes(STM_BOOT_UART, (const char*)&b, 1);
+}
+
+// Block until the bootloader UART TX FIFO has fully drained (replaces .flush()).
+static IRAM_ATTR void stmFlushTx() {
+    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(1000));
+}
+
+// How many bytes are waiting in the bootloader UART RX ring buffer.
+static IRAM_ATTR int stmRxAvailable() {
+    size_t len = 0;
+    uart_get_buffered_data_len(STM_BOOT_UART, &len);
+    return (int)len;
+}
+
+// Read one byte with timeout (ms). Returns -1 on timeout. Uses the ESP-IDF
+// driver's blocking read, which yields to other FreeRTOS tasks while waiting.
 // NOTE on IRAM_ATTR (applies to every AN3155 helper below + stm32FlashFromSD):
 // the build runs code from PSRAM (CONFIG_SPIRAM_XIP_FROM_PSRAM). PSRAM fetches
-// are slower and can stall under bus contention, which delayed the UART2 RX path
-// enough to drop the timing-sensitive STM32 ROM-bootloader ACK bytes (handshake
-// failed -> "bootloader did not respond" / mid-write errors). Forcing these
-// functions into fast internal IRAM removes that PSRAM-fetch jitter so the
-// handshake and writes are reliable again.
+// are slower and can stall under bus contention; keeping these helpers in fast
+// internal IRAM removes that jitter. (Byte framing itself is now handled by the
+// ESP-IDF UART hardware FIFO + driver ISR, which is inherently timing-robust.)
 static IRAM_ATTR int stmReadByte(uint32_t timeout_ms) {
-    uint32_t t0 = millis();
-    while (!STM32Serial.available()) {
-        if (millis() - t0 > timeout_ms) return -1;
-        yield();
-    }
-    return STM32Serial.read();
+    uint8_t b;
+    int n = uart_read_bytes(STM_BOOT_UART, &b, 1, pdMS_TO_TICKS(timeout_ms));
+    return (n == 1) ? (int)b : -1;
 }
 
 // Wait for an ACK (0x79). Logs NACK/timeout/unexpected bytes for diagnostics.
@@ -3543,12 +3580,34 @@ static IRAM_ATTR bool stmWaitAck(uint32_t timeout_ms) {
 // Drain (discard) any pending RX bytes. Returns how many bytes were dropped so
 // the caller can log it during the verbose bootloader handshake.
 static IRAM_ATTR int stmDrainRx() {
-    int n = 0;
-    while (STM32Serial.available()) {
-        STM32Serial.read();
-        n++;
+    int n = stmRxAvailable();
+    if (n > 0) {
+        // Discard everything currently buffered on the bootloader UART.
+        uart_flush_input(STM_BOOT_UART);
     }
     return n;
+}
+
+// ESP-IDF variant of the RX hex dump, used inside the bootloader handshake
+// (stmSync) where UART2 is owned by the ESP-IDF driver, not Arduino. Reads up
+// to `max` bytes, giving late/slow bytes ~50 ms each to arrive.
+static void stmDumpRxIDF(const char* tag, int max) {
+    int count = 0;
+    Serial.printf("[STM32-BOOT] %s: ", tag);
+    while (count < max) {
+        uint8_t b;
+        int n = uart_read_bytes(STM_BOOT_UART, &b, 1, pdMS_TO_TICKS(50));
+        if (n == 1) {
+            Serial.printf("0x%02X ", b & 0xFF);
+            count++;
+        } else {
+            break;
+        }
+    }
+    if (count == 0)
+        Serial.println("(no bytes)");
+    else
+        Serial.printf("  (%d byte%s)\n", count, count == 1 ? "" : "s");
 }
 
 // Verbose debug helper: read up to `max` bytes currently in the RX buffer and
@@ -3578,9 +3637,9 @@ static void stmDumpRx(const char* tag, int max) {
 
 // Send command byte + its complement, wait for ACK.
 static IRAM_ATTR bool stmSendCmd(uint8_t cmd) {
-    STM32Serial.write(cmd);
-    STM32Serial.write((uint8_t)(cmd ^ 0xFF));
-    STM32Serial.flush();
+    uint8_t b[2] = {cmd, (uint8_t)(cmd ^ 0xFF)};
+    stmWrite(b, 2);
+    stmFlushTx();
     return stmWaitAck(800);
 }
 
@@ -3596,8 +3655,8 @@ static IRAM_ATTR bool stmSync() {
                           drained, drained == 1 ? "" : "s");
         Serial.printf("[STM32-BOOT] Sync attempt %d/%d: sending 0x7F...\n",
                       i + 1, kAttempts);
-        STM32Serial.write(STM_INIT);
-        STM32Serial.flush();
+        stmWriteByte(STM_INIT);
+        stmFlushTx();
         Serial.println("[STM32-BOOT] Waiting for ACK (0x79)...");
         int b = stmReadByte(500);
         if (b < 0) {
@@ -3618,9 +3677,8 @@ static IRAM_ATTR bool stmSync() {
         delay(200);  // give the ROM bootloader more time between sync attempts
     }
     Serial.printf("[STM32-BOOT] No response after %d attempts\n", kAttempts);
-    Serial.printf("[STM32-BOOT] RX bytes available: %d\n",
-                  STM32Serial.available());
-    stmDumpRx("Dumping RX buffer", 64);
+    Serial.printf("[STM32-BOOT] RX bytes available: %d\n", stmRxAvailable());
+    stmDumpRxIDF("Dumping RX buffer", 64);
     return false;
 }
 
@@ -3640,10 +3698,9 @@ static IRAM_ATTR bool stmGetId(uint16_t* id) {
 // Extended Erase (0x44) global mass-erase (special code 0xFFFF, checksum 0x00).
 static IRAM_ATTR bool stmMassErase() {
     if (!stmSendCmd(0x44)) return false;
-    STM32Serial.write((uint8_t)0xFF);
-    STM32Serial.write((uint8_t)0xFF);
-    STM32Serial.write((uint8_t)0x00);  // checksum = 0xFF ^ 0xFF
-    STM32Serial.flush();
+    uint8_t e[3] = {0xFF, 0xFF, 0x00};  // special mass-erase code + checksum
+    stmWrite(e, 3);
+    stmFlushTx();
     return stmWaitAck(30000);  // a full mass erase can take several seconds
 }
 
@@ -3654,18 +3711,18 @@ static IRAM_ATTR bool stmWriteChunk(uint32_t addr, const uint8_t* data, int len)
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
                     (uint8_t)(addr >> 8), (uint8_t)addr};
     uint8_t acs = a[0] ^ a[1] ^ a[2] ^ a[3];
-    STM32Serial.write(a, 4);
-    STM32Serial.write(acs);
-    STM32Serial.flush();
+    uint8_t addrpkt[5] = {a[0], a[1], a[2], a[3], acs};
+    stmWrite(addrpkt, 5);
+    stmFlushTx();
     if (!stmWaitAck(800)) return false;
 
     uint8_t n = (uint8_t)(len - 1);  // device expects (count - 1)
     uint8_t cs = n;
     for (int i = 0; i < len; i++) cs ^= data[i];
-    STM32Serial.write(n);
-    STM32Serial.write(data, len);
-    STM32Serial.write(cs);
-    STM32Serial.flush();
+    stmWriteByte(n);
+    stmWrite(data, len);
+    stmWriteByte(cs);
+    stmFlushTx();
     return stmWaitAck(2000);
 }
 
@@ -3677,9 +3734,9 @@ static IRAM_ATTR bool stmGo(uint32_t addr) {
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
                     (uint8_t)(addr >> 8), (uint8_t)addr};
     uint8_t cs = a[0] ^ a[1] ^ a[2] ^ a[3];
-    STM32Serial.write(a, 4);
-    STM32Serial.write(cs);
-    STM32Serial.flush();
+    uint8_t pkt[5] = {a[0], a[1], a[2], a[3], cs};
+    stmWrite(pkt, 5);
+    stmFlushTx();
     return stmWaitAck(1000);
 }
 
@@ -3695,9 +3752,15 @@ static IRAM_ATTR void sendBootloaderCommand() {
     STM32Serial.flush();
 }
 
-// Restore the normal 2 Mbaud 8N1 application link to the STM32.
-static IRAM_ATTR void stm32RestoreAppLink() {
-    STM32Serial.end();
+// Restore the normal 2 Mbaud 8N1 application link to the STM32. Tears down the
+// ESP-IDF bootloader UART driver first (it owns UART_NUM_2 during the flash),
+// then re-opens UART2 with Arduino HardwareSerial for normal app comms.
+static void stm32RestoreAppLink() {
+    // Remove the ESP-IDF driver if it is installed (harmless no-op otherwise).
+    if (uart_is_driver_installed(STM_BOOT_UART)) {
+        uart_driver_delete(STM_BOOT_UART);
+    }
+    delay(100);
     STM32Serial.setRxBufferSize(8192);
     STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
@@ -3768,19 +3831,39 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // cause of "bootloader did not respond".
     delay(200);  // wait for the STM32 reset + ROM bootloader entry
 
-    Serial.println("[STM32-BOOT] Switching UART to 115200 8E1...");
-    // Force a FULL UART peripheral reset so the parity change from 8N1 to 8E1
-    // actually takes effect. Simply re-calling begin() can leave the old parity
-    // latched in the UART hardware; end() + settle + begin() guarantees the
-    // peripheral fully reconfigures from scratch instead of just changing baud.
-    STM32Serial.end();          // stop UART completely
+    Serial.println("[STM32-BOOT] Switching UART to 115200 8E1 (ESP-IDF driver)...");
+    // ------------------------------------------------------------------------
+    // Hand UART2 from Arduino HardwareSerial to the low-level ESP-IDF driver.
+    // ------------------------------------------------------------------------
+    // The Arduino HardwareSerial wrapper did not reliably produce EVEN parity
+    // framing, so the STM32 ROM bootloader (which REQUIRES 8E1) never accepted
+    // the 0x7F auto-baud byte. Installing the ESP-IDF uart driver and setting
+    // UART_PARITY_EVEN explicitly gives correct 8E1 framing on the wire.
+    STM32Serial.end();          // release the Arduino driver on UART2
     delay(100);                 // let the hardware settle
-    // ST ROM bootloader: 8 data bits, EVEN parity, 1 stop; auto-baud from 0x7F.
-    STM32Serial.begin(115200, SERIAL_8E1, STM32_TO_ESP32_PIN,
-                      ESP32_TO_STM32_PIN);
-    delay(100);                 // let the new 8E1 config settle
-    STM32Serial.flush();        // clear TX buffer
-    while (STM32Serial.available()) STM32Serial.read();  // clear RX buffer
+
+    // Make sure no stale ESP-IDF driver is already installed on this UART.
+    if (uart_is_driver_installed(STM_BOOT_UART)) {
+        uart_driver_delete(STM_BOOT_UART);
+    }
+
+    const uart_config_t bl_uart_config = {
+        .baud_rate = 115200,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_EVEN,        // CRITICAL: STM32 ROM bootloader is 8E1
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .rx_flow_ctrl_thresh = 0,
+        .source_clk = UART_SCLK_APB,
+    };
+    // RX/TX ring buffers 1024 B each; no event queue.
+    uart_driver_install(STM_BOOT_UART, 1024, 1024, 0, NULL, 0);
+    uart_param_config(STM_BOOT_UART, &bl_uart_config);
+    // Same pins as Serial2: TX=GPIO18 -> STM32 RX, RX=GPIO17 <- STM32 TX.
+    uart_set_pin(STM_BOOT_UART, ESP32_TO_STM32_PIN, STM32_TO_ESP32_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_flush(STM_BOOT_UART);   // clear any RX/TX residue
+
     // The STM32 ROM bootloader needs plenty of settling time after the reset
     // before it is ready to auto-baud from the first 0x7F. Sending it too early
     // is the #1 cause of "bootloader did not respond". Wait generously:
