@@ -54,6 +54,7 @@
 #include <lv_conf.h>
 #include <lvgl.h>
 #include <math.h>
+#include <stdarg.h>  // va_list/vsnprintf() for the telnet monitor logger
 #include <string.h>  // memset() for the boot framebuffer clear
 
 #include "ui.h"
@@ -142,6 +143,21 @@ String wifi_pass = "";  // loaded from NVS at boot
 
 WiFiServer server(8888);  // STM32<->Flask bridge (STA mode)
 WiFiClient client;
+
+// ---- Telnet UART monitor (port 23) -------------------------------------
+// A second, independent server that lets a desktop telnet client (e.g.
+// MobaXterm) watch the STM32 UART traffic over WiFi instead of plugging in a
+// USB serial cable, and type commands straight to the STM32. It runs ALONGSIDE
+// the Flask bridge on 8888 — they are separate sockets and never interfere.
+//
+// Why a "mirror" and not a raw re-read of Serial2: the STM32 RX bytes are
+// already consumed and parsed line-by-line in pollStm32Uart(). Reading Serial2
+// again here would steal bytes from that parser and break the welder. Instead
+// we MIRROR each parsed line (and each line we transmit) into the telnet client
+// from the existing UART code paths, so the monitor shows both directions of
+// traffic plus the key debug while the protocol parser keeps working untouched.
+WiFiServer telnetServer(23);  // WiFi UART monitor (telnet)
+WiFiClient telnetClient;      // single connected monitor client (one at a time)
 
 // ---- WiFi provisioning state machine ----
 enum WifiProvState {
@@ -1137,6 +1153,83 @@ void updateScreenDisplay() {
 // =========================
 // TCP / UART helpers
 // =========================
+
+// ---- Telnet monitor output helpers -------------------------------------
+// All writes are guarded so they are cheap no-ops when no monitor is attached.
+// telnetMirror() shows STM32 UART traffic + debug; the "<-"/"->" prefixes let
+// the operator tell the two directions apart in MobaXterm.
+static inline bool telnetActive() {
+    return telnetClient && telnetClient.connected();
+}
+
+// Mirror one already-parsed line into the telnet monitor with a direction tag.
+//   dir : "<-" for STM32 -> ESP32 (received), "->" for ESP32 -> STM32 (sent),
+//         "" / nullptr for a plain debug line.
+static void telnetMirror(const char* dir, const char* line) {
+    if (!telnetActive() || !line) return;
+    if (dir && dir[0]) {
+        telnetClient.print(dir);
+        telnetClient.print(' ');
+    }
+    telnetClient.print(line);
+    telnetClient.print("\r\n");
+}
+
+// printf-style debug line to the telnet monitor (no direction tag).
+static void telnetLogf(const char* fmt, ...) {
+    if (!telnetActive()) return;
+    char buf[160];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    telnetClient.print(buf);
+    telnetClient.print("\r\n");
+}
+
+// Telnet UART monitor service. Accepts one client at a time, forwards bytes
+// typed by the client straight to the STM32 (filtering telnet IAC negotiation
+// bytes), and detects disconnects. STM32 traffic is mirrored to the client
+// elsewhere (telnetMirror() in forwardToStm32()/pollStm32Uart()).
+void handleTelnet() {
+    // Accept a new monitor client (drop any existing one so only one at a time).
+    WiFiClient nc = telnetServer.accept();
+    if (nc) {
+        if (telnetClient && telnetClient.connected()) {
+            telnetClient.print("\r\n[dropped: new monitor connected]\r\n");
+            telnetClient.stop();
+        }
+        telnetClient = nc;
+        telnetClient.setNoDelay(true);
+        telnetClient.print("=== ESP32 Spot Welder Telnet Bridge ===\r\n"
+                           "Connected to STM32 UART @ 2Mbaud\r\n");
+        telnetLogf("[info] device %s  heap=%u bytes  ('->' = ESP32->STM32, "
+                   "'<-' = STM32->ESP32)",
+                   WiFi.localIP().toString().c_str(), (unsigned)ESP.getFreeHeap());
+        Serial.println("[Telnet] Monitor client connected from " +
+                       telnetClient.remoteIP().toString());
+    }
+
+    if (telnetClient && telnetClient.connected()) {
+        // Client -> STM32: forward raw bytes, stripping telnet IAC (0xFF)
+        // negotiation sequences so they never reach the STM32 UART.
+        while (telnetClient.available()) {
+            int b = telnetClient.read();
+            if (b < 0) break;
+            if (b == 0xFF) {              // IAC: consume the 2 negotiation bytes
+                telnetClient.read();
+                telnetClient.read();
+                continue;
+            }
+            STM32Serial.write((uint8_t)b);
+        }
+    } else if (telnetClient) {
+        // Client went away - release the slot.
+        telnetClient.stop();
+        Serial.println("[Telnet] Monitor client disconnected");
+    }
+}
+
 void sendToPi(const String& msg) {
     if (client && client.connected()) {
         client.print(msg);
@@ -1155,6 +1248,11 @@ void forwardToStm32(const String& line) {
     STM32Serial.print(out);
     STM32Serial.print("\r\n");
     STM32Serial.flush();
+
+    // Mirror every outgoing line to the telnet monitor (both directions are
+    // shown there). READY heartbeats are noisy, so tag-mirror them too but skip
+    // the USB-serial log for them as before.
+    telnetMirror("->", out.c_str());
 
     if (!out.startsWith("READY,")) {
         Serial.printf("[UART->STM32] %s\n", out.c_str());
@@ -1286,6 +1384,12 @@ void pollStm32Uart() {
             }
 
             if (stmLine.length() > 0) {
+                // Mirror every received STM32 line to the telnet monitor. This
+                // is the "Serial2 -> client" direction of the WiFi UART bridge;
+                // we mirror the already-parsed line (rather than re-reading
+                // Serial2) so the protocol parser below still gets every byte.
+                telnetMirror("<-", stmLine.c_str());
+
                 // BOOT message handler – trigger safety re-sync
                 if (stmLine.startsWith("BOOT,") || stmLine == "BOOT") {
                     Serial.printf("[Boot] STM32 boot detected: %s\n",
@@ -2716,6 +2820,13 @@ void ensureWiFiAndServer() {
                     Serial.println("Starting TCP server on port 8888...");
                     server.begin();
                     server.setNoDelay(true);
+
+                    // WiFi UART monitor (telnet) on port 23 - lets a desktop
+                    // telnet client (e.g. MobaXterm) watch STM32 UART traffic.
+                    Serial.println("Starting Telnet UART monitor on port 23...");
+                    telnetServer.begin();
+                    telnetServer.setNoDelay(true);
+
                     server_started = true;
 
                     // Now that STA is up, (re)start mDNS + arm OTA so the
@@ -2728,6 +2839,8 @@ void ensureWiFiAndServer() {
             server_started = false;
             server.stop();
             if (client) client.stop();
+            telnetServer.stop();
+            if (telnetClient) telnetClient.stop();
             setUiConnected(false);
             if (now - last_retry > 5000) {
                 last_retry = now;
@@ -4060,6 +4173,7 @@ void loop() {
     // --- Existing logic ---
     ensureWiFiAndServer();
     pollStm32Uart();
+    handleTelnet();  // WiFi UART monitor (telnet, port 23)
     serviceReadyHeartbeat();
 
     static uint32_t lastStatusReqMs = 0;
