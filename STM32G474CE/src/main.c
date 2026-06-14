@@ -4112,9 +4112,9 @@ static void parseCommand(char* line) {
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
-        uartSend("DBG,About to call requestBootloaderReset()");
+        uartSend("DBG,About to call jumpToBootloader() (direct, no reset)");
         HAL_Delay(100);             /* give the UART time to send before the call */
-        requestBootloaderReset();   /* does not return */
+        jumpToBootloader();         /* DIRECT jump - does not return, no reset */
         return;
     }
 
@@ -4616,6 +4616,22 @@ static void jumpToBootloader(void) {
     uint32_t bootEntry = *(volatile uint32_t*)(SYSTEM_BOOTLOADER_ADDR + 4U);
     void (*bootJump)(void) = (void (*)(void))bootEntry;
 
+    /* --------------------------------------------------------------------
+     * IWDG window extension (CRITICAL for the direct, no-reset jump).
+     * We now jump straight from the running application instead of via
+     * NVIC_SystemReset(). That means the software-mode IWDG that main()
+     * started (~800 ms timeout) is STILL RUNNING, and the ROM bootloader
+     * never refreshes it - so without this the watchdog would reset the
+     * MCU out of the bootloader (back into the app) within ~800 ms.
+     * The IWDG cannot be stopped once started, but its reload value can be
+     * reconfigured on the fly. Push it to the maximum (~32.7 s @ /256, LSI
+     * 32 kHz) to give the host the longest possible flashing window.
+     * Harmless if the IWDG was never started (early-boot path). -------- */
+    IWDG->KR  = 0x5555U;            /* unlock PR/RLR write access            */
+    IWDG->PR  = IWDG_PRESCALER_256; /* slowest prescaler                     */
+    IWDG->RLR = 0x0FFFU;            /* max reload -> longest timeout         */
+    IWDG->KR  = 0xAAAAU;            /* refresh counter with the new reload   */
+
     /* Mask all interrupts while we tear the system down. */
     __disable_irq();
 
@@ -4634,6 +4650,15 @@ static void jumpToBootloader(void) {
         NVIC->ICER[i] = 0xFFFFFFFFUL;
         NVIC->ICPR[i] = 0xFFFFFFFFUL;
     }
+
+    /* Remap system memory (the ROM bootloader) to 0x00000000 so the chip is
+     * in exactly the state it would be after a reset with BOOT0=1. This is
+     * the missing half of the jump - setting SCB->VTOR alone is not enough;
+     * the ROM bootloader expects to be aliased at address 0. The MEMRMP write
+     * lives in SYSCFG, whose clock HAL_RCC_DeInit() just turned off, so it
+     * must be re-enabled or the remap write is silently ignored. */
+    __HAL_RCC_SYSCFG_CLK_ENABLE();
+    __HAL_SYSCFG_REMAPMEMORY_SYSTEMFLASH();
 
     /* Point the vector table at the system-memory bootloader. */
     SCB->VTOR = SYSTEM_BOOTLOADER_ADDR;
