@@ -4084,6 +4084,24 @@ static void parseCommand(char* line) {
         HAL_Delay(5);
     }
 
+    /* Debug: show the EXACT line we are about to compare against "BOOTLOADER". */
+    {
+        char debugcmp[128];
+        snprintf(debugcmp, sizeof(debugcmp),
+                 "DBG,strcmp check: line='%s' len=%d", line, (int)strlen(line));
+        uartSend(debugcmp);
+        HAL_Delay(10);
+    }
+
+    /* Debug: show what strcmp(line, "BOOTLOADER") actually returns. 0 = match. */
+    {
+        int cmp_result = strcmp(line, "BOOTLOADER");
+        char debugres[64];
+        snprintf(debugres, sizeof(debugres), "DBG,strcmp result=%d", cmp_result);
+        uartSend(debugres);
+        HAL_Delay(10);
+    }
+
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
      * can flash a new image over UART (AN3155) without the BOOT0/RESET lines.
      * Accept both the bare and CMD-prefixed forms. We acknowledge first, give
