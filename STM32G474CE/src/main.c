@@ -4752,6 +4752,16 @@ static void requestBootloaderReset(void) {
 static uint32_t g_boot_tamp_value = 0;
 
 int main(void) {
+    /* Disable the UCPD "dead battery" pull-down behavior at the very start.
+     * After reset the STM32G4 enables ~5.1k Rd pull-downs on the UCPD1_CC1 and
+     * UCPD1_CC2 pins (PB6 and PB4 on this package - see RM0440 Table, PWR_CR3
+     * bit 14). We do not use USB Type-C / Power Delivery, and PB4/PB6 are GPIO,
+     * so clear those pull-downs once the application runs. NOTE: this does NOT
+     * affect USART1_RX (PA10) and does NOT change ROM-bootloader behavior - the
+     * bootloader runs from a fresh reset where this bit is re-enabled anyway. */
+    RCC->APB1ENR1 |= RCC_APB1ENR1_PWREN;   /* enable PWR peripheral clock   */
+    PWR->CR3 |= PWR_CR3_UCPD_DBDIS;        /* remove UCPD CC dead-battery Rd */
+
     HAL_Init();
 
     /* Software bootloader entry: if the "BOOTLOADER" UART command requested an
