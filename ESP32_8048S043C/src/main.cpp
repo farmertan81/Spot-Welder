@@ -3903,13 +3903,16 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // RX/TX ring buffers 1024 B each; no event queue.
     uart_driver_install(STM_BOOT_UART, 1024, 1024, 0, NULL, 0);
     uart_param_config(STM_BOOT_UART, &bl_uart_config);
-    // Same pins as Serial2: TX=GPIO18 -> STM32 RX, RX=GPIO17 <- STM32 TX.
-    uart_set_pin(STM_BOOT_UART, ESP32_TO_STM32_PIN, STM32_TO_ESP32_PIN,
+    // *** TEST BUILD: TX/RX SWAPPED ***  Normally TX=GPIO18, RX=GPIO17. This
+    // diagnostic build swaps them (TX=GPIO17, RX=GPIO18) to check whether the
+    // ESP32<->STM32 UART wires are physically reversed. Swap back if it fails.
+    uart_set_pin(STM_BOOT_UART, STM32_TO_ESP32_PIN, ESP32_TO_STM32_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     // --- Debug: confirm the ESP-IDF driver is installed + which pins -------
     Serial.println("[DEBUG] ESP-IDF UART driver installed");
-    Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", ESP32_TO_STM32_PIN,
-                  STM32_TO_ESP32_PIN);
+    Serial.println("[DEBUG] TEST BUILD - TX/RX SWAPPED!");
+    Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", STM32_TO_ESP32_PIN,
+                  ESP32_TO_STM32_PIN);
     // Reconfiguring the ESP-IDF driver is already several ms of wall-clock time;
     // the ROM bootloader is up by now. Flush residue and fire the first 0x7F as
     // fast as possible to land inside the ROM's narrow receive window.
