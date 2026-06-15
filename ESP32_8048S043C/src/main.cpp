@@ -4069,8 +4069,18 @@ static void onUpdateStm32FromSD() { g_fw_request = FW_REQ_STM32; }
 // Setup
 // =========================
 void setup() {
+    // CRITICAL: Drive STM32 BOOT0 (GPIO38 -> PB8) LOW as the VERY FIRST thing,
+    // before any other init. GPIO38 floats HIGH out of reset, which would hold
+    // the STM32 in its ROM bootloader at power-on. Pin it LOW immediately and
+    // let it settle so the STM32 boots its application normally.
+    pinMode(STM32_BOOT0_PIN, OUTPUT);
+    digitalWrite(STM32_BOOT0_PIN, LOW);
+    delay(50);  // ensure BOOT0 is stable LOW before the STM32 starts
+
     Serial.begin(115200);
     delay(500);
+
+    Serial.println("✅ STM32 BOOT0 line (GPIO38) held LOW for normal boot");
 
     Serial.println();
     Serial.println("===========================================");
@@ -4106,14 +4116,6 @@ void setup() {
     STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
     Serial.println("✅ STM32 UART bridge ready (Serial2 @ 2000000)");
-
-    // --- STM32 BOOT0 control line (hardware bootloader entry) ---
-    // GPIO38 is wired to the STM32 BOOT0 pin (PB8). Held LOW for normal
-    // operation; driven HIGH only during SD firmware flashing so that the
-    // STM32 reset lands in the ROM bootloader instead of the application.
-    pinMode(STM32_BOOT0_PIN, OUTPUT);
-    digitalWrite(STM32_BOOT0_PIN, LOW);
-    Serial.println("✅ STM32 BOOT0 line (GPIO38) initialised LOW");
 
     // --- Front button ---
     pinMode(BUTTON_PIN, INPUT_PULLUP);
