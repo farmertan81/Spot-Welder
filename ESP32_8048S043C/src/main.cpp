@@ -2494,6 +2494,58 @@ static void resyncDisplayPanel(const char* reason) {
 }
 
 // =========================================================================
+// "QUIET BUS" - reduce LCD PSRAM contention during STM32 bootloader flashing
+// -------------------------------------------------------------------------
+// With XIP-from-PSRAM enabled (CONFIG_SPIRAM_XIP_FROM_PSRAM, see platformio.ini)
+// the CPU fetches instructions from PSRAM. The RGB panel's scan-out DMA also
+// reads the framebuffer from PSRAM *continuously*. Those two compete for the
+// same octal-SPI bus, adding jitter to UART RX servicing - which corrupts the
+// timing-sensitive 115200 8E1 STM32 ROM-bootloader handshake (dropped bytes ->
+// failed 0x7F sync). The normal 2 Mbaud 8N1 app link tolerates the jitter; the
+// bootloader does not.
+//
+// There is NO public API to fully stop an RGB panel (esp_lcd_panel_disp_on_off
+// only toggles the disp-enable GPIO, which is -1 on this board, so it does
+// nothing and never touches the DMA). The effective lever is the pixel clock:
+// the panel's PSRAM read bandwidth is proportional to PCLK, so dropping PCLK
+// from 12 MHz to ~2 MHz cuts the DMA's bus demand ~6x and frees bandwidth for
+// clean UART timing. The display just refreshes slowly during the flash (we
+// don't care - the progress modal is still visible), and we restore + resync
+// it afterwards.
+#if defined(DISPLAY_ST7262_PAR)
+// Must match the PCLK in the board definition (boards/esp32-8048S043C.json).
+static const uint32_t kPanelPclkNormalHz = 12000000;  // 12 MHz (normal)
+static const uint32_t kPanelPclkQuietHz  = 2000000;   // 2 MHz  (during flash)
+#endif
+
+// quiet=true  -> slow the panel PCLK to free the PSRAM bus for the flash.
+// quiet=false -> restore full PCLK and re-sync the scan-out for a clean frame.
+static void quietDisplayBus(bool quiet) {
+#if defined(DISPLAY_ST7262_PAR)
+    esp_lcd_panel_handle_t panel = getRgbPanelHandle();
+    if (!panel) {
+        Serial.println("[STM32-BOOT] quietDisplayBus: no panel handle (skipped)");
+        return;
+    }
+    uint32_t hz = quiet ? kPanelPclkQuietHz : kPanelPclkNormalHz;
+    esp_err_t err = esp_lcd_rgb_panel_set_pclk(panel, hz);
+    Serial.printf("[STM32-BOOT] LCD PCLK -> %u Hz (%s): %s\n", (unsigned)hz,
+                  quiet ? "quiet bus" : "restore", esp_err_to_name(err));
+    // Re-sync the DMA scan-out at the new clock so the panel timing recovers
+    // (especially important when restoring to 12 MHz - clears any drift that
+    // built up while we were running slow).
+    esp_lcd_rgb_panel_restart(panel);
+    if (!quiet) {
+        // Repaint a full clean frame at normal speed.
+        lv_obj_invalidate(lv_scr_act());
+        lv_refr_now(lv_display_get_default());
+    }
+#else
+    (void)quiet;  // no RGB panel in this build - nothing to quiet
+#endif
+}
+
+// =========================================================================
 // BOOT DISPLAY STABILIZATION  (fix for garbled/overlapping UI on cold boot)
 // -------------------------------------------------------------------------
 // Symptom: right after a power-on/reset the UI is drawn garbled, overlapping
@@ -3849,6 +3901,14 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
+    // --- Quiet the PSRAM bus before any bootloader UART activity ---------------
+    // Slow the LCD pixel clock so the RGB panel's continuous scan-out DMA stops
+    // hogging PSRAM bandwidth. With XIP-from-PSRAM, that contention is what jitters
+    // the 115200 8E1 bootloader UART and breaks the handshake. Restored after flash.
+    Serial.println("[STM32-BOOT] Quieting LCD bus for clean bootloader UART...");
+    quietDisplayBus(true);
+    delay(50);  // let the slower scan-out settle before we touch the UART
+
     // --- Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader ---
     // Drive the hardware BOOT0 line (GPIO38 -> STM32 PB8) HIGH and let it settle
     // BEFORE telling the STM32 to reset. With BOOT0 high at reset, the STM32
@@ -3903,16 +3963,13 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // RX/TX ring buffers 1024 B each; no event queue.
     uart_driver_install(STM_BOOT_UART, 1024, 1024, 0, NULL, 0);
     uart_param_config(STM_BOOT_UART, &bl_uart_config);
-    // *** TEST BUILD: TX/RX SWAPPED ***  Normally TX=GPIO18, RX=GPIO17. This
-    // diagnostic build swaps them (TX=GPIO17, RX=GPIO18) to check whether the
-    // ESP32<->STM32 UART wires are physically reversed. Swap back if it fails.
-    uart_set_pin(STM_BOOT_UART, STM32_TO_ESP32_PIN, ESP32_TO_STM32_PIN,
+    // Same pins as Serial2: TX=GPIO18 -> STM32 RX, RX=GPIO17 <- STM32 TX.
+    uart_set_pin(STM_BOOT_UART, ESP32_TO_STM32_PIN, STM32_TO_ESP32_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
     // --- Debug: confirm the ESP-IDF driver is installed + which pins -------
     Serial.println("[DEBUG] ESP-IDF UART driver installed");
-    Serial.println("[DEBUG] TEST BUILD - TX/RX SWAPPED!");
-    Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", STM32_TO_ESP32_PIN,
-                  ESP32_TO_STM32_PIN);
+    Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", ESP32_TO_STM32_PIN,
+                  STM32_TO_ESP32_PIN);
     // Reconfiguring the ESP-IDF driver is already several ms of wall-clock time;
     // the ROM bootloader is up by now. Flush residue and fire the first 0x7F as
     // fast as possible to land inside the ROM's narrow receive window.
@@ -4011,6 +4068,12 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // restore needed (hardware BOOT0 control replaces the old software methods).
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
+
+    // --- Restore the LCD bus now that all bootloader UART traffic is done ------
+    // The UART is back on the tolerant 2 Mbaud 8N1 app link, so the PSRAM jitter
+    // no longer matters. Restore full PCLK and re-sync the panel scan-out.
+    Serial.println("[STM32-BOOT] Restoring LCD bus to full speed...");
+    quietDisplayBus(false);
 
     // Reconnect WiFi if it was up before the flash (the wrapper reboots the
     // ESP32 shortly after, but restore the radio so nothing is left disabled
