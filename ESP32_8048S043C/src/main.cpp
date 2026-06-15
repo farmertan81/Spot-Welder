@@ -3782,6 +3782,28 @@ static void stm32RestoreAppLink() {
                       ESP32_TO_STM32_PIN);
 }
 
+// ============================================================================
+// ⚠️ KNOWN LIMITATION: STM32 SD-card flashing is UNRELIABLE on this hardware.
+// ----------------------------------------------------------------------------
+// To update the STM32 firmware, use an ST-LINK programmer. SD-card flashing of
+// the STM32 (this function) cannot reliably enter the STM32G4 ROM bootloader:
+//   * The Sunton ESP32-8048S043C exposes NO free GPIO that can be wired to the
+//     STM32 BOOT0 pin (every header pin is taken by the RGB LCD, GT911 touch
+//     I2C, the STM32 UART, the microSD SPI bus, or the USB debug UART), and
+//   * the STM32G4 ROM bootloader does NOT come up USART-responsive after a
+//     software-only jump from the running app.
+// Without a BOOT0 control line there is no fully reliable wire-free way to force
+// the ROM bootloader. The STM32 ACKs the BOOTLOADER command and jumps, but then
+// never answers the AN3155 0x7F sync, so this flash path fails.
+//
+// The STM32 side now uses an EXPERIMENTAL (unverified) option-byte method to
+// force a real reset into the ROM bootloader; keep an ST-LINK handy as the
+// guaranteed recovery path.
+//
+// ➡️  Full analysis, workaround, and the future fix (ESP32-P4 + BOOT0 wire):
+//     see KNOWN_ISSUES.md in the repository root.
+// ============================================================================
+//
 // Inner worker: flashes the STM32 from /stm32_firmware.bin over the AN3155 ROM
 // bootloader. Returns true on success and fills 'msg' with a short result in
 // both cases. Does NOT reboot and does NOT show the popup - the thin wrapper
