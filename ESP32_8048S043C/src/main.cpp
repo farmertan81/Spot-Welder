@@ -86,16 +86,17 @@
 #define ESP32_TO_STM32_PIN 18  // ESP TX  -> STM32 RX
 
 // -------------------------------------------------------------------------
-// STM32 ROM bootloader entry: OPTION-BYTE method (no control wire)
+// STM32 ROM bootloader entry: HARDWARE BOOT0 control wire (rock-solid)
 // -------------------------------------------------------------------------
-// This board has NO free GPIO broken out to drive the STM32 BOOT0 pin (every
-// header pin is taken by the RGB LCD, GT911 touch I2C 19/20, STM32 UART 17/18,
-// microSD SPI 10-13, or the USB debug UART 43/44). So bootloader entry is done
-// entirely on the STM32 side: on the "BOOTLOADER" command the STM32 app
-// reprograms its boot option bytes to start the factory ROM bootloader and
-// resets into it (a real reset, fully USART-responsive at 8E1). The new app
-// restores the option bytes on its next boot. The ESP32 only sends the command
-// and flashes over the existing GPIO17/18 link - no BOOT0/NRST wires needed.
+// GPIO38 is wired directly to the STM32 BOOT0 pin (PB8). The STM32 samples
+// BOOT0 only at reset: with BOOT0 HIGH the chip starts the factory ROM
+// bootloader (USART-responsive on PA9/PA10 at 8E1); with BOOT0 LOW it boots the
+// application. The flash flow drives BOOT0 HIGH, asks the STM32 app to reset
+// (it ACKs then NVIC_SystemReset()), flashes over the existing GPIO17/18 UART
+// link, then drops BOOT0 LOW so the next reset / AN3155 "Go" boots the new app.
+// This is the ST-supported hardware entry method - reliable, no option-byte
+// writes, no software-jump guesswork.
+#define STM32_BOOT0_PIN 38     // ESP32 GPIO38 -> STM32 PB8 (BOOT0)
 
 // Touch I2C (I2C_NUM_0) – managed by smartdisplay, DO NOT use Wire
 #define TOUCH_SDA 19
@@ -127,20 +128,23 @@
 #define SD_STM32_FW_PATH "/stm32_firmware.bin"
 
 // =========================
-// STM32 remote-flash control: SOFTWARE bootloader entry (no GPIO mod)
+// STM32 remote-flash control: HARDWARE BOOT0 entry (GPIO38 -> PB8)
 // -------------------------------------------------------------------------
-// There are NO BOOT0/NRST control wires between the ESP32 and the STM32. The
-// updater instead asks the running STM32 application to jump into its built-in
-// ROM bootloader by sending a "BOOTLOADER" command over the normal UART link
-// (sendBootloaderCommand(), below). The STM32 firmware must implement a handler
-// that, on receiving this command, calls its jump-to-system-memory routine.
-// After flashing, the AN3155 "Go" command (0x21) launches the freshly written
-// application — again, with no hardware reset line.
+// A control wire connects ESP32 GPIO38 to the STM32 BOOT0 pin (PB8). The flash
+// sequence is the ST-supported hardware path:
+//   1. Drive BOOT0 HIGH (GPIO38) and let it settle.
+//   2. Send the "BOOTLOADER" command over the normal UART link
+//      (sendBootloaderCommand(), below); the STM32 app just ACKs and calls
+//      NVIC_SystemReset().
+//   3. Because BOOT0 is held HIGH at reset, the STM32 boots its factory ROM
+//      bootloader directly (no option-byte writes, no software jump guesswork).
+//   4. Flash over the existing GPIO17/18 UART link, then drop BOOT0 LOW so the
+//      AN3155 "Go" / next reset boots the freshly written application.
 //
-// Trade-off: this is software-only, so if the STM32 application is bricked (no
-// running firmware to receive the command) there is no GPIO fallback to force
-// the bootloader; recovery then needs the STM32's own BOOT0 strap / SWD. The
-// GT911 touch I2C bus (GPIO19/20) is never touched by any of this.
+// This replaces the earlier software-jump and option-byte experiments, which
+// were unreliable because a software jump did not leave the G4 ROM bootloader
+// responsive to the AN3155 0x7F auto-baud. BOOT0 HIGH at a real reset always
+// does. The GT911 touch I2C bus (GPIO19/20) is never touched by any of this.
 // =========================
 
 HardwareSerial STM32Serial(2);
@@ -3783,25 +3787,23 @@ static void stm32RestoreAppLink() {
 }
 
 // ============================================================================
-// ⚠️ KNOWN LIMITATION: STM32 SD-card flashing is UNRELIABLE on this hardware.
+// STM32 SD-card flashing: HARDWARE BOOT0 entry (GPIO38 -> STM32 PB8).
 // ----------------------------------------------------------------------------
-// To update the STM32 firmware, use an ST-LINK programmer. SD-card flashing of
-// the STM32 (this function) cannot reliably enter the STM32G4 ROM bootloader:
-//   * The Sunton ESP32-8048S043C exposes NO free GPIO that can be wired to the
-//     STM32 BOOT0 pin (every header pin is taken by the RGB LCD, GT911 touch
-//     I2C, the STM32 UART, the microSD SPI bus, or the USB debug UART), and
-//   * the STM32G4 ROM bootloader does NOT come up USART-responsive after a
-//     software-only jump from the running app.
-// Without a BOOT0 control line there is no fully reliable wire-free way to force
-// the ROM bootloader. The STM32 ACKs the BOOTLOADER command and jumps, but then
-// never answers the AN3155 0x7F sync, so this flash path fails.
+// A control wire connects ESP32 GPIO38 to the STM32 BOOT0 pin (PB8), soldered
+// directly to the WROOM module pad. This function drives BOOT0 HIGH, asks the
+// STM32 app to NVIC_SystemReset(), and the chip comes up in its factory ROM
+// bootloader (BOOT0 high at reset). It then flashes /stm32_firmware.bin over
+// the existing GPIO17/18 UART link and drops BOOT0 LOW so the next boot runs
+// the new app.
 //
-// The STM32 side now uses an EXPERIMENTAL (unverified) option-byte method to
-// force a real reset into the ROM bootloader; keep an ST-LINK handy as the
-// guaranteed recovery path.
+// Why this works where the old methods did not: the STM32G4 ROM bootloader does
+// NOT come up USART-responsive after a software-only jump from the running app,
+// and the option-byte experiment was unverified/fragile. A real reset with
+// BOOT0 strapped HIGH is the ST-supported entry path and always responds to the
+// AN3155 0x7F auto-baud.
 //
-// ➡️  Full analysis, workaround, and the future fix (ESP32-P4 + BOOT0 wire):
-//     see KNOWN_ISSUES.md in the repository root.
+// Recovery: an ST-LINK on the SWD header remains the guaranteed fallback if the
+// STM32 is ever fully bricked. The GT911 touch I2C bus (GPIO19/20) is untouched.
 // ============================================================================
 //
 // Inner worker: flashes the STM32 from /stm32_firmware.bin over the AN3155 ROM
@@ -3847,11 +3849,19 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
+    // --- Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader ---
+    // Drive the hardware BOOT0 line (GPIO38 -> STM32 PB8) HIGH and let it settle
+    // BEFORE telling the STM32 to reset. With BOOT0 high at reset, the STM32
+    // boots its factory ROM bootloader instead of the application - this is the
+    // ST-supported hardware entry path (no option-byte writes, no software jump).
+    Serial.println("[STM32-BOOT] Asserting BOOT0 HIGH (GPIO38)...");
+    digitalWrite(STM32_BOOT0_PIN, HIGH);
+    delay(100);  // let the BOOT0 level settle before the reset
+
     // --- Ask the STM32 app to reset into its ROM bootloader --------------------
     // Send the command over the CURRENT application link (2 Mbaud, 8N1) while it
-    // is still open. The app ACKs, reprograms its boot option bytes, and resets
-    // into the factory ROM bootloader (no BOOT0/NRST wire involved - the option
-    // bytes do the work). The new app restores the option bytes on its next boot.
+    // is still open. The app simply ACKs and calls NVIC_SystemReset(). Because
+    // BOOT0 is now held HIGH, the reset enters the ROM bootloader directly.
     Serial.println("[STM32-BOOT] Sending BOOTLOADER command at 2Mbaud...");
     sendBootloaderCommand();
     Serial.println("[STM32-BOOT] Command sent, waiting for STM32 reset...");
@@ -3997,12 +4007,19 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
 
     f.close();
 
+    // --- Release BOOT0 LOW (flashing done, success or fail) --------------------
+    // Drop the hardware BOOT0 line so that any future reset boots the freshly
+    // written application instead of re-entering the ROM bootloader. Done
+    // unconditionally so a failed flash never leaves the STM32 stuck in DFU.
+    digitalWrite(STM32_BOOT0_PIN, LOW);
+    Serial.println("[STM32-BOOT] BOOT0 released LOW (normal boot restored)");
+
     if (ok) show_firmware_progress("STM32", 98, "Launching...");
 
     // Launch the freshly written application with the AN3155 "Go" command, then
-    // restore the normal 2 Mbaud 8N1 application link settings. The new app's
-    // restoreNormalBootIfNeeded() resets the boot option bytes back to factory
-    // on its first boot, so every future reset boots the application.
+    // restore the normal 2 Mbaud 8N1 application link settings. With BOOT0 now
+    // LOW, every subsequent reset boots the application directly - no option-byte
+    // restore needed (hardware BOOT0 control replaces the old software methods).
     if (ok) stmGo(STM32_FLASH_BASE);  // jump to the new app at 0x08000000
     stm32RestoreAppLink();
 
@@ -4089,6 +4106,14 @@ void setup() {
     STM32Serial.begin(2000000, SERIAL_8N1, STM32_TO_ESP32_PIN,
                       ESP32_TO_STM32_PIN);
     Serial.println("✅ STM32 UART bridge ready (Serial2 @ 2000000)");
+
+    // --- STM32 BOOT0 control line (hardware bootloader entry) ---
+    // GPIO38 is wired to the STM32 BOOT0 pin (PB8). Held LOW for normal
+    // operation; driven HIGH only during SD firmware flashing so that the
+    // STM32 reset lands in the ROM bootloader instead of the application.
+    pinMode(STM32_BOOT0_PIN, OUTPUT);
+    digitalWrite(STM32_BOOT0_PIN, LOW);
+    Serial.println("✅ STM32 BOOT0 line (GPIO38) initialised LOW");
 
     // --- Front button ---
     pinMode(BUTTON_PIN, INPUT_PULLUP);
