@@ -3865,20 +3865,15 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     Serial.println("[STM32-BOOT] Sending BOOTLOADER command at 2Mbaud...");
     sendBootloaderCommand();
     Serial.println("[STM32-BOOT] Command sent, waiting for STM32 reset...");
-    delay(100);  // let the STM32 receive + ACK the command over the 2 Mbaud link
 
-    // Capture whatever the STM32 app replied over the 2 Mbaud link (it should
-    // echo "ACK,BOOTLOADER" before it resets). Seeing this confirms the command
-    // was received and the app is about to jump to its ROM bootloader.
-    stmDumpRx("App-link reply to BOOTLOADER cmd", 32);
-
-    // The STM32 app acknowledges, waits ~50 ms, then issues NVIC_SystemReset()
-    // and reboots into its ROM bootloader. The reset itself plus the ROM
-    // start-up must FULLY complete before we switch the ESP32 UART and start the
-    // 0x7F auto-baud, otherwise the very first sync bytes are lost while the MCU
-    // is still resetting. Wait generously here - this is the single most common
-    // cause of "bootloader did not respond".
-    delay(200);  // wait for the STM32 reset + ROM bootloader entry
+    // The STM32 BOOTLOADER handler ACKs, then takes ~170 ms (its own HAL_Delays)
+    // before NVIC_SystemReset(). The reset + ROM start-up is only a few ms more.
+    // The G4 ROM bootloader has a NARROW window to receive the first 0x7F after
+    // boot, so we wait only the MINIMUM needed for the reset to land in ROM, then
+    // race to send the sync byte. ~200 ms total from command send covers the
+    // STM32's internal delay + ROM init; anything longer risks missing the window.
+    stmDumpRx("App-link reply to BOOTLOADER cmd", 32);  // grab the ACK (non-blocking)
+    delay(200);  // MINIMUM wait for STM32 internal delay (~170 ms) + reset + ROM init
 
     Serial.println("[STM32-BOOT] Switching UART to 115200 8E1 (ESP-IDF driver)...");
     // ------------------------------------------------------------------------
@@ -3889,7 +3884,7 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     // the 0x7F auto-baud byte. Installing the ESP-IDF uart driver and setting
     // UART_PARITY_EVEN explicitly gives correct 8E1 framing on the wire.
     STM32Serial.end();          // release the Arduino driver on UART2
-    delay(100);                 // let the hardware settle
+    delay(5);                   // brief settle after releasing the Arduino driver
 
     // Make sure no stale ESP-IDF driver is already installed on this UART.
     if (uart_is_driver_installed(STM_BOOT_UART)) {
@@ -3915,22 +3910,13 @@ static bool stm32FlashFromSD(char* msg, size_t msgn) {
     Serial.println("[DEBUG] ESP-IDF UART driver installed");
     Serial.printf("[DEBUG] TX pin: %d, RX pin: %d\n", ESP32_TO_STM32_PIN,
                   STM32_TO_ESP32_PIN);
-    delay(1000);  // long settling time before first transmit
-    Serial.println("[DEBUG] Driver ready, flushing...");
+    // Reconfiguring the ESP-IDF driver is already several ms of wall-clock time;
+    // the ROM bootloader is up by now. Flush residue and fire the first 0x7F as
+    // fast as possible to land inside the ROM's narrow receive window.
     uart_flush(STM_BOOT_UART);   // clear any RX/TX residue
-    delay(500);
-
-    // The STM32 ROM bootloader needs plenty of settling time after the reset
-    // before it is ready to auto-baud from the first 0x7F. Sending it too early
-    // is the #1 cause of "bootloader did not respond". Wait generously:
-    //   500 ms after the UART reconfigure + 500 ms after draining the RX
-    //   buffer = 1000 ms total before the first sync attempt.
-    delay(500);  // let the reopened UART + ROM bootloader fully settle
     int pre_drained = stmDrainRx();
-    Serial.printf("[STM32-BOOT] UART configured, draining RX buffer... "
-                  "(%d byte%s discarded)\n",
+    Serial.printf("[STM32-BOOT] UART ready, drained %d byte%s; sending 0x7F now\n",
                   pre_drained, pre_drained == 1 ? "" : "s");
-    delay(500);  // additional settle after draining RX, before first 0x7F
 
     bool ok = false;
     const char* err = nullptr;
