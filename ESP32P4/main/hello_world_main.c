@@ -335,13 +335,6 @@ void app_main(void)
     // Initialize LVGL
     lv_init();
     
-    // Allocate draw buffers (smaller, using internal RAM for now)
-void *buf1 = heap_caps_malloc(LCD_H_RES * 50 * sizeof(lv_color_t), MALLOC_CAP_INTERNAL);
-assert(buf1);
-void *buf2 = heap_caps_malloc(LCD_H_RES * 50 * sizeof(lv_color_t), MALLOC_CAP_INTERNAL);
-assert(buf2);
-ESP_LOGI(TAG, "Allocated LVGL buffers: %d bytes each", LCD_H_RES * 50 * sizeof(lv_color_t));
-    
     // RGB panel configuration
     esp_lcd_rgb_panel_config_t panel_conf = {
         .clk_src = LCD_CLK_SRC_DEFAULT,
@@ -384,10 +377,16 @@ ESP_LOGI(TAG, "Allocated LVGL buffers: %d bytes each", LCD_H_RES * 50 * sizeof(l
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
     
-    // Create LVGL display
+    // Get RGB panel's framebuffer (allocated in PSRAM by esp_lcd_new_rgb_panel)
+    void *fb0 = NULL;
+    void *fb1 = NULL;
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &fb0, &fb1));
+    ESP_LOGI(TAG, "Got RGB framebuffers: fb0=%p, fb1=%p", fb0, fb1);
+    
+    // Create LVGL display using RGB panel's framebuffers directly (most efficient)
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(lvgl_disp, NULL);  // RGB direct mode - no flush needed
-    lv_display_set_buffers(lvgl_disp, buf1, buf2, LCD_H_RES * 50 * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(lvgl_disp, fb0, fb1, LCD_H_RES * LCD_V_RES * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_DIRECT);
     
     // Register vsync callback
     esp_lcd_rgb_panel_event_callbacks_t cbs = {
