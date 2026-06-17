@@ -60,6 +60,7 @@ static const char *TAG = "WELDER_UI";
 
 // LVGL
 static lv_display_t *lvgl_disp = NULL;
+static esp_lcd_panel_handle_t g_panel_handle = NULL;
 static lv_obj_t *label_vcap, *label_temp, *label_cell1, *label_cell2, *label_cell3, *label_status;
 
 // Welder data
@@ -73,12 +74,17 @@ typedef struct {
 
 static welder_data_t welder = {0};
 
-// LVGL flush callback
-static bool rgb_lcd_on_vsync_event(esp_lcd_panel_handle_t panel, const esp_lcd_rgb_panel_event_data_t *edata, void *user_ctx)
+// LVGL flush callback - copies the rendered region into the panel framebuffer.
+// Using a single panel framebuffer + this flush avoids the double-buffer tearing
+// (smeared/garbled numbers) seen in DIRECT mode.
+static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    lv_display_t *disp = (lv_display_t *)user_ctx;
+    int x1 = area->x1;
+    int y1 = area->y1;
+    int x2 = area->x2 + 1;  // esp_lcd uses exclusive end coordinates
+    int y2 = area->y2 + 1;
+    esp_lcd_panel_draw_bitmap(g_panel_handle, x1, y1, x2, y2, px_map);
     lv_display_flush_ready(disp);
-    return false;
 }
 
 // LVGL tick timer
@@ -335,14 +341,6 @@ void app_main(void)
     // Initialize LVGL
     lv_init();
     
-    // Allocate framebuffers in PSRAM for RGB panel (user-managed so we can share with LVGL)
-    size_t fb_size = LCD_H_RES * LCD_V_RES * sizeof(lv_color_t);
-    void *fb0 = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(fb0);
-    void *fb1 = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(fb1);
-    ESP_LOGI(TAG, "Allocated framebuffers in PSRAM: fb0=%p, fb1=%p (%d bytes each)", fb0, fb1, fb_size);
-    
     // RGB panel configuration
     esp_lcd_rgb_panel_config_t panel_conf = {
         .clk_src = LCD_CLK_SRC_DEFAULT,
@@ -368,16 +366,13 @@ void app_main(void)
             .vsync_pulse_width = 4,
         },
         .flags.fb_in_psram = 1,
-        .num_fbs = 2,
-        .bounce_buffer_size_px = 0,
+        .num_fbs = 1,                          // single framebuffer (driver-managed)
+        .bounce_buffer_size_px = LCD_H_RES * 10, // bounce buffer to avoid PSRAM FIFO underflow
     };
-    
-    // Provide user-managed framebuffers to RGB panel
-    panel_conf.user_fbs[0] = fb0;
-    panel_conf.user_fbs[1] = fb1;
     
     esp_lcd_panel_handle_t panel_handle = NULL;
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &panel_handle));
+    g_panel_handle = panel_handle;
     ESP_LOGI(TAG, "RGB LCD panel created");
     
     ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
@@ -391,17 +386,19 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
     
-    // Create LVGL display using the same framebuffers as RGB panel (shared memory = direct rendering)
-    lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
-    lv_display_set_flush_cb(lvgl_disp, NULL);  // RGB direct mode - no flush needed
-    lv_display_set_buffers(lvgl_disp, fb0, fb1, fb_size, LV_DISPLAY_RENDER_MODE_DIRECT);
-    ESP_LOGI(TAG, "LVGL configured with shared framebuffers (direct rendering)");
+    // Allocate LVGL draw buffers (partial mode) - 1/10 of screen each, in internal RAM for speed
+    size_t draw_buf_size = LCD_H_RES * (LCD_V_RES / 10) * sizeof(lv_color_t);
+    void *draw_buf1 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    assert(draw_buf1);
+    void *draw_buf2 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    assert(draw_buf2);
+    ESP_LOGI(TAG, "Allocated LVGL draw buffers: %d bytes each", draw_buf_size);
     
-    // Register vsync callback
-    esp_lcd_rgb_panel_event_callbacks_t cbs = {
-        .on_vsync = rgb_lcd_on_vsync_event,
-    };
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(panel_handle, &cbs, lvgl_disp));
+    // Create LVGL display - PARTIAL mode with flush callback (no tearing on updates)
+    lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
+    lv_display_set_flush_cb(lvgl_disp, lvgl_flush_cb);
+    lv_display_set_buffers(lvgl_disp, draw_buf1, draw_buf2, draw_buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    ESP_LOGI(TAG, "LVGL configured (partial mode + flush callback)");
     
     // Create UI
     create_ui();
