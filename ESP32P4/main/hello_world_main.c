@@ -146,11 +146,23 @@ void backlight_init(void)
     
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &stc8_dev_handle));
     
-    // MATCH ELECROW OFFICIAL: Turn OFF backlight first (will enable after panel init)
-    uint8_t brightness_off[2] = {0x20, 0};  // PWM register 0x20, brightness = 0
+    // CRITICAL: Enable LCD panel power FIRST (register 0x18)
+    uint8_t panel_power[2] = {0x18, 1};
+    ESP_ERROR_CHECK(i2c_master_transmit(stc8_dev_handle, panel_power, 2, 1000 / portTICK_PERIOD_MS));
+    vTaskDelay(pdMS_TO_TICKS(30));  // Wait for panel power to stabilize
+    ESP_LOGI(TAG, "LCD panel power enabled (reg 0x18)");
+    
+    // Enable backlight power rail (register 0x1B)
+    uint8_t backlight_power[2] = {0x1B, 1};
+    ESP_ERROR_CHECK(i2c_master_transmit(stc8_dev_handle, backlight_power, 2, 1000 / portTICK_PERIOD_MS));
+    vTaskDelay(pdMS_TO_TICKS(20));
+    ESP_LOGI(TAG, "Backlight power enabled (reg 0x1B)");
+    
+    // Set PWM brightness to 0 initially (will enable after RGB panel init)
+    uint8_t brightness_off[2] = {0x20, 0};
     ESP_ERROR_CHECK(i2c_master_transmit(stc8_dev_handle, brightness_off, 2, 1000 / portTICK_PERIOD_MS));
     
-    ESP_LOGI(TAG, "STC8 I2C initialized @ 0x2F, backlight OFF (will enable after panel init)");
+    ESP_LOGI(TAG, "Display power & backlight initialized via STC8 @ 0x2F");
 }
 
 void backlight_set(uint8_t brightness)
