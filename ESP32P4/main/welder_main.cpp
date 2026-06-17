@@ -45,7 +45,7 @@ static const char *TAG = "WELDER_UI";
 #define STM32_RX_PIN        30
 #define STM32_BOOT0_PIN     31
 #define BUF_SIZE            2048
-#define STM32_BAUD          2000000
+#define STM32_BAUD          1000000  // Reduced from 2M to avoid corruption at boot
 
 #define LCD_H_RES           800
 #define LCD_V_RES           480
@@ -154,6 +154,8 @@ static void uart_init(void)
     ESP_ERROR_CHECK(uart_set_pin(STM32_UART_NUM, STM32_TX_PIN, STM32_RX_PIN,
                                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
     ESP_ERROR_CHECK(uart_driver_install(STM32_UART_NUM, BUF_SIZE * 2, 0, 0, NULL, 0));
+    // Set RX timeout: flush after 10 symbol times of idle (helps partial-packet delivery).
+    ESP_ERROR_CHECK(uart_set_rx_timeout(STM32_UART_NUM, 10));
     ESP_LOGI(TAG, "UART initialized: %d baud on TX=%d RX=%d", STM32_BAUD, STM32_TX_PIN, STM32_RX_PIN);
 }
 

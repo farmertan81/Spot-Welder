@@ -39,12 +39,11 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 
 # ===== Runtime: task watchdog + crash diagnostics =====
 # The UI now renders, but the first full-screen paint of the large 5-tab
-# 800x480 UI (software-rendered, no 2D accel) overruns the default 5 s task
-# watchdog window, so the WDT keeps printing "IDLE0 did not reset" while the
-# lvgl task is busy in lv_timer_handler(). Give the heavy startup render real
-# headroom (it is a warning-only WDT here - it does NOT reboot, the STM32 poll
-# keeps running), so the UI can settle.
-CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+# 800x480 UI (software-rendered, no 2D accel) can take 30+ seconds, blocking
+# IDLE0 and triggering the task watchdog. Set to 60s to survive the startup
+# render. (TODO: optimize the UI build — 30s is abnormal and starves the UART
+# RX ISR, causing packet corruption. For now, reducing baud to 1 Mbaud helps.)
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # NOTE: do NOT enable CONFIG_ESP_SYSTEM_USE_FRAME_POINTER here. It is applied to
 # the bootloader build too and pushes the bootloader binary past its 24 KB cap
 # (build error: "Bootloader binary size 0x61a0 ... too large"). It also adds
