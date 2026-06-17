@@ -45,8 +45,8 @@ static const char *TAG = "WELDER_UI";
 #define STM32_RX_PIN        30
 #define STM32_BOOT0_PIN     31
 #define BUF_SIZE            2048
-#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB to survive heavy bursts at 2 Mbaud
-#define STM32_BAUD          2000000  // 2 Mbaud required for waveform streaming
+#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (still generous at 1 Mbaud)
+#define STM32_BAUD          1000000  // 1 Mbaud — stable link without HW flow control
 
 #define LCD_H_RES           800
 #define LCD_V_RES           480

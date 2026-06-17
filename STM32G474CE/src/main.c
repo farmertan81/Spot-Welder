@@ -3592,7 +3592,7 @@ static void MX_USART1_UART_Init(void) {
     __HAL_RCC_USART1_CLK_ENABLE();
 
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 2000000;
+    huart1.Init.BaudRate = 1000000;  // 1 Mbaud — stable link without HW flow control
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;
@@ -4643,7 +4643,7 @@ static void jumpToBootloader(void) {
     /* --------------------------------------------------------------------
      * Deinitialize USART1 BEFORE jumping so the ROM bootloader inherits a
      * clean UART peripheral. The running application has USART1 configured
-     * for 2 Mbaud 8N1 with RX interrupts; if we leave that in place the ROM
+     * for 1 Mbaud 8N1 with RX interrupts; if we leave that in place the ROM
      * bootloader's own USART1 init can collide with the stale config and the
      * 0x7F auto-baud / RX never works. HAL_UART_DeInit() resets the registers
      * and runs MspDeInit (GPIO + NVIC), then we kill the peripheral clock so
