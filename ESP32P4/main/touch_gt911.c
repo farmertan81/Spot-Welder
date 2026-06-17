@@ -83,6 +83,7 @@ static void gt911_reset_sequence(void)
 static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static int16_t last_x = 0, last_y = 0;
+    static int16_t last_raw_x = 0, last_raw_y = 0;
 
     uint8_t status = 0;
     if (gt911_read(GT911_REG_STATUS, &status, 1) != ESP_OK) {
@@ -99,24 +100,18 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
                 // Raw coordinates from GT911 (before any transform)
                 int16_t raw_x = (int16_t)(p[1] | (p[2] << 8));
                 int16_t raw_y = (int16_t)(p[3] | (p[4] << 8));
+                last_raw_x = raw_x;
+                last_raw_y = raw_y;
 
-                // ---- Coordinate transform ----
-                // The GT911 touch digitizer's native orientation may not match
-                // the LCD's 800×480 landscape. Tune this block if touches land
-                // in the wrong place. Common fixes:
-                //   - Swap X↔Y if panel is rotated 90°/270°
-                //   - Invert an axis (MAX-val) if mirrored
-                // Try these combinations until taps match their visual location:
-                //   1. x=raw_x,        y=raw_y             (no transform)
-                //   2. x=raw_y,        y=raw_x             (swap only)
-                //   3. x=raw_y,        y=479-raw_x         (swap + invert Y)
-                //   4. x=479-raw_y,    y=raw_x             (swap + invert X)
-                //   5. x=799-raw_x,    y=raw_y             (invert X only)
-                //   6. x=raw_x,        y=479-raw_y         (invert Y only)
-                //   7. x=799-raw_x,    y=479-raw_y         (invert both)
-                // #5 gave correct X but Y stuck at 479 → trying #7 (invert both):
-                int16_t x = (GT911_X_MAX - 1) - raw_x;
-                int16_t y = (GT911_Y_MAX - 1) - raw_y;
+                // ---- CALIBRATION MODE: identity transform ----
+                // We are temporarily passing the RAW digitizer values straight
+                // through (no transform) and logging them, so we can read the
+                // GROUND TRUTH for the four corners and compute the exact
+                // mapping in one shot instead of guessing. Once we know the
+                // raw values for each corner, this block gets replaced with the
+                // correct fixed transform.
+                int16_t x = raw_x;
+                int16_t y = raw_y;
 
                 // Clamp to display bounds
                 if (x < 0) x = 0;
@@ -139,8 +134,9 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         // flooding the console. Remove once touch is verified working.
         bool now_pressed = (points > 0);
         if (now_pressed != s_is_pressed) {
-            ESP_LOGI(TAG, "touch %s @ (%d,%d) pts=%d",
-                     now_pressed ? "DOWN" : "UP  ", last_x, last_y, points);
+            ESP_LOGI(TAG, "touch %s RAW=(%d,%d) pts=%d",
+                     now_pressed ? "DOWN" : "UP  ",
+                     last_raw_x, last_raw_y, points);
         }
         s_is_pressed = now_pressed;
     } else {
