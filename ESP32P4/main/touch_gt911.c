@@ -96,8 +96,28 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         if (points > 0 && points <= 5) {
             uint8_t p[8];
             if (gt911_read(GT911_REG_POINT1, p, sizeof(p)) == ESP_OK) {
-                int16_t x = (int16_t)(p[1] | (p[2] << 8));
-                int16_t y = (int16_t)(p[3] | (p[4] << 8));
+                // Raw coordinates from GT911 (before any transform)
+                int16_t raw_x = (int16_t)(p[1] | (p[2] << 8));
+                int16_t raw_y = (int16_t)(p[3] | (p[4] << 8));
+
+                // ---- Coordinate transform ----
+                // The GT911 touch digitizer's native orientation may not match
+                // the LCD's 800×480 landscape. Tune this block if touches land
+                // in the wrong place. Common fixes:
+                //   - Swap X↔Y if panel is rotated 90°/270°
+                //   - Invert an axis (MAX-val) if mirrored
+                // Try these combinations until taps match their visual location:
+                //   1. x=raw_x,        y=raw_y             (no transform)
+                //   2. x=raw_y,        y=raw_x             (swap only)
+                //   3. x=raw_y,        y=479-raw_x         (swap + invert Y)
+                //   4. x=479-raw_y,    y=raw_x             (swap + invert X)
+                //   5. x=799-raw_x,    y=raw_y             (invert X only)
+                //   6. x=raw_x,        y=479-raw_y         (invert Y only)
+                // Start with #3 (common for portrait→landscape):
+                int16_t x = raw_y;
+                int16_t y = (GT911_Y_MAX - 1) - raw_x;
+
+                // Clamp to display bounds
                 if (x < 0) x = 0;
                 if (x >= GT911_X_MAX) x = GT911_X_MAX - 1;
                 if (y < 0) y = 0;
