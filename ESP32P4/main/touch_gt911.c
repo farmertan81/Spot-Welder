@@ -1,6 +1,8 @@
 // touch_gt911.c — see touch_gt911.h
 #include "touch_gt911.h"
 
+#include <string.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -84,6 +86,7 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static int16_t last_x = 0, last_y = 0;
     static int16_t last_raw_x = 0, last_raw_y = 0;
+    static uint8_t last_bytes[8] = {0};
 
     uint8_t status = 0;
     if (gt911_read(GT911_REG_STATUS, &status, 1) != ESP_OK) {
@@ -102,6 +105,7 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
                 int16_t raw_y = (int16_t)(p[3] | (p[4] << 8));
                 last_raw_x = raw_x;
                 last_raw_y = raw_y;
+                memcpy(last_bytes, p, sizeof(last_bytes));
 
                 // ---- CALIBRATION MODE: identity transform ----
                 // We are temporarily passing the RAW digitizer values straight
@@ -134,8 +138,13 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         // flooding the console. Remove once touch is verified working.
         bool now_pressed = (points > 0);
         if (now_pressed != s_is_pressed) {
-            ESP_LOGI(TAG, "touch %s RAW=(%d,%d) pts=%d",
+            // Dump all 8 raw point bytes so we can determine the exact GT911
+            // byte layout (track-id vs X-low offset) once and for all.
+            ESP_LOGI(TAG, "touch %s bytes=[%02X %02X %02X %02X %02X %02X %02X %02X] "
+                     "(xguess=%d yguess=%d) pts=%d",
                      now_pressed ? "DOWN" : "UP  ",
+                     last_bytes[0], last_bytes[1], last_bytes[2], last_bytes[3],
+                     last_bytes[4], last_bytes[5], last_bytes[6], last_bytes[7],
                      last_raw_x, last_raw_y, points);
         }
         s_is_pressed = now_pressed;
