@@ -425,7 +425,8 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(g_panel_handle, true));
+    // Note: esp_lcd_panel_disp_on_off() is NOT supported for RGB panels
+    // (returns ESP_ERR_NOT_SUPPORTED). RGB panels are always on when receiving signals.
     ESP_LOGI(TAG, "RGB LCD initialized: %dx%d", LCD_H_RES, LCD_V_RES);
 
     vTaskDelay(pdMS_TO_TICKS(100));
