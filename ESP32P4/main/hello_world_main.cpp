@@ -400,10 +400,11 @@ extern "C" void app_main(void)
     esp_lcd_rgb_panel_config_t panel_conf = {};
     panel_conf.clk_src = LCD_CLK_SRC_DEFAULT;
     panel_conf.data_width = 16;
-    panel_conf.de_gpio_num = LCD_DE;
-    panel_conf.pclk_gpio_num = LCD_PCLK;
-    panel_conf.vsync_gpio_num = LCD_VSYNC;
-    panel_conf.hsync_gpio_num = LCD_HSYNC;
+    panel_conf.de_gpio_num = (gpio_num_t)LCD_DE;
+    panel_conf.pclk_gpio_num = (gpio_num_t)LCD_PCLK;
+    panel_conf.vsync_gpio_num = (gpio_num_t)LCD_VSYNC;
+    panel_conf.hsync_gpio_num = (gpio_num_t)LCD_HSYNC;
+    panel_conf.disp_gpio_num = (gpio_num_t)-1;
     int dpins[16] = { LCD_B0, LCD_B1, LCD_B2, LCD_B3, LCD_B4,
                       LCD_G0, LCD_G1, LCD_G2, LCD_G3, LCD_G4, LCD_G5,
                       LCD_R0, LCD_R1, LCD_R2, LCD_R3, LCD_R4 };
@@ -466,7 +467,9 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "UI created");
 
     // ---- LVGL tick timer ----
-    const esp_timer_create_args_t tick_args = { .callback = &lv_tick_task, .name = "lv_tick" };
+    esp_timer_create_args_t tick_args = {};
+    tick_args.callback = &lv_tick_task;
+    tick_args.name = "lv_tick";
     esp_timer_handle_t tick_timer;
     ESP_ERROR_CHECK(esp_timer_create(&tick_args, &tick_timer));
     ESP_ERROR_CHECK(esp_timer_start_periodic(tick_timer, 2000));  // 2 ms

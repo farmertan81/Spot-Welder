@@ -97,8 +97,10 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
             if (gt911_read(GT911_REG_POINT1, p, sizeof(p)) == ESP_OK) {
                 int16_t x = (int16_t)(p[1] | (p[2] << 8));
                 int16_t y = (int16_t)(p[3] | (p[4] << 8));
-                if (x < 0) x = 0; if (x >= GT911_X_MAX) x = GT911_X_MAX - 1;
-                if (y < 0) y = 0; if (y >= GT911_Y_MAX) y = GT911_Y_MAX - 1;
+                if (x < 0) x = 0;
+                if (x >= GT911_X_MAX) x = GT911_X_MAX - 1;
+                if (y < 0) y = 0;
+                if (y >= GT911_Y_MAX) y = GT911_Y_MAX - 1;
                 last_x = x;
                 last_y = y;
             }
