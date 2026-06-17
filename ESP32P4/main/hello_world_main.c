@@ -335,6 +335,14 @@ void app_main(void)
     // Initialize LVGL
     lv_init();
     
+    // Allocate framebuffers in PSRAM for RGB panel (user-managed so we can share with LVGL)
+    size_t fb_size = LCD_H_RES * LCD_V_RES * sizeof(lv_color_t);
+    void *fb0 = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(fb0);
+    void *fb1 = heap_caps_malloc(fb_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    assert(fb1);
+    ESP_LOGI(TAG, "Allocated framebuffers in PSRAM: fb0=%p, fb1=%p (%d bytes each)", fb0, fb1, fb_size);
+    
     // RGB panel configuration
     esp_lcd_rgb_panel_config_t panel_conf = {
         .clk_src = LCD_CLK_SRC_DEFAULT,
@@ -360,7 +368,13 @@ void app_main(void)
             .vsync_pulse_width = 4,
         },
         .flags.fb_in_psram = 1,
+        .num_fbs = 2,
+        .bounce_buffer_size_px = 0,
     };
+    
+    // Provide user-managed framebuffers to RGB panel
+    panel_conf.user_fbs[0] = fb0;
+    panel_conf.user_fbs[1] = fb1;
     
     esp_lcd_panel_handle_t panel_handle = NULL;
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &panel_handle));
@@ -377,16 +391,11 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
     
-    // Get RGB panel's framebuffer (allocated in PSRAM by esp_lcd_new_rgb_panel)
-    void *fb0 = NULL;
-    void *fb1 = NULL;
-    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &fb0, &fb1));
-    ESP_LOGI(TAG, "Got RGB framebuffers: fb0=%p, fb1=%p", fb0, fb1);
-    
-    // Create LVGL display using RGB panel's framebuffers directly (most efficient)
+    // Create LVGL display using the same framebuffers as RGB panel (shared memory = direct rendering)
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(lvgl_disp, NULL);  // RGB direct mode - no flush needed
-    lv_display_set_buffers(lvgl_disp, fb0, fb1, LCD_H_RES * LCD_V_RES * sizeof(lv_color_t), LV_DISPLAY_RENDER_MODE_DIRECT);
+    lv_display_set_buffers(lvgl_disp, fb0, fb1, fb_size, LV_DISPLAY_RENDER_MODE_DIRECT);
+    ESP_LOGI(TAG, "LVGL configured with shared framebuffers (direct rendering)");
     
     // Register vsync callback
     esp_lcd_rgb_panel_event_callbacks_t cbs = {
