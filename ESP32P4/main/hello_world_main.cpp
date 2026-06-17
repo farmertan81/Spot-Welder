@@ -162,7 +162,9 @@ static void stm_send(const char *cmd)
 {
     uart_write_bytes(STM32_UART_NUM, cmd, strlen(cmd));
     uart_write_bytes(STM32_UART_NUM, "\n", 1);
-    ESP_LOGI(TAG, "-> STM32: %s", cmd);
+    // Debug-level: the periodic STATUS poll (every ~350 ms) would otherwise
+    // flood the console. Raise the log level to DEBUG to see it if needed.
+    ESP_LOGD(TAG, "-> STM32: %s", cmd);
 }
 
 static void stm_sendf(const char *fmt, ...)
