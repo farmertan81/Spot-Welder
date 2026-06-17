@@ -408,10 +408,28 @@ static void lvgl_task(void *arg)
             xSemaphoreTake(g_state_mtx, portMAX_DELAY);
             snap = g_state;
             xSemaphoreGive(g_state_mtx);
+            
+            int64_t t0 = esp_timer_get_time();
             ui_update(snap);
+            int64_t elapsed_us = esp_timer_get_time() - t0;
+            int32_t elapsed_ms = (int32_t)(elapsed_us / 1000LL);
+            if (elapsed_ms >= 1000) {
+                ESP_LOGE(TAG, "ui_update() took %ld ms — BLOCKING CPU0!", elapsed_ms);
+            } else if (elapsed_ms >= 100) {
+                ESP_LOGW(TAG, "ui_update() took %ld ms (slow)", elapsed_ms);
+            }
         }
 
+        int64_t t0 = esp_timer_get_time();
         lv_timer_handler();
+        int64_t elapsed_us = esp_timer_get_time() - t0;
+        int32_t elapsed_ms = (int32_t)(elapsed_us / 1000LL);
+        if (elapsed_ms >= 1000) {
+            ESP_LOGE(TAG, "lv_timer_handler() took %ld ms — BLOCKING CPU0!", elapsed_ms);
+        } else if (elapsed_ms >= 100) {
+            ESP_LOGW(TAG, "lv_timer_handler() took %ld ms (slow)", elapsed_ms);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
