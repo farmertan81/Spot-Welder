@@ -44,3 +44,5 @@ esp32/wifi_config_from_esp_live.py
 **/.vscode/c_cpp_properties.json
 **/.vscode/launch.json
 **/.vscode/ipch/
+# VM agent tool logs (not part of project)
+.logs/

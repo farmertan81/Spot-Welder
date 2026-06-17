@@ -1,6 +1,12 @@
 # ===== LVGL configuration for the spot-welder UI (ui.cpp) =====
-# NOTE: if you have already built once, delete the generated `sdkconfig`
-# (or run `idf.py menuconfig`) so these defaults are applied.
+# NOTE: these defaults only apply to a FRESH config. If you have already built
+# once, the generated `sdkconfig` already has the old values and will WIN over
+# this file. Do NOT just delete `sdkconfig` (that would also wipe your PSRAM /
+# flash-size / target settings, which live only in `sdkconfig`). Instead, apply
+# the LVGL changes below via:  idf.py menuconfig
+#   Component config -> LVGL configuration -> Memory Settings
+#     -> set the allocator to "C library's malloc/free"  (LV_USE_CLIB_MALLOC)
+# then: idf.py -p COM6 build flash monitor
 
 # Color depth must match the RGB panel (RGB565)
 CONFIG_LV_COLOR_DEPTH_16=y
@@ -20,5 +26,13 @@ CONFIG_LV_USE_SPINBOX=y
 CONFIG_LV_USE_BAR=y
 CONFIG_LV_USE_QRCODE=y
 
-# Give LVGL enough heap for the 800x480 UI with many widgets
-CONFIG_LV_MEM_SIZE_KILOBYTES=64
+# ===== LVGL memory allocator =====
+# The 5-tab 800x480 UI needs far more than the 64 KB builtin LVGL pool. When
+# the builtin pool overflows mid-build, lv_malloc() fails, LV_ASSERT_MALLOC
+# spins forever, and the task watchdog reboots the chip (~5 s after touch init).
+# Use the C-library allocator instead so LVGL draws from the system heap, which
+# already includes the 32 MB PSRAM pool (see "Adding pool of 32768K of PSRAM
+# memory to heap allocator" in the boot log). This eliminates the OOM crash.
+CONFIG_LV_USE_CLIB_MALLOC=y
+# (LV_MEM_SIZE_KILOBYTES only applies to the builtin allocator, which is now
+#  disabled, so it is intentionally omitted.)
