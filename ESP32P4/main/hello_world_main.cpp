@@ -224,6 +224,17 @@ static void parse_status_line(const char *line)
     if (extract_int(line, "armed=", &iv))    g_state.armed   = (iv == 1);
     if (extract_int(line, "ready=", &iv))    g_state.welding = (iv == 1);
 
+    // Contact/probe hold time (STATUS packet). Each step = 0.5s; the UI shows
+    // "Contact X.Xs" from this. Was previously unparsed -> stuck at 0.0s.
+    if (extract_int(line, "contact_hold_steps=", &iv)) g_state.contact_hold_steps = (uint8_t)iv;
+
+    // Charger telemetry (STATUS2 packet): chg_en = charger relay on/off,
+    // ichg = charge current in A. Mirror the old ESP32 behaviour and only
+    // report current while the charger is actually on (else show 0).
+    // These were previously unparsed -> charging gauge stuck at 0.
+    if (extract_int(line, "chg_en=", &iv)) g_state.charging = (iv == 1);
+    if (extract_float(line, "ichg=", &fv)) g_state.charger_current = g_state.charging ? fv : 0.0f;
+
     if (extract_float(line, "energy_cap_j=", &fv))  { g_state.energy_cap_j = fv;  energy_cap_j = fv; }
     if (extract_float(line, "energy_weld_j=", &fv)) { g_state.energy_weld_j = fv; energy_weld_j = fv; }
     if (extract_float(line, "energy_loss_j=", &fv)) { g_state.energy_loss_j = fv; energy_loss_j = fv; }
@@ -331,6 +342,11 @@ static void stm32_task(void *arg)
             char *save = NULL;
             char *line = strtok_r((char *)data, "\r\n", &save);
             while (line) {
+                // Echo the raw STM32 feed to the console (like the old ESP32
+                // did) so STATUS/STATUS2/EVENT packets are visible in monitor.
+                if (line[0] != '\0') {
+                    ESP_LOGI(TAG, "STM32 RX: %s", line);
+                }
                 parse_status_line(line);
                 line = strtok_r(NULL, "\r\n", &save);
             }
