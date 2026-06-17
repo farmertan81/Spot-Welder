@@ -49,7 +49,7 @@ static const char *TAG = "WELDER_UI";
 #define LCD_R1                 18
 #define LCD_R2                 17
 #define LCD_R3                 16
-#define LCD_R4                 15
+#define LCD_R4                 15  // VERIFIED: GPIO15 per schematic (was incorrectly 12 = collision with G2)
 
 
 // I2C for backlight control
@@ -137,22 +137,31 @@ void backlight_init(void)
     // Add STC8 co-processor device at 0x2F
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = 0x2F,  // ← CORRECT ADDRESS!
+        .device_address = 0x2F,
         .scl_speed_hz = 400000,
     };
     
     i2c_master_dev_handle_t dev_handle;
     ESP_ERROR_CHECK(i2c_master_bus_add_device(bus_handle, &dev_config, &dev_handle));
     
-    // Enable backlight power (GPIO LCD_BL_POWER) — KEEP
-    uint8_t power_on[2] = {0x1B, 0x01};
-    ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, power_on, 2, 1000 / portTICK_PERIOD_MS));
-
-    // Set PWM brightness — MUST be 0-100, NOT 0-255!
-    uint8_t brightness[2] = {0x20, 0x64};   // 0x64 = 100 = full brightness  ← WAS 0xFF
-    ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, brightness, 2, 1000 / portTICK_PERIOD_MS));
+    // Enable LCD panel power first (GPIO0 on STC8, register 0x18)
+    uint8_t lcd_power[2] = {0x18, 0x01};
+    ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, lcd_power, 2, 1000 / portTICK_PERIOD_MS));
+    ESP_LOGI(TAG, "LCD panel power enabled (reg 0x18)");
+    vTaskDelay(pdMS_TO_TICKS(20));
     
-    ESP_LOGI(TAG, "Backlight enabled via STC8 @ 0x2F");
+    // Enable backlight power (GPIO3 on STC8, register 0x1B = LCD_BL_POWER)
+    uint8_t bl_power[2] = {0x1B, 0x01};
+    ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, bl_power, 2, 1000 / portTICK_PERIOD_MS));
+    ESP_LOGI(TAG, "Backlight power enabled (reg 0x1B)");
+    vTaskDelay(pdMS_TO_TICKS(20));
+
+    // Set PWM brightness to 100% (register 0x20, range 0-100)
+    uint8_t brightness[2] = {0x20, 100};
+    ESP_ERROR_CHECK(i2c_master_transmit(dev_handle, brightness, 2, 1000 / portTICK_PERIOD_MS));
+    ESP_LOGI(TAG, "Backlight PWM set to 100%%");
+    
+    ESP_LOGI(TAG, "Display power & backlight initialized via STC8 @ 0x2F");
 }
 
 void send_stm32_command(const char *cmd)
@@ -342,10 +351,15 @@ ESP_LOGI(TAG, "Allocated LVGL buffers: %d bytes each", LCD_H_RES * 50 * sizeof(l
     };
     
     esp_lcd_panel_handle_t panel_handle = NULL;
-
-    ESP_LOGI(TAG, "Explicitly turning display ON...");
-  
-    ESP_LOGI(TAG, "Display ON command sent");
+    ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &panel_handle));
+    ESP_LOGI(TAG, "RGB LCD panel created");
+    
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(panel_handle));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(panel_handle));
+    ESP_LOGI(TAG, "RGB LCD initialized: %dx%d", LCD_H_RES, LCD_V_RES);
+    
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_handle, true));
+    ESP_LOGI(TAG, "Display ON");
     
     // Create LVGL display
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
