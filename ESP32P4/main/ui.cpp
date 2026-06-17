@@ -49,6 +49,7 @@
 #include "ui.h"
 
 #include "arduino_compat.h"  // millis()/Serial shim (ESP-IDF port of Arduino UI)
+#include "touch_gt911.h"     // touch_is_physically_down() for anti-shudder
 #include <lvgl.h>
 #include <math.h>
 #include <stdio.h>   // for standard snprintf/sscanf (supports %f)
@@ -162,12 +163,11 @@ static void make_interaction_safe(lv_obj_t* obj) {
 static const uint32_t HOLD_INITIAL_DELAY_MS = 400;
 static const uint32_t HOLD_REPEAT_RATE_MS = 120;
 
-// RAW physical touch state, published by the debounced touch reader in
-// main.cpp.  We gate the repeat on this instead of LVGL's PRESSED state so a
-// hold STOPS the instant the finger physically lifts.  LVGL keeps reporting
-// PRESSED for TOUCH_RELEASE_DEBOUNCE_MS (and re-arms on release noise), which
-// is exactly what caused the +/- overshoot after release.
-extern bool touch_is_physically_down();
+// RAW physical touch state, provided by touch_gt911.c (tracks the GT911 pressed
+// state from the LVGL input callback).  We gate the repeat on this instead of
+// LVGL's PRESSED state so a hold STOPS the instant the finger physically lifts.
+// LVGL keeps reporting PRESSED for a debounce window (and re-arms on release
+// noise), which would cause +/- overshoot after release.
 
 // Set to 1 to print hold-to-repeat diagnostics to the serial console:
 //   start of press, every repeat (with running count), and release (with the

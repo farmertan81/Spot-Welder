@@ -18,6 +18,10 @@ extern "C" {
 // bound to the given display. Returns true on success.
 bool touch_gt911_init(i2c_master_bus_handle_t bus, lv_display_t *disp);
 
+// Returns true if the touch panel is currently reporting a pressed state.
+// This reflects the most recent reading from the LVGL input callback.
+bool touch_is_physically_down(void);
+
 #ifdef __cplusplus
 }
 #endif

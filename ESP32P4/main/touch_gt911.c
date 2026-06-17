@@ -23,6 +23,7 @@ static const char *TAG = "GT911";
 #define GT911_REG_POINT1    0x8150  // first touch point (8 bytes)
 
 static i2c_master_dev_handle_t s_dev = NULL;
+static bool s_is_pressed = false;  // Tracks current touch state
 
 // Read `len` bytes from a 16-bit register address.
 static esp_err_t gt911_read(uint16_t reg, uint8_t *data, size_t len)
@@ -112,10 +113,12 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.y = last_y;
         data->state = (points > 0) ? LV_INDEV_STATE_PRESSED
                                    : LV_INDEV_STATE_RELEASED;
+        s_is_pressed = (points > 0);
     } else {
         data->point.x = last_x;
         data->point.y = last_y;
         data->state = LV_INDEV_STATE_RELEASED;
+        s_is_pressed = false;
     }
 }
 
@@ -149,4 +152,9 @@ bool touch_gt911_init(i2c_master_bus_handle_t bus, lv_display_t *disp)
     ESP_LOGI(TAG, "GT911 touch initialized (addr 0x%02X, %dx%d)",
              GT911_I2C_ADDR, GT911_X_MAX, GT911_Y_MAX);
     return true;
+}
+
+bool touch_is_physically_down(void)
+{
+    return s_is_pressed;
 }
