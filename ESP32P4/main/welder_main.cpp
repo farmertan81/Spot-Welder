@@ -320,6 +320,23 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     esp_lcd_panel_draw_bitmap(g_panel_handle, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px_map);
     lv_display_flush_ready(disp);
+
+    // Instrument large redraws to diagnose the ~20s flicker issue. Log only if
+    // the flush area exceeds 40% of the screen (potential full/large refresh).
+    static uint32_t last_large_flush_ms = 0;
+    uint32_t w = area->x2 - area->x1 + 1;
+    uint32_t h = area->y2 - area->y1 + 1;
+    uint32_t pixels = w * h;
+    uint32_t screen_pixels = LCD_H_RES * LCD_V_RES;
+    if (pixels > screen_pixels * 40 / 100) {
+        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        uint32_t delta_ms = now - last_large_flush_ms;
+        ESP_LOGI(TAG, "LARGE FLUSH: %lux%lu (%lu%% screen) after %lums",
+                 (unsigned long)w, (unsigned long)h,
+                 (unsigned long)(pixels * 100 / screen_pixels),
+                 (unsigned long)delta_ms);
+        last_large_flush_ms = now;
+    }
 }
 
 static void lv_tick_task(void *arg) { lv_tick_inc(2); }
@@ -342,10 +359,14 @@ static void stm32_task(void *arg)
             char *save = NULL;
             char *line = strtok_r((char *)data, "\r\n", &save);
             while (line) {
-                // Echo the raw STM32 feed to the console (like the old ESP32
-                // did) so STATUS/STATUS2/EVENT packets are visible in monitor.
+                // Log the STM32 feed selectively: STATUS/STATUS2 at DEBUG level
+                // (quiet by default), EVENT/WAVEFORM/etc. at INFO (always visible).
                 if (line[0] != '\0') {
-                    ESP_LOGI(TAG, "STM32 RX: %s", line);
+                    if (strstr(line, "STATUS") == line) {
+                        ESP_LOGD(TAG, "STM32: %s", line);  // periodic telemetry (quiet)
+                    } else {
+                        ESP_LOGI(TAG, "STM32: %s", line);  // events/waveforms/cal (loud)
+                    }
                 }
                 parse_status_line(line);
                 line = strtok_r(NULL, "\r\n", &save);

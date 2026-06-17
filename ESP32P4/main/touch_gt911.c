@@ -122,11 +122,10 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.y = last_y;
         data->state = (points > 0) ? LV_INDEV_STATE_PRESSED
                                    : LV_INDEV_STATE_RELEASED;
-        // Lightweight verification log on press/release transitions only.
-        // Safe to delete once touch is confirmed working in the UI.
+        // Touch verification log (DEBUG level — enable via menuconfig if needed).
         bool now_pressed = (points > 0);
         if (now_pressed != s_is_pressed) {
-            ESP_LOGI(TAG, "touch %s @ (%d,%d) pts=%d",
+            ESP_LOGD(TAG, "touch %s @ (%d,%d) pts=%d",
                      now_pressed ? "DOWN" : "UP  ", last_x, last_y, points);
         }
         s_is_pressed = now_pressed;

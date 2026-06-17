@@ -1,4 +1,4 @@
-idf_component_register(SRCS "hello_world_main.cpp"
+idf_component_register(SRCS "welder_main.cpp"
                             "ui.cpp"
                             "touch_gt911.c"
                        PRIV_REQUIRES spi_flash
