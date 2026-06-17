@@ -414,6 +414,13 @@ extern "C" void app_main(void)
     panel_conf.timings.pclk_hz = LCD_PIXEL_CLOCK_HZ;
     panel_conf.timings.h_res = LCD_H_RES;
     panel_conf.timings.v_res = LCD_V_RES;
+    // ---- RGB panel timing ----
+    // If the image is shifted horizontally, tune hsync_back_porch (shifts the
+    // image RIGHT when increased, LEFT when decreased); for vertical shift tune
+    // vsync_back_porch the same way. Elecrow's proven values for this 800x480
+    // CrowPanel panel family are HBP=43, HFP=8, HPW=4 / VBP=12, VFP=8, VPW=4
+    // (PCLK ~15-16 MHz). Adjust these toward those numbers if the picture is
+    // off-center, then rebuild.
     panel_conf.timings.hsync_back_porch = 8;
     panel_conf.timings.hsync_front_porch = 8;
     panel_conf.timings.hsync_pulse_width = 4;

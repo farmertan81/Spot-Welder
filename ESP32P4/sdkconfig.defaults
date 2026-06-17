@@ -45,11 +45,10 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 # headroom (it is a warning-only WDT here - it does NOT reboot, the STM32 poll
 # keeps running), so the UI can settle.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
-# Frame pointer => the panic/WDT dump prints a FULL backtrace (the monitor log
-# explicitly asked for this). If a hang remains, this tells us the exact draw
-# function lv_timer_handler() is stuck in, instead of just the outer frame.
-CONFIG_ESP_SYSTEM_USE_FRAME_POINTER=y
-# Apply these two via: idf.py menuconfig
+# NOTE: do NOT enable CONFIG_ESP_SYSTEM_USE_FRAME_POINTER here. It is applied to
+# the bootloader build too and pushes the bootloader binary past its 24 KB cap
+# (build error: "Bootloader binary size 0x61a0 ... too large"). It also adds
+# per-function runtime overhead, which slows the already-heavy software render.
+# Apply the watchdog timeout via: idf.py menuconfig
 #   Component config -> ESP System Settings
 #     -> Task Watchdog timeout period (seconds)        = 30
-#     -> "Enable backtrace using frame pointer"        = [*]

@@ -113,7 +113,15 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.y = last_y;
         data->state = (points > 0) ? LV_INDEV_STATE_PRESSED
                                    : LV_INDEV_STATE_RELEASED;
-        s_is_pressed = (points > 0);
+        // DEBUG: log only on a press/release transition so we can confirm the
+        // GT911 is delivering touches (and at what coordinates) without
+        // flooding the console. Remove once touch is verified working.
+        bool now_pressed = (points > 0);
+        if (now_pressed != s_is_pressed) {
+            ESP_LOGI(TAG, "touch %s @ (%d,%d) pts=%d",
+                     now_pressed ? "DOWN" : "UP  ", last_x, last_y, points);
+        }
+        s_is_pressed = now_pressed;
     } else {
         data->point.x = last_x;
         data->point.y = last_y;
