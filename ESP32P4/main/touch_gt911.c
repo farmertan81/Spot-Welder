@@ -113,9 +113,9 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
                 //   4. x=479-raw_y,    y=raw_x             (swap + invert X)
                 //   5. x=799-raw_x,    y=raw_y             (invert X only)
                 //   6. x=raw_x,        y=479-raw_y         (invert Y only)
-                // Start with #3 (common for portrait→landscape):
-                int16_t x = raw_y;
-                int16_t y = (GT911_Y_MAX - 1) - raw_x;
+                // #3 gave correct Y but X stuck at 799 → trying #5:
+                int16_t x = (GT911_X_MAX - 1) - raw_x;
+                int16_t y = raw_y;
 
                 // Clamp to display bounds
                 if (x < 0) x = 0;
