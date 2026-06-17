@@ -1,8 +1,6 @@
 // touch_gt911.c — see touch_gt911.h
 #include "touch_gt911.h"
 
-#include <string.h>
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -85,8 +83,6 @@ static void gt911_reset_sequence(void)
 static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
 {
     static int16_t last_x = 0, last_y = 0;
-    static int16_t last_raw_x = 0, last_raw_y = 0;
-    static uint8_t last_bytes[8] = {0};
 
     uint8_t status = 0;
     if (gt911_read(GT911_REG_STATUS, &status, 1) != ESP_OK) {
@@ -98,24 +94,17 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
     if (status & 0x80) {
         uint8_t points = status & 0x0F;
         if (points > 0 && points <= 5) {
+            // GT911 point-1 data block starts at 0x8150 with the X-low byte
+            // (the track-id lives at 0x814F, NOT here). So the 8 bytes read are:
+            //   p[0]=X low, p[1]=X high, p[2]=Y low, p[3]=Y high,
+            //   p[4]=size low, p[5]=size high, p[6..7]=reserved.
+            // This panel's digitizer is already in 800x480 landscape with the
+            // same origin as the display, so NO swap/inversion is needed -
+            // verified by corner taps: TL->(14,12), BR->(787,468), C->(408,279).
             uint8_t p[8];
             if (gt911_read(GT911_REG_POINT1, p, sizeof(p)) == ESP_OK) {
-                // Raw coordinates from GT911 (before any transform)
-                int16_t raw_x = (int16_t)(p[1] | (p[2] << 8));
-                int16_t raw_y = (int16_t)(p[3] | (p[4] << 8));
-                last_raw_x = raw_x;
-                last_raw_y = raw_y;
-                memcpy(last_bytes, p, sizeof(last_bytes));
-
-                // ---- CALIBRATION MODE: identity transform ----
-                // We are temporarily passing the RAW digitizer values straight
-                // through (no transform) and logging them, so we can read the
-                // GROUND TRUTH for the four corners and compute the exact
-                // mapping in one shot instead of guessing. Once we know the
-                // raw values for each corner, this block gets replaced with the
-                // correct fixed transform.
-                int16_t x = raw_x;
-                int16_t y = raw_y;
+                int16_t x = (int16_t)(p[0] | (p[1] << 8));
+                int16_t y = (int16_t)(p[2] | (p[3] << 8));
 
                 // Clamp to display bounds
                 if (x < 0) x = 0;
@@ -133,19 +122,12 @@ static void gt911_lvgl_read(lv_indev_t *indev, lv_indev_data_t *data)
         data->point.y = last_y;
         data->state = (points > 0) ? LV_INDEV_STATE_PRESSED
                                    : LV_INDEV_STATE_RELEASED;
-        // DEBUG: log only on a press/release transition so we can confirm the
-        // GT911 is delivering touches (and at what coordinates) without
-        // flooding the console. Remove once touch is verified working.
+        // Lightweight verification log on press/release transitions only.
+        // Safe to delete once touch is confirmed working in the UI.
         bool now_pressed = (points > 0);
         if (now_pressed != s_is_pressed) {
-            // Dump all 8 raw point bytes so we can determine the exact GT911
-            // byte layout (track-id vs X-low offset) once and for all.
-            ESP_LOGI(TAG, "touch %s bytes=[%02X %02X %02X %02X %02X %02X %02X %02X] "
-                     "(xguess=%d yguess=%d) pts=%d",
-                     now_pressed ? "DOWN" : "UP  ",
-                     last_bytes[0], last_bytes[1], last_bytes[2], last_bytes[3],
-                     last_bytes[4], last_bytes[5], last_bytes[6], last_bytes[7],
-                     last_raw_x, last_raw_y, points);
+            ESP_LOGI(TAG, "touch %s @ (%d,%d) pts=%d",
+                     now_pressed ? "DOWN" : "UP  ", last_x, last_y, points);
         }
         s_is_pressed = now_pressed;
     } else {
