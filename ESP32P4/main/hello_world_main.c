@@ -347,11 +347,11 @@ ESP_LOGI(TAG, "Allocated LVGL buffers: %d bytes each", LCD_H_RES * 50 * sizeof(l
             .pclk_hz = LCD_PIXEL_CLOCK_HZ,
             .h_res = LCD_H_RES,
             .v_res = LCD_V_RES,
-            .hsync_back_porch = 30,
-            .hsync_front_porch = 210,
+            .hsync_back_porch = 8,      // FIXED: Was 30, now matches Elecrow official (bsp_illuminate.h line 47)
+            .hsync_front_porch = 8,     // FIXED: Was 210, now matches Elecrow official (bsp_illuminate.h line 48)
             .hsync_pulse_width = 4,
-            .vsync_back_porch = 4,
-            .vsync_front_porch = 4,
+            .vsync_back_porch = 16,     // FIXED: Was 4, now matches Elecrow official (bsp_illuminate.h line 50)
+            .vsync_front_porch = 16,    // FIXED: Was 4, now matches Elecrow official (bsp_illuminate.h line 51)
             .vsync_pulse_width = 4,
         },
         .flags.fb_in_psram = 1,
