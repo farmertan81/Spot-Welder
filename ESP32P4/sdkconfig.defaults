@@ -1,0 +1,24 @@
+# ===== LVGL configuration for the spot-welder UI (ui.cpp) =====
+# NOTE: if you have already built once, delete the generated `sdkconfig`
+# (or run `idf.py menuconfig`) so these defaults are applied.
+
+# Color depth must match the RGB panel (RGB565)
+CONFIG_LV_COLOR_DEPTH_16=y
+
+# Fonts used by ui.cpp
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_18=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_24=y
+CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+
+# Widgets / extras used by ui.cpp
+CONFIG_LV_USE_TABVIEW=y
+CONFIG_LV_USE_SPINBOX=y
+CONFIG_LV_USE_BAR=y
+CONFIG_LV_USE_QRCODE=y
+
+# Give LVGL enough heap for the 800x480 UI with many widgets
+CONFIG_LV_MEM_SIZE_KILOBYTES=64
