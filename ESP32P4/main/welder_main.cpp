@@ -45,7 +45,7 @@ static const char *TAG = "WELDER_UI";
 #define STM32_RX_PIN        30
 #define STM32_BOOT0_PIN     31
 #define BUF_SIZE            2048
-#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB to survive 30s UI build at 2 Mbaud
+#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB to survive heavy bursts at 2 Mbaud
 #define STM32_BAUD          2000000  // 2 Mbaud required for waveform streaming
 
 #define LCD_H_RES           800
@@ -325,23 +325,9 @@ static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
     esp_lcd_panel_draw_bitmap(g_panel_handle, area->x1, area->y1,
                               area->x2 + 1, area->y2 + 1, px_map);
     lv_display_flush_ready(disp);
-
-    // Instrument large redraws to diagnose the ~20s flicker issue. Log only if
-    // the flush area exceeds 40% of the screen (potential full/large refresh).
-    static uint32_t last_large_flush_ms = 0;
-    uint32_t w = area->x2 - area->x1 + 1;
-    uint32_t h = area->y2 - area->y1 + 1;
-    uint32_t pixels = w * h;
-    uint32_t screen_pixels = LCD_H_RES * LCD_V_RES;
-    if (pixels > screen_pixels * 40 / 100) {
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        uint32_t delta_ms = now - last_large_flush_ms;
-        ESP_LOGI(TAG, "LARGE FLUSH: %lux%lu (%lu%% screen) after %lums",
-                 (unsigned long)w, (unsigned long)h,
-                 (unsigned long)(pixels * 100 / screen_pixels),
-                 (unsigned long)delta_ms);
-        last_large_flush_ms = now;
-    }
+    // NOTE: never call ESP_LOGx here. This runs in the LVGL render hot path and
+    // shares the stdout lock with stm32_task; logging here stalls rendering and
+    // contributes to the periodic flicker.
 }
 
 static void lv_tick_task(void *arg) { lv_tick_inc(2); }
@@ -355,6 +341,16 @@ static void stm32_task(void *arg)
     uint8_t *data = (uint8_t *)malloc(BUF_SIZE);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
+    // Console-echo throttle. The 115200 console is ~17x slower than the 2 Mbaud
+    // STM32 link, so echoing every line floods the console TX buffer, blocks
+    // this read loop, overflows the 2 Mbaud RX FIFO (-> dropped bytes /
+    // "STATrS" corruption) and starves CPU0 idle (-> flicker + task watchdog).
+    // Policy:
+    //   - STATUS / STATUS2 telemetry: parsed always, but echoed at most 1 Hz.
+    //   - STM32's own per-command "DBG,..." echo: never printed (pure noise).
+    //   - Everything else (EVENT / WAVEFORM / RXHEALTH / CAL / errors): printed.
+    uint32_t last_status_log_ms = 0;
+
     while (1) {
         stm_send("STATUS");
         int len = uart_read_bytes(STM32_UART_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(150));
@@ -364,16 +360,24 @@ static void stm32_task(void *arg)
             char *save = NULL;
             char *line = strtok_r((char *)data, "\r\n", &save);
             while (line) {
-                // Log the STM32 feed selectively: STATUS/STATUS2 at DEBUG level
-                // (quiet by default), EVENT/WAVEFORM/etc. at INFO (always visible).
+                parse_status_line(line);
+
                 if (line[0] != '\0') {
-                    if (strstr(line, "STATUS") == line) {
-                        ESP_LOGD(TAG, "STM32: %s", line);  // periodic telemetry (quiet)
-                    } else {
-                        ESP_LOGI(TAG, "STM32: %s", line);  // events/waveforms/cal (loud)
+                    // Tolerant prefix match: "STAT" still catches corrupted
+                    // "STATrS"/"STATre" variants so they don't slip through as
+                    // "events" and re-trigger the flood.
+                    bool is_status = (strncmp(line, "STAT", 4) == 0);
+                    bool is_dbg    = (strncmp(line, "DBG", 3) == 0);
+                    if (is_status) {
+                        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                        if (now - last_status_log_ms >= 1000) {
+                            last_status_log_ms = now;
+                            ESP_LOGI(TAG, "STM32: %s", line);  // 1 Hz heartbeat
+                        }
+                    } else if (!is_dbg) {
+                        ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
                     }
                 }
-                parse_status_line(line);
                 line = strtok_r(NULL, "\r\n", &save);
             }
         }
