@@ -348,27 +348,22 @@ static IRAM_ATTR bool rgb_vsync_cb(esp_lcd_panel_handle_t panel,
     return hp_task_woken == pdTRUE;
 }
 
-// Double-buffered DIRECT-mode flush. LVGL renders the whole frame straight into
-// one of the two driver framebuffers, so for non-final areas there is nothing
-// to copy. On the final area we hand that framebuffer to the scan-out engine
-// and block until the next VSYNC, so the engine never latches a buffer mid-draw
-// (this is what eliminates the drifting/tearing lines under WiFi load).
+// Double-buffered FULL-mode flush. LVGL renders the whole frame into one of the
+// two driver framebuffers, then hands that framebuffer to the scan-out engine on
+// VSYNC so the swap lands on a frame boundary (tear-free). FULL mode (vs DIRECT)
+// lets LVGL render sub-areas internally during animation/scroll, then only waits
+// for VSYNC on the final swap → smooth scrolling without tearing.
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    if (lv_display_flush_is_last(disp)) {
-        // DIRECT mode: px_map is the base of the framebuffer LVGL just rendered.
-        // Draw the WHOLE screen so the RGB driver recognises px_map as one of its
-        // own framebuffers and switches the active scan-out buffer to it (no copy)
-        // rather than blitting a sub-rectangle. Then wait for the next VSYNC so
-        // the swap lands on a frame boundary (tear-free).
-        esp_lcd_panel_draw_bitmap(g_panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, px_map);
-        if (g_vsync_sem) {
-            xSemaphoreTake(g_vsync_sem, 0);
-            xSemaphoreTake(g_vsync_sem, portMAX_DELAY);
-        }
+    // FULL mode: px_map is the base of the framebuffer LVGL just rendered (the
+    // entire screen). Draw the WHOLE screen so the RGB driver recognises px_map
+    // as one of its own framebuffers and switches the active scan-out buffer to
+    // it (zero-copy). Then wait for the next VSYNC so the swap is tear-free.
+    esp_lcd_panel_draw_bitmap(g_panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, px_map);
+    if (g_vsync_sem) {
+        xSemaphoreTake(g_vsync_sem, 0);
+        xSemaphoreTake(g_vsync_sem, portMAX_DELAY);
     }
-    // Non-final areas in DIRECT mode need no work: LVGL has already rendered them
-    // straight into the framebuffer; only the final area triggers the swap above.
     (void)area;
     lv_display_flush_ready(disp);
     // NOTE: never call ESP_LOGx here. This runs in the LVGL render hot path and
@@ -584,20 +579,21 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
 
-    // ---- LVGL display (DIRECT mode, double framebuffer) ----
+    // ---- LVGL display (FULL mode, double framebuffer) ----
     // Use the RGB driver's two PSRAM framebuffers directly as LVGL's draw
     // buffers. LVGL renders the full frame into the back buffer and the flush
     // callback swaps it in on VSYNC (see lvgl_flush_cb). This both frees the
     // internal RAM the old partial-mode draw buffers would have used and gives
-    // a stable, tear-free scan-out under WiFi load.
+    // a stable, tear-free scan-out under WiFi load. FULL mode (vs DIRECT) allows
+    // internal LVGL optimizations during scroll/animation for smooth feel.
     void *fb0 = NULL, *fb1 = NULL;
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 2, &fb0, &fb1));
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(lvgl_disp, lvgl_flush_cb);
     lv_display_set_buffers(lvgl_disp, fb0, fb1,
                            LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
-                           LV_DISPLAY_RENDER_MODE_DIRECT);
-    ESP_LOGI(TAG, "LVGL display ready (DIRECT mode, 2 framebuffers)");
+                           LV_DISPLAY_RENDER_MODE_FULL);
+    ESP_LOGI(TAG, "LVGL display ready (FULL mode, 2 framebuffers)");
 
     // ---- GT911 touch (shares the STC8 I2C bus) ----
     if (!touch_gt911_init(g_i2c_bus, lvgl_disp)) {
@@ -619,7 +615,11 @@ extern "C" void app_main(void)
     ui_set_fw_update_stm32_cb(cb_fw_update_stm32);
 
     ui_init(cb_arm_toggle, cb_recipe_apply);
-    ui_load_config(config_defaults());
+    ConfigState defaults = config_defaults();
+    ui_load_config(defaults);
+    // Send the defaults to the STM32 so the status display reads back the
+    // correct values (contact_hold_steps=2→1.0s, not the STM32's default of 4→2.0s).
+    cb_config_change(defaults);
     ui_set_system_info("P4-1.0", "ESP32-P4", 16 * 1024 * 1024, 0);
     ESP_LOGI(TAG, "UI created");
 
