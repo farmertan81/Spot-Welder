@@ -224,21 +224,15 @@ static void do_power_step(bool increment);
 
 // Perform one increment/decrement for the given repeat context.
 static void repeat_apply_step(HoldRepeatCtx* ctx) {
-    ESP_LOGI("UI_REPEAT", "repeat_apply_step: step_fn=%p, is_power=%d, spinbox=%p, is_inc=%d",
-             ctx->step_fn, ctx->is_power, ctx->spinbox, ctx->is_increment);
-    
     if (ctx->step_fn) {
         ctx->step_fn(ctx->is_increment);
     } else if (ctx->is_power) {
         do_power_step(ctx->is_increment);
     } else if (ctx->spinbox) {
-        int32_t old_val = lv_spinbox_get_value(ctx->spinbox);
         if (ctx->is_increment)
             lv_spinbox_increment(ctx->spinbox);
         else
             lv_spinbox_decrement(ctx->spinbox);
-        int32_t new_val = lv_spinbox_get_value(ctx->spinbox);
-        ESP_LOGI("UI_REPEAT", "spinbox value: %d -> %d", (int)old_val, (int)new_val);
         lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
     }
 }
@@ -255,12 +249,8 @@ static void repeat_stop(HoldRepeatCtx* ctx) {
 static void on_repeat_pressed(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
-    if (!ctx) {
-        ESP_LOGE("UI_REPEAT", "on_repeat_pressed: NULL ctx!");
-        return;
-    }
-    ESP_LOGI("UI_REPEAT", "on_repeat_pressed: ctx=%p", ctx);
-    
+    if (!ctx) return;
+
     uint32_t now = millis();
     ctx->active = true;        // finger is physically down
     ctx->stop_latched = false; // fresh genuine press clears the latch
@@ -569,51 +559,75 @@ static void update_draft_dirty() {
 // _ui_dirty flag: set by callbacks, cleared by ui_update after visual refresh
 static bool _ui_dirty = false;
 
+// Clamp a value into [lo, hi]. Used so that values echoed by the STM32 are
+// always representable by the ESP32 spinbox widgets. Without this, if the
+// STM32 reports a value outside a spinbox's range (e.g. preheat_pct=3 while
+// the spinbox min is 10), lv_spinbox_set_value() clamps the displayed value,
+// the change handler reads back the clamped value into the draft, and
+// draft != applied forever => the Apply button is stuck "dirty" (green) and
+// sync_applied_from_state can never adopt other STM32 values (like power).
+static inline int clamp_i(int v, int lo, int hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
 static void sync_applied_from_state(const WelderDisplayState& st) {
     bool changed = false;
+
+    // Clamp incoming STM32 values to the SAME ranges used by the spinbox
+    // widgets (see make_touch_row calls in build_pulse_tab). This keeps
+    // applied == draft == spinbox value and prevents a permanent "dirty" loop.
+    uint16_t st_d1   = (uint16_t)clamp_i(st.pulse_d1,   1, 999);
+    uint16_t st_gap1 = (uint16_t)clamp_i(st.pulse_gap1, 1, 999);
+    uint16_t st_d2   = (uint16_t)clamp_i(st.pulse_d2,   1, 999);
+    uint16_t st_gap2 = (uint16_t)clamp_i(st.pulse_gap2, 1, 999);
+    uint16_t st_d3   = (uint16_t)clamp_i(st.pulse_d3,   1, 999);
+    uint8_t  st_power     = (uint8_t)clamp_i(st.power_pct,    50, 100);
+    uint16_t st_ph_ms     = (uint16_t)clamp_i(st.preheat_ms, 1, 200);
+    uint8_t  st_ph_pct    = (uint8_t)clamp_i(st.preheat_pct, 10, 100);
+    uint16_t st_ph_gap    = (uint16_t)clamp_i(st.preheat_gap_ms, 1, 100);
 
     if (applied_mode != st.weld_mode) {
         applied_mode = st.weld_mode;
         changed = true;
     }
-    if (applied_d1 != st.pulse_d1) {
-        applied_d1 = st.pulse_d1;
+    if (applied_d1 != st_d1) {
+        applied_d1 = st_d1;
         changed = true;
     }
-    if (applied_gap1 != st.pulse_gap1) {
-        applied_gap1 = st.pulse_gap1;
+    if (applied_gap1 != st_gap1) {
+        applied_gap1 = st_gap1;
         changed = true;
     }
-    if (applied_d2 != st.pulse_d2) {
-        applied_d2 = st.pulse_d2;
+    if (applied_d2 != st_d2) {
+        applied_d2 = st_d2;
         changed = true;
     }
-    if (applied_gap2 != st.pulse_gap2) {
-        applied_gap2 = st.pulse_gap2;
+    if (applied_gap2 != st_gap2) {
+        applied_gap2 = st_gap2;
         changed = true;
     }
-    if (applied_d3 != st.pulse_d3) {
-        applied_d3 = st.pulse_d3;
+    if (applied_d3 != st_d3) {
+        applied_d3 = st_d3;
         changed = true;
     }
-    if (applied_power != st.power_pct) {
-        applied_power = st.power_pct;
+    if (applied_power != st_power) {
+        applied_power = st_power;
         changed = true;
     }
     if (applied_preheat_en != st.preheat_enabled) {
         applied_preheat_en = st.preheat_enabled;
         changed = true;
     }
-    if (applied_preheat_ms != st.preheat_ms) {
-        applied_preheat_ms = st.preheat_ms;
+    if (applied_preheat_ms != st_ph_ms) {
+        applied_preheat_ms = st_ph_ms;
         changed = true;
     }
-    if (applied_preheat_pct != st.preheat_pct) {
-        applied_preheat_pct = st.preheat_pct;
+    if (applied_preheat_pct != st_ph_pct) {
+        applied_preheat_pct = st_ph_pct;
         changed = true;
     }
-    if (applied_preheat_gap != st.preheat_gap_ms) {
-        applied_preheat_gap = st.preheat_gap_ms;
+    if (applied_preheat_gap != st_ph_gap) {
+        applied_preheat_gap = st_ph_gap;
         changed = true;
     }
 
@@ -1283,21 +1297,9 @@ static void on_preheat_toggle(lv_event_t* e) {
 
 // Data-only callback: apply sends recipe via callback
 static void on_apply_click(lv_event_t* e) {
-    lv_event_code_t code = lv_event_get_code(e);
-    ESP_LOGI("UI_PULSE", "on_apply_click: event=%d (%s), draft_dirty=%d", 
-             code, 
-             code == LV_EVENT_CLICKED ? "CLICKED" : 
-             code == LV_EVENT_PRESSED ? "PRESSED" : 
-             code == LV_EVENT_PRESSING ? "PRESSING" : 
-             code == LV_EVENT_RELEASED ? "RELEASED" : "OTHER",
-             draft_dirty);
-    
-    if (code != LV_EVENT_CLICKED) return;
-    
-    if (!draft_dirty) {
-        ESP_LOGI("UI_PULSE", "Apply blocked: draft not dirty");
-        return;
-    }
+    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+
+    if (!draft_dirty) return;
     
     // Set guard flag to suppress spurious dirty marks during apply operation
     _applying = true;
@@ -1328,7 +1330,6 @@ static void on_apply_click(lv_event_t* e) {
     
     // Clear guard flag after apply completes
     _applying = false;
-    ESP_LOGI("UI_PULSE", "Apply complete: draft_dirty=%d", draft_dirty);
 }
 
 // ============================================================
@@ -1732,11 +1733,8 @@ static void build_pulse_tab(lv_obj_t* tab) {
     lv_obj_set_style_bg_opa(btn_apply, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_apply, 10, 0);
     
-    // Register ALL touch events for debugging
-    lv_obj_add_event_cb(btn_apply, on_apply_click, LV_EVENT_ALL, nullptr);
-    
-    ESP_LOGI("UI_PULSE", "Apply button created at pos (%d, %d), size (%d, %d)", R, ry, BTN_W, BTN_H);
-    
+    lv_obj_add_event_cb(btn_apply, on_apply_click, LV_EVENT_CLICKED, nullptr);
+
     make_interaction_safe(btn_apply);
 
     lbl_apply = lv_label_create(btn_apply);
