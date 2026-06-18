@@ -1196,6 +1196,7 @@ static void update_preheat_visibility() {
 static void mark_dirty() {
     update_draft_dirty();
     _ui_dirty = true;
+    ESP_LOGI("UI_PULSE", "mark_dirty: draft_dirty=%d", draft_dirty);
 }
 
 // ============================================================
@@ -1214,6 +1215,8 @@ static void on_spinbox_change(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     lv_obj_t* obj = (lv_obj_t*)lv_event_get_target(e);
     int32_t val = lv_spinbox_get_value(obj);
+
+    ESP_LOGI("UI_PULSE", "on_spinbox_change: val=%d", (int)val);
 
     if (obj == spin_d1)
         draft_d1 = (uint16_t)val;
@@ -1262,8 +1265,14 @@ static void on_preheat_toggle(lv_event_t* e) {
 
 // Data-only callback: apply sends recipe via callback
 static void on_apply_click(lv_event_t* e) {
+    ESP_LOGI("UI_PULSE", "on_apply_click: event=%d, draft_dirty=%d", lv_event_get_code(e), draft_dirty);
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-    if (!draft_dirty) return;
+    if (!draft_dirty) {
+        ESP_LOGI("UI_PULSE", "Apply blocked: draft not dirty");
+        return;
+    }
+    ESP_LOGI("UI_PULSE", "Applying recipe: mode=%u, d1=%u, gap1=%u, d2=%u, gap2=%u, d3=%u, power=%u",
+             draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2, draft_d3, draft_power);
     if (_recipe_cb) {
         _recipe_cb(draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2,
                    draft_d3, draft_power, draft_preheat_en, draft_preheat_ms,
