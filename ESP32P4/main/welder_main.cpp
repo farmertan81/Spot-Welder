@@ -55,7 +55,7 @@ static const char *TAG = "WELDER_UI";
 
 #define LCD_H_RES           800
 #define LCD_V_RES           480
-#define LCD_PIXEL_CLOCK_HZ  (16 * 1000 * 1000)  // official Elecrow 5" value (was 18 MHz — too tight)
+#define LCD_PIXEL_CLOCK_HZ  (15 * 1000 * 1000)  // 15 MHz for extra margin on config-tab scrolling (was 16 MHz — stable main screen but minor scroll glitch)
 
 #define LCD_PCLK             3
 #define LCD_DE               2
