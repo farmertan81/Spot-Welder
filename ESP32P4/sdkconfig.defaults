@@ -82,3 +82,10 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 #
 # WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
 # buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
+
+# ===== Partition Table =====
+# The full WiFi provisioning + HTTP server + captive portal + mDNS pushed the
+# binary past the default 1 MB factory partition (actual size ~1.27 MB). Use a
+# custom partition table (partitions.csv) with a 2 MB factory app.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
