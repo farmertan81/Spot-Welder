@@ -83,6 +83,12 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
 # buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
 
+# ===== Flash Size =====
+# CrowPanel P4 has 16 MB flash (verify via: esptool.py --port COM6 flash_id).
+# The default 2 MB setting in a fresh sdkconfig is wrong and causes partition
+# table overflow errors when the factory app is 2 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
 # ===== Partition Table =====
 # The full WiFi provisioning + HTTP server + captive portal + mDNS pushed the
 # binary past the default 1 MB factory partition (actual size ~1.27 MB). Use a
