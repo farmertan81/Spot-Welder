@@ -224,6 +224,46 @@ static bool extract_int(const char *s, const char *key, int *out)
 }
 
 // Parse a STATUS line from the STM32 into g_state (under mutex).
+static void parse_weld_done(const char *line)
+{
+    // Extract last-weld stats from EVENT,WELD_DONE for the Status dashboard.
+    xSemaphoreTake(g_state_mtx, portMAX_DELAY);
+    float fv; int iv;
+
+    if (extract_int(line, "total_ms=", &iv))
+        g_state.last_weld_duration_ms = (uint32_t)iv;
+    if (extract_float(line, "peak_a=", &fv))
+        g_state.last_weld_peak_a = fv;
+    if (extract_float(line, "avg_a=", &fv))
+        g_state.last_weld_avg_a = fv;
+
+    // Prefer joule-mode workpiece energy; fall back to time-mode weld energy.
+    float jw = NAN, ew = NAN;
+    extract_float(line, "joule_workpiece_j=", &jw);
+    extract_float(line, "energy_weld_j=", &ew);
+    g_state.last_weld_energy_j = !isnan(jw) ? jw : ew;
+
+    // Prefer joule-mode lead loss; fall back to time-mode lead loss.
+    float jl = NAN, el = NAN;
+    extract_float(line, "joule_loss_j=", &jl);
+    extract_float(line, "energy_lead_j=", &el);
+    g_state.last_weld_lead_loss_j = !isnan(jl) ? jl : el;
+
+    // Snapshot the control mode and target at the time of the weld.
+    g_state.last_weld_was_joule = (g_state.control_mode == 1);
+    g_state.last_weld_target_j = g_state.joule_target_j;
+
+    // Accuracy % (joule mode): 100 * delivered / target.
+    g_state.last_weld_accuracy_pct =
+        (g_state.last_weld_target_j > 0.0f)
+            ? (100.0f * g_state.last_weld_energy_j / g_state.last_weld_target_j)
+            : 0.0f;
+
+    g_state.last_weld_valid = true;
+
+    xSemaphoreGive(g_state_mtx);
+}
+
 static void parse_status_line(const char *line)
 {
     if (!strstr(line, "STATUS")) return;
@@ -460,6 +500,13 @@ static void stm32_task(void *arg)
                         ESP_LOGI(TAG, "STM32: %s", line);
                     }
 
+                    // Weld completion: parse last-weld stats for Status dashboard.
+                    bool is_weld_done = (strncmp(line, "EVENT,WELD_DONE", 15) == 0);
+                    if (is_weld_done && looks_valid) {
+                        parse_weld_done(line);
+                        ESP_LOGI(TAG, "STM32: %s", line);
+                    }
+
                     if (is_status) {
                         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
                         if (now - last_status_log_ms >= 1000) {
@@ -470,7 +517,7 @@ static void stm32_task(void *arg)
                         // STM32 now persists settings in its own flash and is
                         // the source of truth; re-asserting an ESP32-side value
                         // would overwrite what the controller restored at boot.
-                    } else if (!is_dbg && !is_cal && looks_valid) {
+                    } else if (!is_dbg && !is_cal && !is_weld_done && looks_valid) {
                         ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
                     }
                 }
