@@ -424,6 +424,12 @@ static void stm32_task(void *arg)
                     // "events" and re-trigger the flood.
                     bool is_status = (strncmp(line, "STAT", 4) == 0);
                     bool is_dbg    = (strncmp(line, "DBG", 3) == 0);
+                    // DIAGNOSTIC: pass through DBG,FLASH_* messages to see the
+                    // exact failure point (unlock/erase/write/verify). These are
+                    // normally suppressed as noise but we need them to fix the
+                    // persistent FLASH_SAVE_FAILED issue. Remove this exception
+                    // after the flash is fixed.
+                    bool is_flash_dbg = (strncmp(line, "DBG,FLASH_", 10) == 0);
                     // Filter obvious garbage: boot-time dropped bytes can create
                     // fragments like ",joule_status=..." that don't start with an
                     // uppercase letter. Real messages start with STAT/EVENT/RXHEALTH/CAL.
@@ -458,8 +464,8 @@ static void stm32_task(void *arg)
                                      (unsigned)reported, (unsigned)g_desired_contact_hold);
                             stm_sendf("SET_CONTACT_HOLD,%u", g_desired_contact_hold);
                         }
-                    } else if (!is_dbg && looks_valid) {
-                        ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
+                    } else if ((!is_dbg || is_flash_dbg) && looks_valid) {
+                        ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events + flash diagnostics
                     }
                 }
                 line = strtok_r(NULL, "\r\n", &save);
