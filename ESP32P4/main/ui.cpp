@@ -50,6 +50,7 @@
 
 #include "arduino_compat.h"  // millis()/Serial shim (ESP-IDF port of Arduino UI)
 #include "touch_gt911.h"     // touch_is_physically_down() for anti-shudder
+#include "esp_log.h"         // ESP_LOGI for debug logging
 #include <lvgl.h>
 #include <math.h>
 #include <stdio.h>   // for standard snprintf/sscanf (supports %f)
