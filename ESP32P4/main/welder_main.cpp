@@ -442,6 +442,14 @@ static void stm32_task(void *arg)
                         wifi_bridge_broadcast(line);
                     }
 
+                    // Calibration progress (CAL_STATUS / CAL_RESULT / CAL_ERROR).
+                    // Update the Config tab status line and log for debugging.
+                    bool is_cal = (strncmp(line, "CAL_", 4) == 0);
+                    if (is_cal && looks_valid) {
+                        ui_notify_cal_message(line);
+                        ESP_LOGI(TAG, "STM32: %s", line);
+                    }
+
                     if (is_status) {
                         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
                         if (now - last_status_log_ms >= 1000) {
@@ -452,7 +460,7 @@ static void stm32_task(void *arg)
                         // STM32 now persists settings in its own flash and is
                         // the source of truth; re-asserting an ESP32-side value
                         // would overwrite what the controller restored at boot.
-                    } else if (!is_dbg && looks_valid) {
+                    } else if (!is_dbg && !is_cal && looks_valid) {
                         ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
                     }
                 }
