@@ -1205,7 +1205,13 @@ static void update_preheat_visibility() {
     set_row_visible(row_ph_gap, show);
 }
 
+static bool _applying = false;  // Guard: suppress dirty marks during apply
+
 static void mark_dirty() {
+    if (_applying) {
+        ESP_LOGI("UI_PULSE", "mark_dirty: SUPPRESSED (applying in progress)");
+        return;
+    }
     update_draft_dirty();
     _ui_dirty = true;
     ESP_LOGI("UI_PULSE", "mark_dirty: draft_dirty=%d", draft_dirty);
@@ -1292,6 +1298,10 @@ static void on_apply_click(lv_event_t* e) {
         ESP_LOGI("UI_PULSE", "Apply blocked: draft not dirty");
         return;
     }
+    
+    // Set guard flag to suppress spurious dirty marks during apply operation
+    _applying = true;
+    
     ESP_LOGI("UI_PULSE", "Applying recipe: mode=%u, d1=%u, gap1=%u, d2=%u, gap2=%u, d3=%u, power=%u",
              draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2, draft_d3, draft_power);
     if (_recipe_cb) {
@@ -1315,6 +1325,10 @@ static void on_apply_click(lv_event_t* e) {
         update_draft_dirty();  // Now draft == applied, so draft_dirty becomes false
         _ui_dirty = true;  // Force UI repaint to show "Applied" state
     }
+    
+    // Clear guard flag after apply completes
+    _applying = false;
+    ESP_LOGI("UI_PULSE", "Apply complete: draft_dirty=%d", draft_dirty);
 }
 
 // ============================================================
