@@ -524,9 +524,15 @@ extern "C" void app_main(void)
     backlight_set(100);
 
     // ---- LVGL display (partial mode + flush callback) ----
+    // Allocate draw buffers in PSRAM to free ~150 KB of internal RAM for the
+    // WiFi stack (esp_hosted + lwIP + SoftAP/DHCP). Before this change the
+    // buffers sat in internal RAM and WiFi bringup caused memory corruption
+    // (LVGL objects spilled into marginal RTCRAM at 0x5010xxxx → crash).
+    // PSRAM is fine for partial-render draw buffers; the RGB driver's internal
+    // framebuffer + bounce buffer are already in PSRAM (panel_conf.flags.fb_in_psram).
     size_t draw_buf_size = LCD_H_RES * (LCD_V_RES / 10) * sizeof(lv_color_t);
-    void *draw_buf1 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    void *draw_buf2 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    void *draw_buf1 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *draw_buf2 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     assert(draw_buf1 && draw_buf2);
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(lvgl_disp, lvgl_flush_cb);
