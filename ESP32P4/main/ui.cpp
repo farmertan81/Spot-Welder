@@ -3409,6 +3409,23 @@ void ui_load_config(const ConfigState& cfg) {
     apply_time_step_to_spinboxes();
 }
 
+void ui_sync_persisted_from_status(const WelderDisplayState& st) {
+    // Adopt the controller's flash-persisted settings into the Config tab so
+    // the UI mirrors what the STM32 actually restored from its own flash at
+    // boot. Range-guard each field so a garbled STATUS can't poison the UI.
+    if (st.contact_hold_steps >= 1 && st.contact_hold_steps <= 10) {
+        _cfg.contact_hold_steps = st.contact_hold_steps;
+        _dash_contact_steps     = st.contact_hold_steps;  // status-line text
+        update_cfg_hold_time_label();
+    }
+    _cfg.contact_with_pedal = st.contact_with_pedal;
+    update_cfg_cwp_label();
+    if (st.lead_resistance_mohm > 0.0f && st.lead_resistance_mohm < 100.0f) {
+        _cfg.lead_resistance_mohm = st.lead_resistance_mohm;
+        update_cfg_cal_labels();
+    }
+}
+
 ConfigState ui_get_config() { return _cfg; }
 
 void ui_set_trigger_source_cb(trigger_source_cb_t cb) { _trigger_cb = cb; }

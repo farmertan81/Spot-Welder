@@ -46,6 +46,7 @@ struct WelderDisplayState {
 
     uint8_t trigger_mode;       // 1=pedal, 2=contact
     uint8_t contact_hold_steps;
+    bool    contact_with_pedal; // require contact detection when using pedal trigger
 
     // ---- Dashboard / Joule-mode telemetry (set by main.cpp) ----
     uint8_t  control_mode;        // 0=TIME, 1=JOULE
@@ -172,6 +173,14 @@ void ui_load_config(const ConfigState& cfg);
 
 // Get current config state from UI
 ConfigState ui_get_config();
+
+// Adopt the STM32's flash-persisted controller settings (reported via STATUS)
+// into the Config tab. Called once at startup ("load last settings on boot")
+// so the UI reflects what the controller actually loaded from its flash,
+// instead of overwriting it with hard-coded ESP32 defaults. Updates only the
+// controller-owned fields (contact hold, contact-with-pedal, lead R); UI-only
+// fields (brightness, step sizes, etc.) are left untouched.
+void ui_sync_persisted_from_status(const WelderDisplayState& st);
 
 // Set callback for trigger source changes (call before or after ui_init)
 void ui_set_trigger_source_cb(trigger_source_cb_t cb);

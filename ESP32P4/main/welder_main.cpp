@@ -99,15 +99,12 @@ static i2c_master_bus_handle_t g_i2c_bus    = NULL;
 static WelderDisplayState g_state;
 static SemaphoreHandle_t  g_state_mtx = NULL;
 
-// Desired contact-hold steps (the value the user/UI wants enforced on the
-// STM32). The ESP32 is the source of truth here: the STM32 loses its setting
-// because its flash save fails (DENY,...,FLASH_SAVE_FAILED), so if we just
-// echoed the STM32's reported value the dashboard would always snap back to
-// the controller's stale flash default (e.g. 2.0s). Instead we remember the
-// desired value and re-assert it whenever the STM32 reports a mismatch. Note
-// the STM32 applies SET_CONTACT_HOLD to RAM *before* the (failing) flash save,
-// so a single delivered command is enough to make it take effect this session.
-static volatile uint8_t g_desired_contact_hold = 2;  // 2 steps * 0.5s = 1.0s default
+// Set true once the first STATUS line from the STM32 has been parsed. Used to
+// adopt the controller's flash-persisted settings into the Config UI exactly
+// once at boot ("load last settings on boot"). The STM32 is now the source of
+// truth for persisted settings (its flash save/load works), so the ESP32 must
+// NOT push hard-coded defaults over them.
+static volatile bool g_status_received = false;
 
 // Phase-1B telemetry globals declared extern in ui.h. Defined here so the link
 // resolves; populated by the STATUS parser.
@@ -250,7 +247,14 @@ static void parse_status_line(const char *line)
 
     // Contact/probe hold time (STATUS packet). Each step = 0.5s; the UI shows
     // "Contact X.Xs" from this. Was previously unparsed -> stuck at 0.0s.
-    if (extract_int(line, "contact_hold_steps=", &iv)) g_state.contact_hold_steps = (uint8_t)iv;
+    if (extract_int(line, "contact_hold_steps=", &iv)) {
+        g_state.contact_hold_steps = (uint8_t)iv;
+        // A main STATUS packet carries the persisted controller settings; mark
+        // that we've seen one so the UI can adopt them once at boot. (STATUS2
+        // battery packets don't include this field, so they won't trip it.)
+        g_status_received = true;
+    }
+    if (extract_int(line, "contact_with_pedal=", &iv))  g_state.contact_with_pedal = (iv == 1);
 
     // Charger telemetry (STATUS2 packet): chg_en = charger relay on/off,
     // ichg = charge current in A. Mirror the old ESP32 behaviour and only
@@ -306,8 +310,9 @@ static void cb_recipe_apply(uint8_t mode, uint16_t d1, uint16_t gap1,
 
 static void cb_config_change(const ConfigState &cfg)
 {
-    // Apply controller-relevant config; UI-only fields stay local.
-    g_desired_contact_hold = cfg.contact_hold_steps;   // remember for self-heal
+    // Apply controller-relevant config; UI-only fields stay local. The STM32
+    // persists these to its own flash, so a single send is enough — no need to
+    // re-assert them (that used to fight the controller's restored values).
     stm_sendf("SET_CONTACT_HOLD,%u", cfg.contact_hold_steps);
     stm_sendf("SET_LEAD_R,%.3f", cfg.lead_resistance_mohm / 1000.0f);
     stm_sendf("SET_CONTACT_WITH_PEDAL,%u", cfg.contact_with_pedal ? 1 : 0);
@@ -320,7 +325,7 @@ static void cb_trigger_source(uint8_t mode)      { stm_sendf("SET_TRIGGER_MODE,%
 static void cb_weld_count_reset(void)            { stm_send("RESET_WELD_COUNT"); }
 static void cb_contact_with_pedal(bool en)       { stm_sendf("SET_CONTACT_WITH_PEDAL,%u", en ? 1 : 0); }
 static void cb_calibrate(void)                   { stm_send("CAL_LEAD_START"); }
-static void cb_contact_delay(uint8_t steps)      { g_desired_contact_hold = steps; stm_sendf("SET_CONTACT_HOLD,%u", steps); }
+static void cb_contact_delay(uint8_t steps)      { stm_sendf("SET_CONTACT_HOLD,%u", steps); }
 
 static void cb_joule_apply(bool mode_joule, float target_j, uint16_t max_ms)
 {
@@ -424,12 +429,6 @@ static void stm32_task(void *arg)
                     // "events" and re-trigger the flood.
                     bool is_status = (strncmp(line, "STAT", 4) == 0);
                     bool is_dbg    = (strncmp(line, "DBG", 3) == 0);
-                    // DIAGNOSTIC: pass through DBG,FLASH_* messages to see the
-                    // exact failure point (unlock/erase/write/verify). These are
-                    // normally suppressed as noise but we need them to fix the
-                    // persistent FLASH_SAVE_FAILED issue. Remove this exception
-                    // after the flash is fixed.
-                    bool is_flash_dbg = (strncmp(line, "DBG,FLASH_", 10) == 0);
                     // Filter obvious garbage: boot-time dropped bytes can create
                     // fragments like ",joule_status=..." that don't start with an
                     // uppercase letter. Real messages start with STAT/EVENT/RXHEALTH/CAL.
@@ -449,23 +448,12 @@ static void stm32_task(void *arg)
                             last_status_log_ms = now;
                             ESP_LOGI(TAG, "STM32: %s", line);  // 1 Hz heartbeat
                         }
-                        // Self-heal the contact-hold setting. If the STM32 is
-                        // reporting a value other than what the user wants
-                        // (e.g. its boot-time SET_CONTACT_HOLD was dropped, or
-                        // its flash reverted to a stale default), re-assert it.
-                        // Throttled to once every 2 s so we don't hammer the
-                        // STM32's (failing) flash save on every poll.
-                        static uint32_t last_contact_assert_ms = 0;
-                        uint8_t reported = g_state.contact_hold_steps;
-                        if (reported != g_desired_contact_hold &&
-                            now - last_contact_assert_ms >= 2000) {
-                            last_contact_assert_ms = now;
-                            ESP_LOGW(TAG, "Contact-hold mismatch: STM32=%u desired=%u, re-sending",
-                                     (unsigned)reported, (unsigned)g_desired_contact_hold);
-                            stm_sendf("SET_CONTACT_HOLD,%u", g_desired_contact_hold);
-                        }
-                    } else if ((!is_dbg || is_flash_dbg) && looks_valid) {
-                        ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events + flash diagnostics
+                        // NOTE: no contact-hold "self-heal" here any more. The
+                        // STM32 now persists settings in its own flash and is
+                        // the source of truth; re-asserting an ESP32-side value
+                        // would overwrite what the controller restored at boot.
+                    } else if (!is_dbg && looks_valid) {
+                        ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
                     }
                 }
                 line = strtok_r(NULL, "\r\n", &save);
@@ -499,6 +487,23 @@ static void lvgl_task(void *arg)
             snap = g_state;
             xSemaphoreGive(g_state_mtx);
             ui_update(snap);
+
+            // One-shot "load last settings on boot": once the STM32 has sent a
+            // real STATUS, adopt its flash-restored controller settings into the
+            // Config tab so the UI mirrors what the controller actually loaded.
+            // Runs here (lvgl_task) so LVGL stays single-threaded. Honors the
+            // Config-tab toggle; default is ON.
+            static bool config_synced = false;
+            if (!config_synced && g_status_received) {
+                config_synced = true;
+                if (ui_get_config().load_last_on_boot) {
+                    ui_sync_persisted_from_status(snap);
+                    ESP_LOGI(TAG, "Adopted STM32 flash settings: contact_hold=%u steps, cwp=%d, lead_r=%.3f mohm",
+                             (unsigned)snap.contact_hold_steps,
+                             (int)snap.contact_with_pedal,
+                             (double)snap.lead_resistance_mohm);
+                }
+            }
         }
 
         lv_timer_handler();
@@ -661,13 +666,14 @@ extern "C" void app_main(void)
     ui_init(cb_arm_toggle, cb_recipe_apply);
     ConfigState defaults = config_defaults();
     ui_load_config(defaults);
-    // Push the defaults to the STM32 and record the desired contact-hold value
-    // (g_desired_contact_hold). This first push may be dropped if the STM32 link
-    // isn't fully up yet — that's fine: stm32_task re-asserts SET_CONTACT_HOLD
-    // whenever the STM32's reported value disagrees, so the controller (and the
-    // status display) converge to 1.0s instead of the STM32's stale 2.0s flash
-    // default.
-    cb_config_change(defaults);
+    // Set ONLY the local backlight from the UI default. We deliberately do NOT
+    // push the controller settings (contact hold, lead R, contact-with-pedal)
+    // to the STM32 here: the STM32 now persists those in its own flash and
+    // restores them at boot, so pushing ESP32 defaults would clobber the
+    // user's saved values. Instead, lvgl_task adopts the controller's restored
+    // settings into the Config UI once the first STATUS arrives (see below).
+    static const uint8_t bl[3] = { 25, 60, 100 };
+    backlight_set(bl[defaults.brightness <= 2 ? defaults.brightness : 2]);
     ui_set_system_info("P4-1.0", "ESP32-P4", 16 * 1024 * 1024, 0);
     ESP_LOGI(TAG, "UI created");
 
