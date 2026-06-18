@@ -15,3 +15,10 @@ dependencies:
   #   # All dependencies of `main` are public by default.
   #   public: true
   lvgl/lvgl: ^9.2.0
+  # ESP32-P4 has no native WiFi. Connectivity is provided by the onboard
+  # ESP32-C6 co-processor, driven over SDIO by esp_hosted. esp_wifi_remote
+  # makes the standard esp_wifi API transparently forward to the C6.
+  espressif/esp_wifi_remote: "*"
+  espressif/esp_hosted: "*"
+  # mDNS so the device is reachable at "spotwelder.local".
+  espressif/mdns: "*"

@@ -62,6 +62,23 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 #   Component config -> ESP System Settings
 #     -> Task Watchdog timeout period (seconds)        = 30
 
-# ===== WiFi Configuration =====
-# WiFi station mode enabled for Flask web UI bridge
-# (Buffer settings use ESP-IDF defaults - tune via menuconfig if needed)
+# ===== WiFi / radio (ESP32-P4 + onboard ESP32-C6) =====
+# The ESP32-P4 has NO native WiFi radio. On this CrowPanel board the radio is
+# the onboard ESP32-C6, reached over SDIO via the esp_hosted / esp_wifi_remote
+# managed components (declared in main/idf_component.yml). The standard esp_wifi
+# API in wifi_bridge.cpp works transparently through that link.
+#
+# The C6 ships pre-flashed with the esp_hosted slave firmware, so basic WiFi
+# works out of the box. If the link is unstable (e.g. WiFi drops after a few
+# minutes, or SDIO CRC errors in the log) configure the transport via
+#   idf.py menuconfig
+#     Component config -> ESP-Hosted config
+#       -> SDIO bus width  -> set to 1-bit  (most reliable on this wiring)
+# and, if needed, update the C6 slave firmware to esp_hosted >= 2.x.
+# These SDIO symbols are provided by the esp_hosted component and only exist
+# AFTER `idf.py reconfigure` has downloaded the managed components, so they are
+# intentionally NOT hard-coded here (adding undeclared CONFIG_* symbols to this
+# file breaks the build).
+#
+# WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
+# buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
