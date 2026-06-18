@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdarg.h>
+#include <ctype.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,6 +29,13 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sockets.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_timer.h"
 #include "lvgl.h"
@@ -47,6 +55,17 @@ static const char *TAG = "WELDER_UI";
 #define BUF_SIZE            2048
 #define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (still generous at 1 Mbaud)
 #define STM32_BAUD          1000000  // 1 Mbaud — stable link without HW flow control
+
+// WiFi configuration (TODO: move to menuconfig or NVS for user config)
+#define WIFI_SSID           "YourSSID"
+#define WIFI_PASS           "YourPassword"
+#define WIFI_MAX_RETRY      5
+
+// TCP server for Flask web UI bridge
+#define TCP_SERVER_PORT     8080
+#define TCP_KEEPALIVE_IDLE  5
+#define TCP_KEEPALIVE_INTERVAL 5
+#define TCP_KEEPALIVE_COUNT 3
 
 #define LCD_H_RES           800
 #define LCD_V_RES           480
@@ -97,6 +116,12 @@ float weld_v_b = 0, weld_v_a = 0;
 float cap_v_b = 0, cap_v_a = 0;
 float vcap_b = 0, vcap_a = 0;
 float energy_cap_j = 0, energy_weld_j = 0, energy_loss_j = 0;
+
+// WiFi state
+static int s_wifi_retry_num = 0;
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
 
 // ============================================================
 //  STC8 BACKLIGHT / PANEL POWER (I2C @ 0x2F)
@@ -368,13 +393,18 @@ static void stm32_task(void *arg)
                     // "events" and re-trigger the flood.
                     bool is_status = (strncmp(line, "STAT", 4) == 0);
                     bool is_dbg    = (strncmp(line, "DBG", 3) == 0);
+                    // Filter obvious garbage: boot-time dropped bytes can create
+                    // fragments like ",joule_status=..." that don't start with an
+                    // uppercase letter. Real messages start with STAT/EVENT/RXHEALTH/CAL.
+                    bool looks_valid = isupper((unsigned char)line[0]);
+                    
                     if (is_status) {
                         uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
                         if (now - last_status_log_ms >= 1000) {
                             last_status_log_ms = now;
                             ESP_LOGI(TAG, "STM32: %s", line);  // 1 Hz heartbeat
                         }
-                    } else if (!is_dbg) {
+                    } else if (!is_dbg && looks_valid) {
                         ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
                     }
                 }
@@ -429,6 +459,188 @@ static void lvgl_task(void *arg)
         }
         vTaskDelay(delay_ticks);
     }
+}
+
+// ============================================================
+//  WIFI EVENT HANDLER
+// ============================================================
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        if (s_wifi_retry_num < WIFI_MAX_RETRY) {
+            esp_wifi_connect();
+            s_wifi_retry_num++;
+            ESP_LOGI(TAG, "Retry WiFi connection (%d/%d)", s_wifi_retry_num, WIFI_MAX_RETRY);
+        } else {
+            xEventGroupSetBits(s_wifi_event_group, WIFI_FAIL_BIT);
+            ESP_LOGE(TAG, "WiFi connection failed after %d retries", WIFI_MAX_RETRY);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "WiFi connected! IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        s_wifi_retry_num = 0;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+// ============================================================
+//  WIFI INITIALIZATION
+// ============================================================
+static void wifi_init_sta(void)
+{
+    s_wifi_event_group = xEventGroupCreate();
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                                                         ESP_EVENT_ANY_ID,
+                                                         &wifi_event_handler,
+                                                         NULL,
+                                                         &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                         IP_EVENT_STA_GOT_IP,
+                                                         &wifi_event_handler,
+                                                         NULL,
+                                                         &instance_got_ip));
+
+    wifi_config_t wifi_config = {};
+    strncpy((char*)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char*)wifi_config.sta.password, WIFI_PASS, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    ESP_LOGI(TAG, "WiFi init complete. Connecting to SSID: %s", WIFI_SSID);
+
+    // Wait for connection or failure
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                            pdFALSE,
+                                            pdFALSE,
+                                            portMAX_DELAY);
+
+    if (bits & WIFI_CONNECTED_BIT) {
+        ESP_LOGI(TAG, "WiFi connected successfully");
+    } else if (bits & WIFI_FAIL_BIT) {
+        ESP_LOGE(TAG, "WiFi connection failed");
+    } else {
+        ESP_LOGE(TAG, "WiFi unexpected event");
+    }
+}
+
+// ============================================================
+//  TCP SERVER TASK (Flask Web UI Bridge)
+// ============================================================
+static void tcp_server_task(void *pvParameters)
+{
+    char rx_buffer[512];
+    char addr_str[128];
+    int addr_family = AF_INET;
+    int ip_protocol = 0;
+
+    struct sockaddr_in dest_addr;
+    dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(TCP_SERVER_PORT);
+    ip_protocol = IPPROTO_IP;
+
+    int listen_sock = socket(addr_family, SOCK_STREAM, ip_protocol);
+    if (listen_sock < 0) {
+        ESP_LOGE(TAG, "Unable to create socket: errno %d", errno);
+        vTaskDelete(NULL);
+        return;
+    }
+    int opt = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    ESP_LOGI(TAG, "TCP server binding to port %d", TCP_SERVER_PORT);
+    int err = bind(listen_sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr));
+    if (err != 0) {
+        ESP_LOGE(TAG, "Socket bind failed: errno %d", errno);
+        close(listen_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    err = listen(listen_sock, 1);
+    if (err != 0) {
+        ESP_LOGE(TAG, "Error during listen: errno %d", errno);
+        close(listen_sock);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "TCP server listening on port %d", TCP_SERVER_PORT);
+
+    while (1) {
+        struct sockaddr_storage source_addr;
+        socklen_t addr_len = sizeof(source_addr);
+        int sock = accept(listen_sock, (struct sockaddr *)&source_addr, &addr_len);
+        if (sock < 0) {
+            ESP_LOGE(TAG, "Unable to accept connection: errno %d", errno);
+            break;
+        }
+
+        // Convert IP to string for logging
+        if (source_addr.ss_family == PF_INET) {
+            inet_ntoa_r(((struct sockaddr_in *)&source_addr)->sin_addr, addr_str, sizeof(addr_str) - 1);
+        }
+        ESP_LOGI(TAG, "TCP client connected from %s", addr_str);
+
+        // Set socket keepalive
+        int keepAlive = 1;
+        int keepIdle = TCP_KEEPALIVE_IDLE;
+        int keepInterval = TCP_KEEPALIVE_INTERVAL;
+        int keepCount = TCP_KEEPALIVE_COUNT;
+        setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &keepAlive, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &keepIdle, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &keepInterval, sizeof(int));
+        setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &keepCount, sizeof(int));
+
+        // Simple echo server for now (TODO: implement Flask bridge protocol)
+        while (1) {
+            int len = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, 0);
+            if (len < 0) {
+                ESP_LOGE(TAG, "TCP recv failed: errno %d", errno);
+                break;
+            } else if (len == 0) {
+                ESP_LOGI(TAG, "TCP client disconnected");
+                break;
+            } else {
+                rx_buffer[len] = 0;  // Null-terminate
+                ESP_LOGI(TAG, "TCP RX: %s", rx_buffer);
+                
+                // Echo back for now
+                int to_write = len;
+                while (to_write > 0) {
+                    int written = send(sock, rx_buffer + (len - to_write), to_write, 0);
+                    if (written < 0) {
+                        ESP_LOGE(TAG, "TCP send failed: errno %d", errno);
+                        break;
+                    }
+                    to_write -= written;
+                }
+            }
+        }
+
+        shutdown(sock, 0);
+        close(sock);
+    }
+
+    close(listen_sock);
+    vTaskDelete(NULL);
 }
 
 // ============================================================
@@ -548,6 +760,21 @@ extern "C" void app_main(void)
     // ---- Tasks ----
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 16384, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(stm32_task, "stm32", 6144, NULL, 4, NULL, 1);
+
+    // ---- WiFi + TCP Server (Flask Web UI Bridge) ----
+    // Initialize NVS (required for WiFi)
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Connect to WiFi (blocking until connected or failed)
+    wifi_init_sta();
+
+    // Start TCP server task (Flask bridge, echo server for now)
+    xTaskCreate(tcp_server_task, "tcp_server", 4096, NULL, 5, NULL);
 
     ESP_LOGI(TAG, "System initialized - welder UI running");
 }
