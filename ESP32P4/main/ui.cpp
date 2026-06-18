@@ -2476,6 +2476,8 @@ static void on_cfg_brightness(lv_event_t* e) {
 static void on_cfg_hold_time_dec(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (_cfg.contact_hold_steps > 1) _cfg.contact_hold_steps--;
+    _dash_contact_steps = _cfg.contact_hold_steps;  // sync Status tab immediately
+    paint_dash_trigger(false);                      // force Status tab repaint
     update_cfg_hold_time_label();
     notify_config_changed();
     if (_contact_delay_cb) _contact_delay_cb(_cfg.contact_hold_steps);
@@ -2484,6 +2486,8 @@ static void on_cfg_hold_time_dec(lv_event_t* e) {
 static void on_cfg_hold_time_inc(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
     if (_cfg.contact_hold_steps < 10) _cfg.contact_hold_steps++;
+    _dash_contact_steps = _cfg.contact_hold_steps;  // sync Status tab immediately
+    paint_dash_trigger(false);                      // force Status tab repaint
     update_cfg_hold_time_label();
     notify_config_changed();
     if (_contact_delay_cb) _contact_delay_cb(_cfg.contact_hold_steps);
