@@ -4844,6 +4844,12 @@ int main(void) {
         uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS");
     }
 
+    // Boot override: always start disarmed + pedal trigger, regardless of what
+    // was in flash. Other persisted settings (contact_hold, lead_r, etc.) are
+    // respected, but for safety the welder must boot in the safe state.
+    armed = false;
+    trigger_mode = 1;  // 1 = pedal, 2 = probe contact
+
     {
         char buf[128];
         snprintf(buf, sizeof(buf),
