@@ -342,7 +342,10 @@ static void cb_recipe_apply(uint8_t mode, uint16_t d1, uint16_t gap1,
                             uint16_t preheat_ms, uint8_t preheat_pct,
                             uint16_t preheat_gap_ms)
 {
-    stm_sendf("SET_PULSE,%u,%u,%u,%u,%u,%u", d1, gap1, d2, gap2, d3, mode);
+    // STM32 parses SET_PULSE,mode,d1,gap1,d2,gap2,d3 (mode FIRST). Match that
+    // order exactly — sending mode last made the STM32 read d1 as the mode
+    // (e.g. d1=10 -> mode clamped to 3/triple).
+    stm_sendf("SET_PULSE,%u,%u,%u,%u,%u,%u", mode, d1, gap1, d2, gap2, d3);
     stm_sendf("SET_POWER,%u", power_pct);
     stm_sendf("SET_PREHEAT,%u,%u,%u,%u",
               preheat_en ? 1 : 0, preheat_ms, preheat_pct, preheat_gap_ms);
