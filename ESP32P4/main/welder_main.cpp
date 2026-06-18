@@ -411,8 +411,18 @@ static void stm32_task(void *arg)
     //   - STM32's own per-command "DBG,..." echo: never printed (pure noise).
     //   - Everything else (EVENT / WAVEFORM / RXHEALTH / CAL / errors): printed.
     uint32_t last_status_log_ms = 0;
+    uint32_t last_ready_ms = 0;
 
     while (1) {
+        // READY heartbeat: STM32 requires periodic READY,1 to keep system_ready
+        // alive (has a 10s timeout). Without this, it stays in ready=0 and
+        // refuses all commands (ARM, WELD, CAL_LEAD_START) with NOT_READY/DENY.
+        uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        if (now_ms - last_ready_ms >= 1000) {
+            stm_send("READY,1");
+            last_ready_ms = now_ms;
+        }
+
         stm_send("STATUS");
         int len = uart_read_bytes(STM32_UART_NUM, data, BUF_SIZE - 1, pdMS_TO_TICKS(150));
         if (len > 0) {
