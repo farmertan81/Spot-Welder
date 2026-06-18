@@ -1266,8 +1266,17 @@ static void on_preheat_toggle(lv_event_t* e) {
 
 // Data-only callback: apply sends recipe via callback
 static void on_apply_click(lv_event_t* e) {
-    ESP_LOGI("UI_PULSE", "on_apply_click: event=%d, draft_dirty=%d", lv_event_get_code(e), draft_dirty);
-    if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
+    lv_event_code_t code = lv_event_get_code(e);
+    ESP_LOGI("UI_PULSE", "on_apply_click: event=%d (%s), draft_dirty=%d", 
+             code, 
+             code == LV_EVENT_CLICKED ? "CLICKED" : 
+             code == LV_EVENT_PRESSED ? "PRESSED" : 
+             code == LV_EVENT_PRESSING ? "PRESSING" : 
+             code == LV_EVENT_RELEASED ? "RELEASED" : "OTHER",
+             draft_dirty);
+    
+    if (code != LV_EVENT_CLICKED) return;
+    
     if (!draft_dirty) {
         ESP_LOGI("UI_PULSE", "Apply blocked: draft not dirty");
         return;
@@ -1681,7 +1690,12 @@ static void build_pulse_tab(lv_obj_t* tab) {
                               0);  // green = synced (initial)
     lv_obj_set_style_bg_opa(btn_apply, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(btn_apply, 10, 0);
-    lv_obj_add_event_cb(btn_apply, on_apply_click, LV_EVENT_CLICKED, nullptr);
+    
+    // Register ALL touch events for debugging
+    lv_obj_add_event_cb(btn_apply, on_apply_click, LV_EVENT_ALL, nullptr);
+    
+    ESP_LOGI("UI_PULSE", "Apply button created at pos (%d, %d), size (%d, %d)", R, ry, BTN_W, BTN_H);
+    
     make_interaction_safe(btn_apply);
 
     lbl_apply = lv_label_create(btn_apply);
