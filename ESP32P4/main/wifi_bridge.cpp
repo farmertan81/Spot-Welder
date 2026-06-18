@@ -433,7 +433,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     strncpy(s_ssid, use_ssid, sizeof(s_ssid) - 1);
     strncpy(s_pass, pass, sizeof(s_pass) - 1);
 
-    char resp[256];
+    char resp[512];  // 256 too small for max-SSID + HTML (compiler -Werror=format-truncation)
     snprintf(resp, sizeof(resp),
         "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'></head>"
         "<body style='font-family:sans-serif;background:#0b1623;color:#eee;padding:24px'>"
