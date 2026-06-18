@@ -131,3 +131,22 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 # custom partition table (partitions.csv) with a 2 MB factory app.
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ===== RGB LCD anti-glitch / anti-drift (fixes shifting lines under WiFi load) =====
+# Symptom: with WiFi active, horizontal lines on the 800x480 RGB panel drift /
+# shift. Root cause: the RGB peripheral streams the PSRAM framebuffer through an
+# internal-RAM bounce buffer via GDMA. When WiFi DMA + cache misses steal PSRAM
+# bandwidth, the bounce buffer underruns and the scan-out loses alignment.
+#
+# 1) Restart the framebuffer DMA at every VSYNC. Any drift accumulated during a
+#    frame is reset at the next vertical sync, so lines can no longer shift
+#    permanently — this is the key fix for the "shifting lines" symptom.
+CONFIG_LCD_RGB_RESTART_IN_VSYNC=y
+#
+# 2) Keep the GDMA control path and ISR handler in IRAM so the bounce-buffer
+#    refill keeps running even when the flash/PSRAM cache is briefly disabled
+#    (e.g. during WiFi/NVS flash writes). Matches the proven Elecrow WiFi+display
+#    reference (Lesson16). DRAM-safe GDMA objects for the same reason.
+CONFIG_GDMA_CTRL_FUNC_IN_IRAM=y
+CONFIG_GDMA_ISR_HANDLER_IN_IRAM=y
+CONFIG_GDMA_OBJ_DRAM_SAFE=y

@@ -484,6 +484,11 @@ extern "C" void app_main(void)
     esp_lcd_rgb_panel_config_t panel_conf = {};
     panel_conf.clk_src = LCD_CLK_SRC_DEFAULT;
     panel_conf.data_width = 16;
+    // DMA burst alignment for PSRAM framebuffer reads. Larger bursts (64 B)
+    // mean fewer, more efficient PSRAM transactions, so the RGB bounce buffer
+    // is refilled with less bus arbitration overhead. Without this the default
+    // small bursts compete with WiFi/cache traffic and cause line drift.
+    panel_conf.dma_burst_size = 64;
     panel_conf.de_gpio_num = (gpio_num_t)LCD_DE;
     panel_conf.pclk_gpio_num = (gpio_num_t)LCD_PCLK;
     panel_conf.vsync_gpio_num = (gpio_num_t)LCD_VSYNC;
@@ -511,7 +516,14 @@ extern "C" void app_main(void)
     panel_conf.timings.vsync_pulse_width = 4;
     panel_conf.flags.fb_in_psram = 1;
     panel_conf.num_fbs = 1;
-    panel_conf.bounce_buffer_size_px = LCD_H_RES * 10;
+    // Bounce buffer = 20 lines (matches the proven Elecrow WiFi+display example).
+    // The driver streams the PSRAM framebuffer through this internal-RAM bounce
+    // buffer to the LCD; a bigger buffer gives more headroom against PSRAM
+    // bandwidth stalls (WiFi DMA, cache misses) that otherwise cause line drift.
+    // Paired with CONFIG_LCD_RGB_RESTART_IN_VSYNC (sdkconfig.defaults), which
+    // realigns the DMA to the framebuffer start every VSYNC so any residual
+    // drift self-corrects each frame instead of shifting permanently.
+    panel_conf.bounce_buffer_size_px = LCD_H_RES * 20;
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
