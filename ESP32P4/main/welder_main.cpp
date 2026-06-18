@@ -55,7 +55,7 @@ static const char *TAG = "WELDER_UI";
 
 #define LCD_H_RES           800
 #define LCD_V_RES           480
-#define LCD_PIXEL_CLOCK_HZ  (18 * 1000 * 1000)
+#define LCD_PIXEL_CLOCK_HZ  (16 * 1000 * 1000)  // official Elecrow 5" value (was 18 MHz — too tight)
 
 #define LCD_PCLK             3
 #define LCD_DE               2
@@ -333,15 +333,14 @@ static void cb_fw_update_stm32(void)  { ESP_LOGW(TAG, "STM32 SD firmware update 
 // ============================================================
 //  LVGL PLUMBING
 // ============================================================
-// RGB panel "frame buffer complete" ISR. With a bounce buffer on IDF v6 the
-// driver streams the active PSRAM framebuffer through internal-RAM bounce
-// buffers; this fires when a whole framebuffer has finished streaming. Wake the
-// flush callback so it only swaps framebuffers on a frame boundary (tear-free).
-// Lives in IRAM and touches only IRAM-safe APIs because the flash/PSRAM cache
-// may be disabled when it fires (e.g. during NVS/flash writes).
-static IRAM_ATTR bool rgb_frame_done_cb(esp_lcd_panel_handle_t panel,
-                                        const esp_lcd_rgb_panel_event_data_t *edata,
-                                        void *user_ctx)
+// RGB panel VSYNC ISR. With no bounce buffer the scan-out engine reads the
+// active PSRAM framebuffer directly; on_vsync fires at the start of each frame.
+// Wake the flush callback so it only swaps framebuffers on a frame boundary
+// (tear-free). Lives in IRAM and touches only IRAM-safe APIs because the
+// flash/PSRAM cache may be disabled when it fires (e.g. during NVS/flash writes).
+static IRAM_ATTR bool rgb_vsync_cb(esp_lcd_panel_handle_t panel,
+                                   const esp_lcd_rgb_panel_event_data_t *edata,
+                                   void *user_ctx)
 {
     BaseType_t hp_task_woken = pdFALSE;
     if (g_vsync_sem) {
@@ -518,13 +517,13 @@ extern "C" void app_main(void)
 
     lv_init();
 
-    // ---- RGB panel: single driver-managed framebuffer + bounce buffer ----
+    // ---- RGB panel: two driver-managed PSRAM framebuffers, no bounce buffer ----
     esp_lcd_rgb_panel_config_t panel_conf = {};
     panel_conf.clk_src = LCD_CLK_SRC_DEFAULT;
     panel_conf.data_width = 16;
     // DMA burst alignment for PSRAM framebuffer reads. Larger bursts (64 B)
-    // mean fewer, more efficient PSRAM transactions, so the RGB bounce buffer
-    // is refilled with less bus arbitration overhead. Without this the default
+    // mean fewer, more efficient PSRAM transactions, so scan-out reads the
+    // framebuffer with less bus arbitration overhead. Without this the default
     // small bursts compete with WiFi/cache traffic and cause line drift.
     panel_conf.dma_burst_size = 64;
     panel_conf.de_gpio_num = (gpio_num_t)LCD_DE;
@@ -540,46 +539,48 @@ extern "C" void app_main(void)
     panel_conf.timings.h_res = LCD_H_RES;
     panel_conf.timings.v_res = LCD_V_RES;
     // ---- RGB panel timing ----
-    // If the image is shifted horizontally, tune hsync_back_porch (shifts the
-    // image RIGHT when increased, LEFT when decreased); for vertical shift tune
-    // vsync_back_porch the same way. Elecrow's proven values for this 800x480
-    // CrowPanel panel family are HBP=43, HFP=8, HPW=4 / VBP=12, VFP=8, VPW=4
-    // (PCLK ~15-16 MHz). Adjust these toward those numbers if the picture is
-    // off-center, then rebuild.
-    panel_conf.timings.hsync_back_porch = 8;
-    panel_conf.timings.hsync_front_porch = 8;
-    panel_conf.timings.hsync_pulse_width = 4;
-    panel_conf.timings.vsync_back_porch = 16;
-    panel_conf.timings.vsync_front_porch = 16;
-    panel_conf.timings.vsync_pulse_width = 4;
+    // These are the AUTHORITATIVE values from Elecrow's official board config
+    // (esp_panel_board_custom_conf.h) for this exact 5" 800x480 CrowPanel:
+    //   PCLK 16 MHz, HPW=10 HBP=10 HFP=20, VPW=10 VBP=10 VFP=10, rising-edge PCLK.
+    // The previous values (PCLK 18 MHz, tiny HFP/HPW) left too little blanking to
+    // refill the RGB FIFO from PSRAM under render load -> glitch lines on scroll
+    // and button repaints. If the image is shifted horizontally, tune
+    // hsync_back_porch (image moves RIGHT when increased); same idea vertically
+    // with vsync_back_porch.
+    panel_conf.timings.hsync_back_porch = 10;
+    panel_conf.timings.hsync_front_porch = 20;
+    panel_conf.timings.hsync_pulse_width = 10;
+    panel_conf.timings.vsync_back_porch = 10;
+    panel_conf.timings.vsync_front_porch = 10;
+    panel_conf.timings.vsync_pulse_width = 10;
+    // Official Elecrow config drives data on the rising PCLK edge (active_neg=0).
+    panel_conf.timings.flags.pclk_active_neg = 0;
     panel_conf.flags.fb_in_psram = 1;
     // Two full framebuffers in PSRAM. LVGL renders into the back buffer while the
     // panel scans out the front buffer, then we swap on VSYNC (see flush_cb).
     // This is the proper cure for the drift/tearing: the scan-out engine always
     // reads a complete, stable frame.
     panel_conf.num_fbs = 2;
-    // Bounce buffer = 10 lines, exactly matching the proven Elecrow Lesson16
-    // (esp_lvgl_port rgb_lcd) config for this 800x480 CrowPanel P4 panel.
-    // The scan-out engine reads from these small internal-RAM bounce buffers
-    // (refilled in efficient 64-byte DMA bursts) instead of contending directly
-    // with LVGL's rendering for random PSRAM access. Without it, heavy redraws
-    // (scrolling, button repaints) starve the scan-out DMA and produce glitch
-    // lines. 2 x (800*10*2) = 32 KB internal RAM — acceptable alongside WiFi.
-    panel_conf.bounce_buffer_size_px = LCD_H_RES * 10;
+    // NO bounce buffer on this P4 board. Testing on real hardware showed the
+    // bounce path (on_frame_buf_complete) actually re-introduced glitching on
+    // the main screen here; the correct, fast PSRAM timings (above) plus double
+    // framebuffers + VSYNC swap are what keep scan-out stable. With the proper
+    // 16 MHz / wider-blanking timings the scan-out DMA refills directly from
+    // PSRAM without starving, so the bounce buffer is unnecessary and harmful.
+    panel_conf.bounce_buffer_size_px = 0;
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
 
-    // Binary semaphore + frame-complete callback for tear-free buffer swaps
-    // (see flush_cb). With a bounce buffer on IDF v6 the correct event is
-    // on_frame_buf_complete (not on_vsync) — it fires after a whole framebuffer
-    // has finished streaming through the bounce buffers. This matches the proven
-    // Elecrow esp_lvgl_port bb_mode path.
+    // Binary semaphore + VSYNC callback for tear-free buffer swaps (see
+    // flush_cb). With NO bounce buffer the scan-out reads PSRAM directly, so the
+    // correct event is on_vsync (fires at the start of each frame) — NOT
+    // on_frame_buf_complete (that only fires in bounce-buffer mode).
     g_vsync_sem = xSemaphoreCreateBinary();
     assert(g_vsync_sem);
     esp_lcd_rgb_panel_event_callbacks_t rgb_cbs = {};
-    rgb_cbs.on_frame_buf_complete = rgb_frame_done_cb;
+    rgb_cbs.on_vsync = rgb_vsync_cb;
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle,
                                                               &rgb_cbs, NULL));
     // Note: esp_lcd_panel_disp_on_off() is NOT supported for RGB panels
@@ -593,10 +594,10 @@ extern "C" void app_main(void)
     // Use the RGB driver's two PSRAM framebuffers directly as LVGL's draw
     // buffers. In DIRECT mode LVGL draws only the invalidated areas into the back
     // framebuffer (cheap repaints for button presses / scrolling), and the flush
-    // callback swaps it in on a frame boundary (see lvgl_flush_cb). This matches
-    // the proven Elecrow Lesson16 config and, combined with the bounce buffer,
-    // gives both a stable scan-out under WiFi load and smooth, low-traffic
-    // partial redraws (DIRECT redraws far less than FULL → less PSRAM contention).
+    // callback swaps it in on a frame boundary (see lvgl_flush_cb). Combined with
+    // the correct 16 MHz / wide-blanking timings this gives both a stable
+    // scan-out under WiFi load and smooth, low-traffic partial redraws (DIRECT
+    // redraws far less than FULL → less PSRAM contention).
     void *fb0 = NULL, *fb1 = NULL;
     ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 2, &fb0, &fb1));
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
@@ -604,7 +605,7 @@ extern "C" void app_main(void)
     lv_display_set_buffers(lvgl_disp, fb0, fb1,
                            LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
                            LV_DISPLAY_RENDER_MODE_DIRECT);
-    ESP_LOGI(TAG, "LVGL display ready (DIRECT mode, 2 framebuffers + bounce)");
+    ESP_LOGI(TAG, "LVGL display ready (DIRECT mode, 2 framebuffers, 16MHz timings)");
 
     // ---- GT911 touch (shares the STC8 I2C bus) ----
     if (!touch_gt911_init(g_i2c_bus, lvgl_disp)) {
