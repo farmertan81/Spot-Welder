@@ -27,6 +27,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+#include "esp_attr.h"      // IRAM_ATTR for the VSYNC ISR callback
 #include "esp_heap_caps.h"
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
@@ -87,6 +88,10 @@ static const char *TAG = "WELDER_UI";
 // ============================================================
 static lv_display_t       *lvgl_disp     = NULL;
 static esp_lcd_panel_handle_t g_panel_handle = NULL;
+// Given by the RGB panel VSYNC ISR; taken by the flush callback so LVGL only
+// hands a freshly-rendered framebuffer to the scan-out engine between frames
+// (avoid-tearing, matches the Elecrow esp_lvgl_port reference).
+static SemaphoreHandle_t  g_vsync_sem    = NULL;
 static i2c_master_dev_handle_t stc8_dev_handle = NULL;
 static i2c_master_bus_handle_t g_i2c_bus    = NULL;
 
@@ -328,10 +333,43 @@ static void cb_fw_update_stm32(void)  { ESP_LOGW(TAG, "STM32 SD firmware update 
 // ============================================================
 //  LVGL PLUMBING
 // ============================================================
+// RGB panel VSYNC ISR: the scan-out engine has just finished a frame and is
+// about to latch the next framebuffer. Wake the flush callback so it swaps
+// buffers only on this boundary (tear-free). Must live in IRAM and touch only
+// IRAM-safe APIs because the flash/PSRAM cache may be disabled when it fires.
+static IRAM_ATTR bool rgb_vsync_cb(esp_lcd_panel_handle_t panel,
+                                   const esp_lcd_rgb_panel_event_data_t *edata,
+                                   void *user_ctx)
+{
+    BaseType_t hp_task_woken = pdFALSE;
+    if (g_vsync_sem) {
+        xSemaphoreGiveFromISR(g_vsync_sem, &hp_task_woken);
+    }
+    return hp_task_woken == pdTRUE;
+}
+
+// Double-buffered DIRECT-mode flush. LVGL renders the whole frame straight into
+// one of the two driver framebuffers, so for non-final areas there is nothing
+// to copy. On the final area we hand that framebuffer to the scan-out engine
+// and block until the next VSYNC, so the engine never latches a buffer mid-draw
+// (this is what eliminates the drifting/tearing lines under WiFi load).
 static void lvgl_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
 {
-    esp_lcd_panel_draw_bitmap(g_panel_handle, area->x1, area->y1,
-                              area->x2 + 1, area->y2 + 1, px_map);
+    if (lv_display_flush_is_last(disp)) {
+        // DIRECT mode: px_map is the base of the framebuffer LVGL just rendered.
+        // Draw the WHOLE screen so the RGB driver recognises px_map as one of its
+        // own framebuffers and switches the active scan-out buffer to it (no copy)
+        // rather than blitting a sub-rectangle. Then wait for the next VSYNC so
+        // the swap lands on a frame boundary (tear-free).
+        esp_lcd_panel_draw_bitmap(g_panel_handle, 0, 0, LCD_H_RES, LCD_V_RES, px_map);
+        if (g_vsync_sem) {
+            xSemaphoreTake(g_vsync_sem, 0);
+            xSemaphoreTake(g_vsync_sem, portMAX_DELAY);
+        }
+    }
+    // Non-final areas in DIRECT mode need no work: LVGL has already rendered them
+    // straight into the framebuffer; only the final area triggers the swap above.
+    (void)area;
     lv_display_flush_ready(disp);
     // NOTE: never call ESP_LOGx here. This runs in the LVGL render hot path and
     // shares the stdout lock with stm32_task; logging here stalls rendering and
@@ -515,19 +553,30 @@ extern "C" void app_main(void)
     panel_conf.timings.vsync_front_porch = 16;
     panel_conf.timings.vsync_pulse_width = 4;
     panel_conf.flags.fb_in_psram = 1;
-    panel_conf.num_fbs = 1;
-    // Bounce buffer = 20 lines (matches the proven Elecrow WiFi+display example).
-    // The driver streams the PSRAM framebuffer through this internal-RAM bounce
-    // buffer to the LCD; a bigger buffer gives more headroom against PSRAM
-    // bandwidth stalls (WiFi DMA, cache misses) that otherwise cause line drift.
-    // Paired with CONFIG_LCD_RGB_RESTART_IN_VSYNC (sdkconfig.defaults), which
-    // realigns the DMA to the framebuffer start every VSYNC so any residual
-    // drift self-corrects each frame instead of shifting permanently.
-    panel_conf.bounce_buffer_size_px = LCD_H_RES * 20;
+    // Two full framebuffers in PSRAM. LVGL renders into the back buffer while the
+    // panel scans out the front buffer, then we swap on VSYNC (see flush_cb).
+    // This is the proper cure for the drift/tearing: the scan-out engine always
+    // reads a complete, stable frame.
+    panel_conf.num_fbs = 2;
+    // No bounce buffer with num_fbs=2. The P4's octal PSRAM @200 MHz has far more
+    // bandwidth than the ~46 MB/s this panel needs, so the scan-out DMA reads the
+    // framebuffer directly without a FIFO to underrun. A bounce buffer here would
+    // re-introduce the very underrun-driven drift we are trying to kill under
+    // WiFi load. (Brief glitches can still occur only during rare NVS flash
+    // writes, not in steady state.)
+    panel_conf.bounce_buffer_size_px = 0;
 
     ESP_ERROR_CHECK(esp_lcd_new_rgb_panel(&panel_conf, &g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_reset(g_panel_handle));
     ESP_ERROR_CHECK(esp_lcd_panel_init(g_panel_handle));
+
+    // Binary semaphore + VSYNC callback for tear-free buffer swaps (see flush_cb).
+    g_vsync_sem = xSemaphoreCreateBinary();
+    assert(g_vsync_sem);
+    esp_lcd_rgb_panel_event_callbacks_t rgb_cbs = {};
+    rgb_cbs.on_vsync = rgb_vsync_cb;
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_register_event_callbacks(g_panel_handle,
+                                                              &rgb_cbs, NULL));
     // Note: esp_lcd_panel_disp_on_off() is NOT supported for RGB panels
     // (returns ESP_ERR_NOT_SUPPORTED). RGB panels are always on when receiving signals.
     ESP_LOGI(TAG, "RGB LCD initialized: %dx%d", LCD_H_RES, LCD_V_RES);
@@ -535,22 +584,20 @@ extern "C" void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
 
-    // ---- LVGL display (partial mode + flush callback) ----
-    // Allocate draw buffers in PSRAM to free ~150 KB of internal RAM for the
-    // WiFi stack (esp_hosted + lwIP + SoftAP/DHCP). Before this change the
-    // buffers sat in internal RAM and WiFi bringup caused memory corruption
-    // (LVGL objects spilled into marginal RTCRAM at 0x5010xxxx → crash).
-    // PSRAM is fine for partial-render draw buffers; the RGB driver's internal
-    // framebuffer + bounce buffer are already in PSRAM (panel_conf.flags.fb_in_psram).
-    size_t draw_buf_size = LCD_H_RES * (LCD_V_RES / 10) * sizeof(lv_color_t);
-    void *draw_buf1 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    void *draw_buf2 = heap_caps_malloc(draw_buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    assert(draw_buf1 && draw_buf2);
+    // ---- LVGL display (DIRECT mode, double framebuffer) ----
+    // Use the RGB driver's two PSRAM framebuffers directly as LVGL's draw
+    // buffers. LVGL renders the full frame into the back buffer and the flush
+    // callback swaps it in on VSYNC (see lvgl_flush_cb). This both frees the
+    // internal RAM the old partial-mode draw buffers would have used and gives
+    // a stable, tear-free scan-out under WiFi load.
+    void *fb0 = NULL, *fb1 = NULL;
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(g_panel_handle, 2, &fb0, &fb1));
     lvgl_disp = lv_display_create(LCD_H_RES, LCD_V_RES);
     lv_display_set_flush_cb(lvgl_disp, lvgl_flush_cb);
-    lv_display_set_buffers(lvgl_disp, draw_buf1, draw_buf2, draw_buf_size,
-                           LV_DISPLAY_RENDER_MODE_PARTIAL);
-    ESP_LOGI(TAG, "LVGL display ready (partial mode)");
+    lv_display_set_buffers(lvgl_disp, fb0, fb1,
+                           LCD_H_RES * LCD_V_RES * sizeof(lv_color_t),
+                           LV_DISPLAY_RENDER_MODE_DIRECT);
+    ESP_LOGI(TAG, "LVGL display ready (DIRECT mode, 2 framebuffers)");
 
     // ---- GT911 touch (shares the STC8 I2C bus) ----
     if (!touch_gt911_init(g_i2c_bus, lvgl_disp)) {
