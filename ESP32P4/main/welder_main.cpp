@@ -408,29 +408,26 @@ static void lvgl_task(void *arg)
             xSemaphoreTake(g_state_mtx, portMAX_DELAY);
             snap = g_state;
             xSemaphoreGive(g_state_mtx);
-            
-            int64_t t0 = esp_timer_get_time();
             ui_update(snap);
-            int64_t elapsed_us = esp_timer_get_time() - t0;
-            int32_t elapsed_ms = (int32_t)(elapsed_us / 1000LL);
-            if (elapsed_ms >= 1000) {
-                ESP_LOGE(TAG, "ui_update() took %ld ms — BLOCKING CPU0!", elapsed_ms);
-            } else if (elapsed_ms >= 100) {
-                ESP_LOGW(TAG, "ui_update() took %ld ms (slow)", elapsed_ms);
-            }
         }
 
-        int64_t t0 = esp_timer_get_time();
         lv_timer_handler();
-        int64_t elapsed_us = esp_timer_get_time() - t0;
-        int32_t elapsed_ms = (int32_t)(elapsed_us / 1000LL);
-        if (elapsed_ms >= 1000) {
-            ESP_LOGE(TAG, "lv_timer_handler() took %ld ms — BLOCKING CPU0!", elapsed_ms);
-        } else if (elapsed_ms >= 100) {
-            ESP_LOGW(TAG, "lv_timer_handler() took %ld ms (slow)", elapsed_ms);
-        }
 
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // CRITICAL: this delay MUST block for at least 1 RTOS tick so the
+        // IDLE0 task on CPU0 gets to run and feed the task watchdog.
+        //
+        // pdMS_TO_TICKS(5) evaluates to 0 ticks at the default 100 Hz tick rate
+        // (5 * 100 / 1000 = 0). vTaskDelay(0) does NOT block — it only yields to
+        // equal/higher priority tasks — so the lower-priority IDLE0 task never
+        // runs, the watchdog is never fed, and it trips at the WDT timeout.
+        // That was the root cause of the repeating "IDLE0 (CPU 0)" watchdog
+        // crash. Clamp to a minimum of 1 tick so the task always truly sleeps,
+        // regardless of the configured CONFIG_FREERTOS_HZ.
+        TickType_t delay_ticks = pdMS_TO_TICKS(5);
+        if (delay_ticks == 0) {
+            delay_ticks = 1;
+        }
+        vTaskDelay(delay_ticks);
     }
 }
 

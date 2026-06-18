@@ -37,12 +37,22 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 # (LV_MEM_SIZE_KILOBYTES only applies to the builtin allocator, which is now
 #  disabled, so it is intentionally omitted.)
 
-# ===== Runtime: task watchdog + crash diagnostics =====
-# The UI now renders, but the first full-screen paint of the large 5-tab
-# 800x480 UI (software-rendered, no 2D accel) can take 30+ seconds, blocking
-# IDLE0 and triggering the task watchdog. Set to 60s to survive the startup
-# render. (TODO: optimize the UI build — 30s is abnormal and starves the UART
-# RX ISR, causing packet corruption. For now, reducing baud to 1 Mbaud helps.)
+# ===== RTOS tick rate =====
+# Run the FreeRTOS tick at 1000 Hz (1 ms/tick) instead of the 100 Hz default.
+# The LVGL task loops with vTaskDelay(pdMS_TO_TICKS(5)); at 100 Hz that rounds
+# DOWN to 0 ticks, so vTaskDelay(0) never blocks — the lower-priority IDLE0
+# task on CPU0 is starved, the task watchdog is never fed, and it trips
+# repeatedly (the "IDLE0 (CPU 0)" watchdog crash). At 1000 Hz the 5 ms delay
+# blocks for a real 5 ticks, IDLE0 runs, and LVGL also gets finer timing for
+# smoother rendering. (The code in welder_main.cpp also clamps the delay to a
+# minimum of 1 tick as a belt-and-suspenders guard regardless of this setting.)
+CONFIG_FREERTOS_HZ=1000
+
+# ===== Runtime: task watchdog =====
+# Generous timeout to survive the first full-screen software paint of the
+# large 5-tab 800x480 UI at boot. With the LVGL task now yielding correctly
+# (see FREERTOS_HZ above + the 1-tick delay clamp) the watchdog should never
+# trip in steady state.
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # NOTE: do NOT enable CONFIG_ESP_SYSTEM_USE_FRAME_POINTER here. It is applied to
 # the bootloader build too and pushes the bootloader binary past its 24 KB cap
