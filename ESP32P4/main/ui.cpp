@@ -224,15 +224,21 @@ static void do_power_step(bool increment);
 
 // Perform one increment/decrement for the given repeat context.
 static void repeat_apply_step(HoldRepeatCtx* ctx) {
+    ESP_LOGI("UI_REPEAT", "repeat_apply_step: step_fn=%p, is_power=%d, spinbox=%p, is_inc=%d",
+             ctx->step_fn, ctx->is_power, ctx->spinbox, ctx->is_increment);
+    
     if (ctx->step_fn) {
         ctx->step_fn(ctx->is_increment);
     } else if (ctx->is_power) {
         do_power_step(ctx->is_increment);
     } else if (ctx->spinbox) {
+        int32_t old_val = lv_spinbox_get_value(ctx->spinbox);
         if (ctx->is_increment)
             lv_spinbox_increment(ctx->spinbox);
         else
             lv_spinbox_decrement(ctx->spinbox);
+        int32_t new_val = lv_spinbox_get_value(ctx->spinbox);
+        ESP_LOGI("UI_REPEAT", "spinbox value: %d -> %d", (int)old_val, (int)new_val);
         lv_obj_send_event(ctx->spinbox, LV_EVENT_VALUE_CHANGED, nullptr);
     }
 }
@@ -249,7 +255,12 @@ static void repeat_stop(HoldRepeatCtx* ctx) {
 static void on_repeat_pressed(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_PRESSED) return;
     HoldRepeatCtx* ctx = (HoldRepeatCtx*)lv_event_get_user_data(e);
-    if (!ctx) return;
+    if (!ctx) {
+        ESP_LOGE("UI_REPEAT", "on_repeat_pressed: NULL ctx!");
+        return;
+    }
+    ESP_LOGI("UI_REPEAT", "on_repeat_pressed: ctx=%p", ctx);
+    
     uint32_t now = millis();
     ctx->active = true;        // finger is physically down
     ctx->stop_latched = false; // fresh genuine press clears the latch
