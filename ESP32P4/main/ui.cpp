@@ -1298,37 +1298,23 @@ static void on_preheat_toggle(lv_event_t* e) {
 // Data-only callback: apply sends recipe via callback
 static void on_apply_click(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_CLICKED) return;
-
     if (!draft_dirty) return;
-    
-    // Set guard flag to suppress spurious dirty marks during apply operation
+
+    // Guard flag prevents spurious dirty marks from stray events during the
+    // brief window between sending the command and receiving the STM32 STATUS
+    // echo that confirms the new settings.
     _applying = true;
-    
-    ESP_LOGI("UI_PULSE", "Applying recipe: mode=%u, d1=%u, gap1=%u, d2=%u, gap2=%u, d3=%u, power=%u",
-             draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2, draft_d3, draft_power);
+
     if (_recipe_cb) {
         _recipe_cb(draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2,
                    draft_d3, draft_power, draft_preheat_en, draft_preheat_ms,
                    draft_preheat_pct, draft_preheat_gap);
-        
-        // Sync applied values from draft immediately for instant visual feedback
-        applied_mode = draft_mode;
-        applied_d1 = draft_d1;
-        applied_gap1 = draft_gap1;
-        applied_d2 = draft_d2;
-        applied_gap2 = draft_gap2;
-        applied_d3 = draft_d3;
-        applied_power = draft_power;
-        applied_preheat_en = draft_preheat_en;
-        applied_preheat_ms = draft_preheat_ms;
-        applied_preheat_pct = draft_preheat_pct;
-        applied_preheat_gap = draft_preheat_gap;
-        
-        update_draft_dirty();  // Now draft == applied, so draft_dirty becomes false
-        _ui_dirty = true;  // Force UI repaint to show "Applied" state
     }
-    
-    // Clear guard flag after apply completes
+
+    // Don't sync applied=draft here. Let the STM32 STATUS echo be the single
+    // source of truth. This avoids a race where the STM32's periodic STATUS
+    // (sent before it processes our command) overwrites our instant sync and
+    // causes a visual flicker (e.g. Triple -> Single -> Triple).
     _applying = false;
 }
 
