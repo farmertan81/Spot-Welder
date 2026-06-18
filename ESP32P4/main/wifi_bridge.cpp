@@ -653,10 +653,63 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 }
 
 // ============================================================
+//  WIFI STACK BRING-UP  (runs on prov_task's stack — see note below)
+//
+//  IMPORTANT: every call in here that can touch SPI flash (nvs_flash_init,
+//  esp_wifi_init / esp_wifi_start -> PHY calibration reads NVS, esp_wifi_set_*
+//  -> WiFi NVS) disables the flash cache while it runs. While the cache is off
+//  the PSRAM is unreachable, so the *calling task's stack must live in internal
+//  RAM*. On this board the main task (app_main) stack is NOT in internal DRAM,
+//  so doing this init directly from app_main asserted in
+//  esp_task_stack_is_sane_cache_disabled(). Tasks made with xTaskCreate() get
+//  an internal-RAM stack on ESP-IDF v6.0, so we run all of this from prov_task
+//  instead of from wifi_bridge_start()/app_main.
+// ============================================================
+static void wifi_stack_init(void)
+{
+    // NVS (required by WiFi).
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        r = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(r);
+
+    // Netif + event loop + default STA/AP interfaces.
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    s_sta_netif = esp_netif_create_default_wifi_sta();
+    s_ap_netif  = esp_netif_create_default_wifi_ap();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    // Start in STA mode by default; start_ap_portal() will flip to APSTA.
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Boot: saved creds -> STA, else straight to the portal.
+    nvs_load_creds();
+    if (s_ssid[0]) {
+        start_sta_connect();
+    } else {
+        start_ap_portal();
+    }
+}
+
+// ============================================================
 //  PROVISIONING SUPERVISOR TASK
 // ============================================================
 static void prov_task(void *arg)
 {
+    // Bring the whole WiFi stack up here (internal-RAM stack — see note above).
+    wifi_stack_init();
+
     uint32_t last_ui_refresh = 0;
     while (1) {
         uint32_t now = now_ms();
@@ -718,43 +771,18 @@ void wifi_bridge_start(wifi_bridge_cmd_cb_t cmd_cb)
     s_client_mtx  = xSemaphoreCreateMutex();
     s_wifi_events = xEventGroupCreate();
 
-    // NVS (required by WiFi).
-    esp_err_t r = nvs_flash_init();
-    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        r = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(r);
+    // NOTE: we deliberately do NOT bring up NVS / WiFi here. app_main() runs on
+    // the main task, whose stack is not in internal DRAM on this board, and any
+    // flash-cache-disabling call (nvs_flash_init, esp_wifi_*) from such a stack
+    // trips the esp_task_stack_is_sane_cache_disabled() assert. Instead prov_task
+    // (created below with xTaskCreate, which gives an internal-RAM stack on
+    // ESP-IDF v6.0) calls wifi_stack_init() as its first action.
 
-    // Netif + event loop + default STA/AP interfaces.
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    s_sta_netif = esp_netif_create_default_wifi_sta();
-    s_ap_netif  = esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(
-        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
-
-    // Start in STA mode by default; start_ap_portal() will flip to APSTA.
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    // The TCP bridge listens regardless of link state.
+    // The TCP bridge listens regardless of link state (no flash ops -> safe).
     xTaskCreate(tcp_bridge_task, "tcp_bridge", 6144, NULL, 5, NULL);
 
-    // Provisioning supervisor.
-    xTaskCreate(prov_task, "wifi_prov", 4096, NULL, 5, NULL);
-
-    // Boot: saved creds -> STA, else straight to the portal.
-    nvs_load_creds();
-    if (s_ssid[0]) {
-        start_sta_connect();
-    } else {
-        start_ap_portal();
-    }
+    // Provisioning supervisor: brings up the WiFi stack, then runs the state
+    // machine. 8 KB stack — esp_wifi_init/start need significantly more than the
+    // old 4 KB once the bring-up runs inside this task.
+    xTaskCreate(prov_task, "wifi_prov", 8192, NULL, 5, NULL);
 }
