@@ -693,6 +693,12 @@ static void wifi_stack_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    // The TCP bridge calls socket()/bind()/listen(), which need the lwIP
+    // TCP/IP stack — created by esp_netif_init() above. Starting it here (rather
+    // than in wifi_bridge_start) avoids a race where it called socket() before
+    // the stack existed ("Invalid mbox" assert in tcpip_send_msg_wait_sem).
+    xTaskCreate(tcp_bridge_task, "tcp_bridge", 6144, NULL, 5, NULL);
+
     // Boot: saved creds -> STA, else straight to the portal.
     nvs_load_creds();
     if (s_ssid[0]) {
@@ -776,10 +782,9 @@ void wifi_bridge_start(wifi_bridge_cmd_cb_t cmd_cb)
     // flash-cache-disabling call (nvs_flash_init, esp_wifi_*) from such a stack
     // trips the esp_task_stack_is_sane_cache_disabled() assert. Instead prov_task
     // (created below with xTaskCreate, which gives an internal-RAM stack on
-    // ESP-IDF v6.0) calls wifi_stack_init() as its first action.
-
-    // The TCP bridge listens regardless of link state (no flash ops -> safe).
-    xTaskCreate(tcp_bridge_task, "tcp_bridge", 6144, NULL, 5, NULL);
+    // ESP-IDF v6.0) calls wifi_stack_init() as its first action. The TCP bridge
+    // task is likewise started from inside wifi_stack_init(), only after the
+    // lwIP stack exists (socket() on an uninitialised stack asserts).
 
     // Provisioning supervisor: brings up the WiFi stack, then runs the state
     // machine. 8 KB stack — esp_wifi_init/start need significantly more than the
