@@ -3425,10 +3425,10 @@ void ui_update(const WelderDisplayState& st) {
                 prev_preheat_en = draft_preheat_en;
             }
 
-            // APPLY button: dirty → green "Apply Settings", clean → grey "Applied"
+            // APPLY button: dirty → green "Apply Settings", applied → red "Applied"
             if (btn_apply) {
                 lv_obj_set_style_bg_color(btn_apply,
-                                          draft_dirty ? C_GREEN : C_DARK_GREY, 0);
+                                          draft_dirty ? C_GREEN : C_RED, 0);
             }
             if (lbl_apply) {
                 lv_label_set_text(lbl_apply, draft_dirty ? "Apply Settings" : "Applied");
