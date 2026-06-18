@@ -68,34 +68,41 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 # managed components (declared in main/idf_component.yml). The standard esp_wifi
 # API in wifi_bridge.cpp works transparently through that link.
 #
-# The C6 ships pre-flashed with the esp_hosted slave firmware. If the SDIO link
-# to the C6 fails the boot log shows:
-#     E SD_HOST: ... sd_host_start_command returned 0x107   (0x107 = TIMEOUT)
+# --- ESP-Hosted SDIO transport pins (CrowPanel Advance ESP32-P4 5" V1.0) ---
+# CRITICAL: the esp_hosted defaults (CLK18 CMD19 D0-14..D3-17, reset GPIO54
+# active-low) are for Espressif's own P4 EV board and are WRONG for this
+# CrowPanel. With the wrong pins the C6 never answers and the boot log shows:
+#     E SD_HOST: sd_host_start_command returned 0x107   (0x107 = TIMEOUT)
 #     E sdio_wrapper: sdmmc_card_init failed
 #     E transport: ensure_slave_bus_ready failed / "ESP-Hosted link not yet up"
-# The firmware now treats this as NON-FATAL (WiFi is disabled for that boot and
-# the welder UI keeps running) — see wifi_stack_init() in main/wifi_bridge.cpp.
 #
-# To actually bring the C6 link up, the SDIO transport must be configured to
-# match THIS board's wiring. The data/clock pins (CLK18 CMD19 D0-14 D1-15 D2-16
-# D3-17) are correct, but the slave RESET GPIO and its polarity are board
-# specific and the esp_hosted default (GPIO54, active-low) is the usual culprit.
-# Configure via:
-#   idf.py menuconfig
-#     Component config -> ESP-Hosted config
-#       -> Transport layer -> SDIO
-#       -> SDIO slave reset GPIO        : try 32 (CrowPanel), else 54 / 11
-#       -> Reset GPIO is active high    : ENABLE  (fixes most "card init failed"
-#                                          boot loops on CrowPanel/P4 boards)
-#       -> SDIO bus width               : set to 1-bit (most reliable wiring)
-#       -> SDIO clock freq              : drop 40000 -> 20000 kHz if still flaky
-# Verify the reset net on "ESP32-P4 Display 5.0 inch V1.0.pdf" (C6 EN/RST pin).
-# If the C6 still won't enumerate, its factory slave firmware (esp_hosted v2.3.0)
-# is buggy and may need updating to >= 2.9.x (see crowpanel-p4-c6-sdio-ota).
+# The values below are taken verbatim from Elecrow's official CrowPanel ESP-IDF
+# example (Squareline_LVGL_LED/sdkconfig.defaults) and Arduino board_config.h,
+# cross-checked against the V1.0 schematic. Reset is GPIO20 ACTIVE-HIGH.
+# These CONFIG_ESP_HOSTED_* symbols are provided by the esp_hosted managed
+# component (declared in main/idf_component.yml), so they resolve fine here —
+# unlike the native-WiFi CONFIG_ESP_WIFI_* symbols that broke an earlier build.
+CONFIG_ESP_HOSTED_ENABLED=y
+CONFIG_ESP_HOSTED_PRIV_SDIO_OPTION=y
+CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
+CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
+CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
+CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=54
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=53
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=52
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=51
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=50
+CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=49
+CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=20
 #
-# These SDIO symbols are provided by the esp_hosted managed component and only
-# exist AFTER `idf.py reconfigure` has downloaded it, so they are intentionally
-# NOT hard-coded here (undeclared CONFIG_* symbols have broken this build before).
+# Boot log should now print: CLK[53] CMD[54] D0[52] D1[51] D2[50] D3[49]
+# Slave_Reset[20]. If the C6 still won't enumerate, its factory slave firmware
+# (esp_hosted v2.3.0) is buggy on SDIO — drop to 1-bit bus (set
+# CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=n) and/or 20 MHz, or update the C6 firmware
+# (see crowpanel-p4-c6-sdio-ota). wifi_stack_init() already treats a failed link
+# as NON-FATAL so the welder UI keeps running either way.
 #
 # WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
 # buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
