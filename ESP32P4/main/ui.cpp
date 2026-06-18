@@ -1298,6 +1298,22 @@ static void on_apply_click(lv_event_t* e) {
         _recipe_cb(draft_mode, draft_d1, draft_gap1, draft_d2, draft_gap2,
                    draft_d3, draft_power, draft_preheat_en, draft_preheat_ms,
                    draft_preheat_pct, draft_preheat_gap);
+        
+        // Sync applied values from draft immediately for instant visual feedback
+        applied_mode = draft_mode;
+        applied_d1 = draft_d1;
+        applied_gap1 = draft_gap1;
+        applied_d2 = draft_d2;
+        applied_gap2 = draft_gap2;
+        applied_d3 = draft_d3;
+        applied_power = draft_power;
+        applied_preheat_en = draft_preheat_en;
+        applied_preheat_ms = draft_preheat_ms;
+        applied_preheat_pct = draft_preheat_pct;
+        applied_preheat_gap = draft_preheat_gap;
+        
+        update_draft_dirty();  // Now draft == applied, so draft_dirty becomes false
+        _ui_dirty = true;  // Force UI repaint to show "Applied" state
     }
 }
 
@@ -3397,10 +3413,13 @@ void ui_update(const WelderDisplayState& st) {
                 prev_preheat_en = draft_preheat_en;
             }
 
-            // APPLY button color: green=synced, red=pending
+            // APPLY button: dirty → green "Apply Settings", clean → grey "Applied"
             if (btn_apply) {
                 lv_obj_set_style_bg_color(btn_apply,
-                                          draft_dirty ? C_RED : C_GREEN, 0);
+                                          draft_dirty ? C_GREEN : C_DARK_GREY, 0);
+            }
+            if (lbl_apply) {
+                lv_label_set_text(lbl_apply, draft_dirty ? "Apply Settings" : "Applied");
             }
 
             // Pending label
