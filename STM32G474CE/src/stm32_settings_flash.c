@@ -105,8 +105,14 @@ static void flash_prepare_erase_config(FLASH_EraseInitTypeDef* erase_config) {
 }
 
 bool settings_flash_init(void) {
-    // HAL Flash module is initialized during HAL_Init() in main()
-    // Nothing additional needed here
+    // HAL Flash module is initialized during HAL_Init() in main().
+    // Defensively clear any Flash error flags that may be latched at boot
+    // (e.g. PGSERR/OPTVERR left over from programming or a prior session).
+    // Clearing SR error flags is a write-1-to-clear and does NOT require the
+    // Flash to be unlocked. This ensures the first settings save starts from a
+    // clean state instead of failing in the pre-erase wait. See the detailed
+    // note in settings_flash_save().
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SR_ERRORS);
     return true;
 }
 
@@ -193,6 +199,21 @@ bool settings_flash_save(const PersistentSettings* settings) {
         return false;
     }
     flash_debug_send("DBG,FLASH_UNLOCKED\r\n");
+
+    // ---- Root-cause fix for persistent FLASH_SAVE_FAILED (HAL_ERR=0x80 PGSERR) ----
+    // Diagnosis from the on-target DBG log: HAL_FLASHEx_Erase aborted in its
+    // *pre-erase* FLASH_WaitForLastOperation() (PageError stayed 0xFFFFFFFF, no
+    // page was ever touched) because FLASH->SR already had PGSERR set on entry.
+    // A stale Flash error flag — or a leftover operation bit (PG/PER/PNB/FSTPG)
+    // in FLASH->CR from an aborted earlier op — makes every subsequent erase
+    // fail. Clear both before erasing so the erase starts from a clean state.
+    // (Report SR/CR first so we can confirm what was stale on the next test.)
+    flash_debug_u32("FLASH_SR_PRECLEAR", FLASH->SR);
+    flash_debug_u32("FLASH_CR_PRECLEAR", FLASH->CR);
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_SR_ERRORS);
+    CLEAR_BIT(FLASH->CR,
+              FLASH_CR_PG | FLASH_CR_PER | FLASH_CR_PNB | FLASH_CR_FSTPG);
+    flash_debug_u32("FLASH_SR_POSTCLEAR", FLASH->SR);
 
     // Erase the settings page
     FLASH_EraseInitTypeDef erase_config;
