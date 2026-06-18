@@ -99,6 +99,16 @@ static i2c_master_bus_handle_t g_i2c_bus    = NULL;
 static WelderDisplayState g_state;
 static SemaphoreHandle_t  g_state_mtx = NULL;
 
+// Desired contact-hold steps (the value the user/UI wants enforced on the
+// STM32). The ESP32 is the source of truth here: the STM32 loses its setting
+// because its flash save fails (DENY,...,FLASH_SAVE_FAILED), so if we just
+// echoed the STM32's reported value the dashboard would always snap back to
+// the controller's stale flash default (e.g. 2.0s). Instead we remember the
+// desired value and re-assert it whenever the STM32 reports a mismatch. Note
+// the STM32 applies SET_CONTACT_HOLD to RAM *before* the (failing) flash save,
+// so a single delivered command is enough to make it take effect this session.
+static volatile uint8_t g_desired_contact_hold = 2;  // 2 steps * 0.5s = 1.0s default
+
 // Phase-1B telemetry globals declared extern in ui.h. Defined here so the link
 // resolves; populated by the STATUS parser.
 float weld_v = 0, cap_v = 0;
@@ -297,6 +307,7 @@ static void cb_recipe_apply(uint8_t mode, uint16_t d1, uint16_t gap1,
 static void cb_config_change(const ConfigState &cfg)
 {
     // Apply controller-relevant config; UI-only fields stay local.
+    g_desired_contact_hold = cfg.contact_hold_steps;   // remember for self-heal
     stm_sendf("SET_CONTACT_HOLD,%u", cfg.contact_hold_steps);
     stm_sendf("SET_LEAD_R,%.3f", cfg.lead_resistance_mohm / 1000.0f);
     stm_sendf("SET_CONTACT_WITH_PEDAL,%u", cfg.contact_with_pedal ? 1 : 0);
@@ -309,7 +320,7 @@ static void cb_trigger_source(uint8_t mode)      { stm_sendf("SET_TRIGGER_MODE,%
 static void cb_weld_count_reset(void)            { stm_send("RESET_WELD_COUNT"); }
 static void cb_contact_with_pedal(bool en)       { stm_sendf("SET_CONTACT_WITH_PEDAL,%u", en ? 1 : 0); }
 static void cb_calibrate(void)                   { stm_send("CAL_LEAD_START"); }
-static void cb_contact_delay(uint8_t steps)      { stm_sendf("SET_CONTACT_HOLD,%u", steps); }
+static void cb_contact_delay(uint8_t steps)      { g_desired_contact_hold = steps; stm_sendf("SET_CONTACT_HOLD,%u", steps); }
 
 static void cb_joule_apply(bool mode_joule, float target_j, uint16_t max_ms)
 {
@@ -431,6 +442,21 @@ static void stm32_task(void *arg)
                         if (now - last_status_log_ms >= 1000) {
                             last_status_log_ms = now;
                             ESP_LOGI(TAG, "STM32: %s", line);  // 1 Hz heartbeat
+                        }
+                        // Self-heal the contact-hold setting. If the STM32 is
+                        // reporting a value other than what the user wants
+                        // (e.g. its boot-time SET_CONTACT_HOLD was dropped, or
+                        // its flash reverted to a stale default), re-assert it.
+                        // Throttled to once every 2 s so we don't hammer the
+                        // STM32's (failing) flash save on every poll.
+                        static uint32_t last_contact_assert_ms = 0;
+                        uint8_t reported = g_state.contact_hold_steps;
+                        if (reported != g_desired_contact_hold &&
+                            now - last_contact_assert_ms >= 2000) {
+                            last_contact_assert_ms = now;
+                            ESP_LOGW(TAG, "Contact-hold mismatch: STM32=%u desired=%u, re-sending",
+                                     (unsigned)reported, (unsigned)g_desired_contact_hold);
+                            stm_sendf("SET_CONTACT_HOLD,%u", g_desired_contact_hold);
                         }
                     } else if (!is_dbg && looks_valid) {
                         ESP_LOGI(TAG, "STM32: %s", line);  // genuine async events
@@ -629,8 +655,12 @@ extern "C" void app_main(void)
     ui_init(cb_arm_toggle, cb_recipe_apply);
     ConfigState defaults = config_defaults();
     ui_load_config(defaults);
-    // Send the defaults to the STM32 so the status display reads back the
-    // correct values (contact_hold_steps=2→1.0s, not the STM32's default of 4→2.0s).
+    // Push the defaults to the STM32 and record the desired contact-hold value
+    // (g_desired_contact_hold). This first push may be dropped if the STM32 link
+    // isn't fully up yet — that's fine: stm32_task re-asserts SET_CONTACT_HOLD
+    // whenever the STM32's reported value disagrees, so the controller (and the
+    // status display) converge to 1.0s instead of the STM32's stale 2.0s flash
+    // default.
     cb_config_change(defaults);
     ui_set_system_info("P4-1.0", "ESP32-P4", 16 * 1024 * 1024, 0);
     ESP_LOGI(TAG, "UI created");
