@@ -665,33 +665,60 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
 //  an internal-RAM stack on ESP-IDF v6.0, so we run all of this from prov_task
 //  instead of from wifi_bridge_start()/app_main.
 // ============================================================
-static void wifi_stack_init(void)
+// Returns true if the WiFi stack came up, false if the radio (onboard ESP32-C6
+// over SDIO/esp_hosted) is unavailable. A false return is NOT fatal: the welder
+// UI + STM32 link must keep running with WiFi simply disabled for this boot.
+//
+// IMPORTANT: do NOT ESP_ERROR_CHECK() the radio-dependent calls. esp_wifi_init/
+// set_mode/start all talk to the C6 across the SDIO link, and if that link is
+// not up (sdmmc_card_init failed / "ESP-Hosted link not yet up") they return an
+// error. Aborting here bricks the whole device into a boot loop.
+static bool wifi_stack_init(void)
 {
-    // NVS (required by WiFi).
-    esp_err_t r = nvs_flash_init();
+    esp_err_t r;
+
+    // --- Local-to-P4 init (does not touch the C6; treat failure as fatal). ---
+    r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         r = nvs_flash_init();
     }
     ESP_ERROR_CHECK(r);
 
-    // Netif + event loop + default STA/AP interfaces.
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     s_sta_netif = esp_netif_create_default_wifi_sta();
     s_ap_netif  = esp_netif_create_default_wifi_ap();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
+    // --- Radio bring-up over esp_hosted/SDIO to the C6 (non-fatal). ---
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    r = esp_wifi_init(&cfg);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_init failed: %s — onboard ESP32-C6 radio link "
+                      "(esp_hosted/SDIO) is down. WiFi disabled this boot; "
+                      "welder UI continues. Check C6 SDIO reset GPIO/polarity "
+                      "and C6 slave firmware.", esp_err_to_name(r));
+        return false;
+    }
+
     // Start in STA mode by default; start_ap_portal() will flip to APSTA.
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    r = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_set_mode failed: %s — WiFi disabled this boot.",
+                 esp_err_to_name(r));
+        return false;
+    }
+    r = esp_wifi_start();
+    if (r != ESP_OK) {
+        ESP_LOGE(TAG, "esp_wifi_start failed: %s — WiFi disabled this boot.",
+                 esp_err_to_name(r));
+        return false;
+    }
 
     // The TCP bridge calls socket()/bind()/listen(), which need the lwIP
     // TCP/IP stack — created by esp_netif_init() above. Starting it here (rather
@@ -706,6 +733,7 @@ static void wifi_stack_init(void)
     } else {
         start_ap_portal();
     }
+    return true;
 }
 
 // ============================================================
@@ -714,7 +742,14 @@ static void wifi_stack_init(void)
 static void prov_task(void *arg)
 {
     // Bring the whole WiFi stack up here (internal-RAM stack — see note above).
-    wifi_stack_init();
+    // If the C6 radio link is down, disable WiFi for this boot and end the task
+    // so the welder UI keeps running (the supervisor loop only manages WiFi).
+    if (!wifi_stack_init()) {
+        ESP_LOGW(TAG, "WiFi unavailable — provisioning supervisor exiting; "
+                      "welder runs without networking this boot.");
+        vTaskDelete(NULL);
+        return;
+    }
 
     uint32_t last_ui_refresh = 0;
     while (1) {
