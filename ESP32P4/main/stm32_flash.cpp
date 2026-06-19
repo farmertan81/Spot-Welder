@@ -333,7 +333,43 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     bool ok = false;
     const char *err = NULL;
     do {
-        if (!stmSync()) { err = "STM32 bootloader did not respond"; break; }
+        if (!stmSync()) {
+            err = "STM32 bootloader did not respond";
+            // DECISIVE POST-FAILURE RE-PROBE. The sync just failed at 115200 8E1.
+            // Flip the link BACK to the app's 1 Mbaud 8N1 and listen ~2 s. This
+            // resolves the ambiguity of the silence:
+            //   * hear "STATUS"/"DBG"/"ACK" -> the STM32 is RUNNING THE APP. The
+            //     reset did NOT land in the ROM bootloader (the early-boot TAMP
+            //     jump didn't happen, or the app rebooted normally). The fix must
+            //     be on the STM32 entry side, not the UART handshake.
+            //   * still SILENT -> the STM32 is HUNG, or it IS in the ROM but its
+            //     USART isn't answering (classic software-jump-to-bootloader
+            //     USART failure). Either way the UART config is not the culprit.
+            uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
+            uart_set_baudrate(STM_BOOT_UART, 1000000);
+            uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
+            uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);  // back to 8N1
+            uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+            uart_flush_input(STM_BOOT_UART);
+            char rp[256];
+            int rt = 0;
+            for (int i = 0; i < 20 && rt < (int)sizeof(rp) - 1; i++) {
+                int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp + rt,
+                                        sizeof(rp) - 1 - rt, pdMS_TO_TICKS(100));
+                if (n > 0) rt += n;
+            }
+            rp[rt > 0 ? rt : 0] = '\0';
+            if (rt > 0 && (strstr(rp, "STATUS") || strstr(rp, "DBG") ||
+                           strstr(rp, "ACK"))) {
+                ESP_LOGE(TAG, "RE-PROBE @1Mbaud: APP IS RUNNING (%d bytes) -> the "
+                              "reset did NOT enter the ROM bootloader.", rt);
+                ESP_LOGW(TAG, "  re-probe text: %.*s", rt, rp);
+            } else {
+                ESP_LOGE(TAG, "RE-PROBE @1Mbaud: STILL SILENT (%d bytes) -> STM32 "
+                              "is hung or in a non-responsive ROM bootloader.", rt);
+            }
+            break;
+        }
 
         uint16_t id = 0;
         if (stmGetId(&id))
