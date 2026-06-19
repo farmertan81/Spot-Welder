@@ -4115,15 +4115,27 @@ static void parseCommand(char* line) {
      * drops BOOT0 LOW again after flashing so the next reset boots the app.
      * Accept both the bare and CMD-prefixed command forms. */
     if (strcmp(line, "BOOTLOADER") == 0 || strcmp(line, "CMD,BOOTLOADER") == 0) {
-        uartSend("DBG,BOOTLOADER command received -> resetting (BOOT0 held high "
-                 "by ESP32 -> ROM bootloader)");
+        /* SOFTWARE (BOOT0-independent) ROM-bootloader entry.
+         * Earlier this did a bare NVIC_SystemReset() and relied entirely on the
+         * ESP32 holding the hardware BOOT0 pin high. Field testing proved that
+         * strap is NOT effective on this board (after the reset the chip lands
+         * back in the application, broadcasting STATUS at 1 Mbaud, instead of
+         * the silent ROM bootloader) - whether due to the GPIO31->BOOT0 wiring
+         * or an option byte (nBOOT_SEL) that makes BOOT0 ignored.
+         *
+         * requestBootloaderReset() instead stashes BOOTLOADER_REQUEST_MAGIC in a
+         * TAMP backup register and resets. The magic survives the warm reset and
+         * is detected at the very top of main() (before the IWDG is re-armed),
+         * which then calls jumpToBootloader() to remap system memory and jump to
+         * the ROM at 0x1FFF0000. This reaches the ROM bootloader with NO reliance
+         * on the BOOT0 pin at all. */
+        uartSend("DBG,BOOTLOADER command received -> software TAMP-magic ROM entry "
+                 "(BOOT0 pin not required)");
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
-        uartSend("DBG,Resetting now (hardware BOOT0 entry)");
-        HAL_Delay(100);             /* give the UART time to send before reset */
-        NVIC_SystemReset();         /* clean reset; BOOT0=high -> ROM bootloader */
-        return;
+        requestBootloaderReset();   /* sets TAMP magic + NVIC_SystemReset(); no return */
+        return;                     /* unreachable */
     }
 
     if (strncmp(line, "READY,", 6) == 0) {
