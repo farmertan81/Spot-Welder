@@ -52,7 +52,7 @@ static const char *TAG = "WELDER_UI";
 #define STM32_TX_PIN        29
 #define STM32_RX_PIN        30
 #define STM32_BOOT0_PIN     31
-#define BUF_SIZE            2048
+#define BUF_SIZE            8192  // WAVEFORM_DATA lines can be huge (OLD board used 8192)
 #define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (still generous at 1 Mbaud)
 #define STM32_BAUD          1000000  // 1 Mbaud — stable link without HW flow control
 // WiFi credentials, captive portal and the Flask TCP bridge (port 8888) are all
