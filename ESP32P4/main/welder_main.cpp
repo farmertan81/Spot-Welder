@@ -307,10 +307,13 @@ static void enrich_and_broadcast(const char *line)
     esp_chip_info(&chip_info);
     const char *chip_model = CONFIG_IDF_TARGET;  // "esp32p4"
     
+    uint32_t flash_size = 0;
+    esp_flash_get_size(NULL, &flash_size);  // NULL = default flash chip
+    
     len += snprintf(enriched + len, sizeof(enriched) - len,
                     ",fw_version=1.0.0,chip_model=%s,flash_size=%lu,free_heap=%lu,uptime_s=%lu",
                     chip_model,
-                    (unsigned long)spi_flash_get_chip_size(),
+                    (unsigned long)flash_size,
                     (unsigned long)esp_get_free_heap_size(),
                     (unsigned long)(esp_timer_get_time() / 1000000ULL));
 
