@@ -215,26 +215,53 @@ static IRAM_ATTR bool stmGo(uint32_t addr) {
 
 // Switch the link from the app's 1 Mbaud 8N1 to the ROM bootloader's 115200 8E1.
 //
-// CRITICAL: do NOT delete/reinstall the driver and do NOT call uart_set_pin().
-// Tearing the driver down floats the TX pin for the teardown gap, which the STM32
-// ROM reads as a break / fake start bit; its auto-baud then locks onto that
-// garbage edge instead of our clean 0x7F (the corrupted-/silent-ACK symptom).
-// The driver welder_main.cpp installed is still alive (stm32_task is only parked,
-// not deleted), so we just retune the line parameters in place on the live
-// driver. The TX pin is never re-muxed, so it stays cleanly idle-high throughout
-// and the very first edge the ROM ever sees is our 0x7F start bit.
+// ROOT-CAUSE NOTE (2026-06-19): This board's STM32 SD/UART flash provably worked
+// on the OLD Sunton firmware (git 8b63ab5 + 6cebf05). That working code did a
+// FULL Arduino HardwareSerial teardown + reopen:
+//        STM32Serial.end();
+//        STM32Serial.begin(115200, SERIAL_8E1, RX, TX);
+// i.e. the driver was completely re-initialised for the parity change. The flash
+// only broke AFTER the screen-glitch fixes, when the code was changed (git
+// 8b13ade / 5bdc3fb) to flip parity IN PLACE on the live driver to avoid a
+// feared "TX glitch" during teardown. An in-place uart_set_parity() does NOT
+// cleanly reset the 8E1 framing state, so the ROM's auto-baud mis-locks — the
+// exact 0x9A/0xFA garbage / silent-ACK symptom seen on the P4.
+//
+// So we go back to the proven behaviour: fully delete and reinstall the driver
+// at 115200 8E1, which is the ESP-IDF equivalent of .end()/.begin(). To remove
+// the original "floating TX" concern entirely, we first park the TX pin as a
+// plain GPIO driven HIGH (UART idle level) so the line is never released low
+// during the swap — the very first edge the ROM ever sees is our clean 0x7F.
 static void switch_uart_to_bootloader(void) {
     // Make sure everything queued at 1 Mbaud has physically left the wire before
-    // we change the bit timing underneath it.
+    // we tear the driver down.
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
 
-    // Retune in place: 1 Mbaud 8N1  ->  115200 8E1. Clock from XTAL so the baud
-    // is exact and immune to power-management clock scaling (an inaccurate baud
-    // is itself a classic auto-baud mis-lock cause).
-    uart_set_baudrate(STM_BOOT_UART, 115200);
-    uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
-    uart_set_parity(STM_BOOT_UART, UART_PARITY_EVEN);  // ROM bootloader is 8E1
-    uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+    // Hold TX idle-high as a GPIO across the teardown gap so the line never
+    // floats / glitches low (which the ROM would read as a fake start bit).
+    gpio_set_direction((gpio_num_t)STM_TX_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)STM_TX_PIN, 1);
+
+    // Full clean re-init = .end()/.begin(). Delete the live driver, reconfigure
+    // for 115200 8E1, re-mux the pins, and reinstall. This resets ALL framing
+    // state (the in-place retune did not), so the ROM auto-baud locks on cleanly.
+    uart_driver_delete(STM_BOOT_UART);
+
+    uart_config_t cfg = {};
+    cfg.baud_rate = 115200;
+    cfg.data_bits = UART_DATA_8_BITS;
+    cfg.parity    = UART_PARITY_EVEN;   // ROM bootloader is 8E1
+    cfg.stop_bits = UART_STOP_BITS_1;
+    cfg.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+#if defined(UART_SCLK_XTAL)
+    // Clock from XTAL so the baud is exact and immune to power-management clock
+    // scaling (an inaccurate baud is itself a classic auto-baud mis-lock cause).
+    cfg.source_clk = UART_SCLK_XTAL;
+#endif
+    uart_param_config(STM_BOOT_UART, &cfg);
+    uart_set_pin(STM_BOOT_UART, STM_TX_PIN, STM_RX_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    uart_driver_install(STM_BOOT_UART, 4096, 0, 0, NULL, 0);
 
     uart_flush_input(STM_BOOT_UART);
 }
@@ -322,8 +349,9 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
         if (total > 0) ESP_LOGW(TAG, "  probe text: %.*s", total, probe);
     }
 
-    // 5) Hand the link to the 115200 8E1 ROM-bootloader config (in place — no
-    //    driver teardown, so the TX line never glitches).
+    // 5) Hand the link to the 115200 8E1 ROM-bootloader config via a FULL clean
+    //    driver reinstall (the proven .end()/.begin() behaviour), with TX held
+    //    idle-high across the gap so the line never glitches.
     switch_uart_to_bootloader();
 
     // 6) Drain any residual bytes so the FIRST thing we actively send is a
