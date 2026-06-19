@@ -930,13 +930,21 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "===== ESP32-P4 Welder Display (UI port) =====");
 
     // BOOT0 LOW first so the STM32 stays in application mode.
+    // INPUT_OUTPUT (not plain OUTPUT) so the input buffer stays enabled and
+    // gpio_get_level() reads the ACTUAL pad voltage — this lets stm32_flash.cpp
+    // verify BOOT0 truly drives HIGH before a flash (an output-only pin always
+    // reads back 0 because its input register is disconnected).
     gpio_config_t boot0 = {};
     boot0.pin_bit_mask = (1ULL << STM32_BOOT0_PIN);
-    boot0.mode = GPIO_MODE_OUTPUT;
+    boot0.mode = GPIO_MODE_INPUT_OUTPUT;
     boot0.pull_down_en = GPIO_PULLDOWN_ENABLE;
     gpio_config(&boot0);
     gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
-    ESP_LOGI(TAG, "GPIO%d (BOOT0) set LOW", STM32_BOOT0_PIN);
+    // Dump GPIO31's IO-mux state: if it prints "**RESERVED**" the pin is owned
+    // by the flash/PSRAM controller and CANNOT be used for BOOT0 (pick another).
+    ESP_LOGI(TAG, "GPIO%d (BOOT0) set LOW; readback=%d, dumping IO config:",
+             STM32_BOOT0_PIN, gpio_get_level((gpio_num_t)STM32_BOOT0_PIN));
+    gpio_dump_io_configuration(stdout, (1ULL << STM32_BOOT0_PIN));
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();
