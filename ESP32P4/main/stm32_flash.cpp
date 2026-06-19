@@ -264,29 +264,24 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
 
-    // DIAGNOSTIC: sniff the 1 Mbaud app link right after the reset to tell which
-    // failure fork we are on (the serial monitor alone disambiguates A vs B):
-    //   * If BOOT0 was genuinely HIGH at reset, the STM32 lands in its SILENT
-    //     ROM bootloader -> we should see (near) nothing here.
-    //   * If BOOT0 was LOW, the normal APPLICATION restarts and immediately
-    //     streams text (boot banner / STATUS) at 1 Mbaud -> we capture a burst.
-    {
-        uint8_t sniff[96];
-        int n = uart_read_bytes(STM_BOOT_UART, sniff, sizeof(sniff) - 1,
-                                pdMS_TO_TICKS(150));
-        if (n > 0) {
-            sniff[n] = '\0';
-            ESP_LOGW(TAG, "post-reset 1Mbaud sniff: %d byte(s) -> APP probably "
-                          "RESTARTED (BOOT0 not HIGH at reset?)", n);
-            ESP_LOGW(TAG, "  sniff text: %.*s", n, (char *)sniff);
-        } else {
-            ESP_LOGI(TAG, "post-reset 1Mbaud sniff: SILENT -> STM32 likely in ROM "
-                          "bootloader (good)");
-        }
-    }
-
-    // 4) Hand UART_NUM_1 to the 115200 8E1 bootloader configuration.
+    // 4) CRITICAL ORDERING: reconfigure the UART to 115200 8E1 *immediately*,
+    //    while the STM32 app is still in its ~170 ms ACK-then-reset countdown.
+    //    Tearing down the driver and re-muxing the TX pin glitches the TX line
+    //    (a fake start bit). The STM32 ROM bootloader auto-bauds onto the FIRST
+    //    byte it sees after reset, so if that glitch lands AFTER the ROM is
+    //    already listening, the ROM locks to a garbage baud and our 0x7F comes
+    //    back corrupted (the 0x9A-then-silence symptom). By switching NOW, the
+    //    glitch happens BEFORE the chip resets; by the time the ROM starts
+    //    listening (~170 ms) the TX line is settled idle-high, so the very first
+    //    byte the ROM measures is our clean 0x7F.
     switch_uart_to_bootloader();
+
+    // 5) Let the app finish its reset and the ROM bootloader come up & begin
+    //    listening. The line is idle-high (UART idle) throughout this wait.
+    vTaskDelay(pdMS_TO_TICKS(250));
+
+    // 6) Drain any residual bytes (misframed app tail) so the FIRST thing we
+    //    actively send is a pristine 0x7F.
     stmDrainRx();
 
     bool ok = false;
