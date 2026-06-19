@@ -64,6 +64,7 @@ static char              s_ap_ssid[24]    = {0};   // "SpotWelder-XXXX"
 static esp_netif_t      *s_sta_netif      = NULL;
 static esp_netif_t      *s_ap_netif       = NULL;
 static httpd_handle_t    s_portal_httpd   = NULL;
+static httpd_handle_t    s_lan_httpd      = NULL;   // STA-mode server (OTA on LAN)
 static EventGroupHandle_t s_wifi_events    = NULL;
 static volatile bool     s_creds_just_saved = false;
 static volatile bool     s_reconfigure_req  = false;
@@ -466,7 +467,7 @@ static esp_err_t update_get_handler(httpd_req_t *req)
         "3. Click Upload and wait ~30-60 seconds<br>"
         "4. Device will reboot automatically when complete</div>"
         "<div class='warning'><strong>⚠️ Warning:</strong> Do not power off the device during update!</div>"
-        "<form id='form' method='POST' action='/ota' enctype='multipart/form-data'>"
+        "<form id='form' method='POST' action='/ota'>"
         "<input type='file' name='file' id='file' accept='.bin' required>"
         "<button type='submit' id='btn'>Upload Firmware</button>"
         "</form>"
@@ -491,7 +492,6 @@ static esp_err_t update_get_handler(httpd_req_t *req)
         "btn.disabled=true;"
         "progress.style.display='block';"
         "status.textContent='Uploading...';"
-        "const formData=new FormData();formData.append('file',file);"
         "try{"
         "const xhr=new XMLHttpRequest();"
         "xhr.upload.onprogress=(e)=>{"
@@ -516,7 +516,8 @@ static esp_err_t update_get_handler(httpd_req_t *req)
         "};"
         "xhr.open('POST','/ota',true);"
         "xhr.setRequestHeader('Authorization','Basic '+btoa('admin:spotwelder2024'));"
-        "xhr.send(formData);"
+        "xhr.setRequestHeader('Content-Type','application/octet-stream');"
+        "xhr.send(file);"
         "}catch(err){"
         "alert('Upload failed: '+err.message);btn.disabled=false;"
         "}};"
@@ -623,6 +624,46 @@ static void stop_portal_httpd(void)
     }
 }
 
+// ------------------------------------------------------------------
+// STA-mode HTTP server (firmware OTA over the LAN, e.g. 192.168.1.77).
+// ------------------------------------------------------------------
+// The captive portal server above only runs while the device is in AP setup
+// mode (192.168.4.1). Once the device joins the home WiFi we still want the
+// firmware-update endpoints reachable on the LAN so you can flash over WiFi
+// from VS Code / curl (the ESP-IDF equivalent of PlatformIO's espota), exactly
+// like the OLD board. This lightweight server exposes ONLY /update (GET, the
+// upload page) and /ota (POST, the firmware receiver) — no captive redirect.
+static void start_lan_httpd(void)
+{
+    if (s_lan_httpd) return;
+    httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
+    cfg.lru_purge_enable = true;
+    cfg.max_uri_handlers = 4;
+    // OTA pushes the whole image in one POST; allow plenty of time per recv.
+    cfg.recv_wait_timeout = 20;
+    cfg.send_wait_timeout = 20;
+    if (httpd_start(&s_lan_httpd, &cfg) != ESP_OK) {
+        ESP_LOGE(TAG, "LAN httpd start failed");
+        return;
+    }
+    httpd_uri_t update = { .uri = "/update", .method = HTTP_GET,
+                           .handler = update_get_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(s_lan_httpd, &update);
+
+    // POST /ota (password-protected firmware receiver).
+    ota_register_handler(s_lan_httpd);
+
+    ESP_LOGI(TAG, "LAN OTA server up: GET /update, POST /ota");
+}
+
+static void stop_lan_httpd(void)
+{
+    if (s_lan_httpd) {
+        httpd_stop(s_lan_httpd);
+        s_lan_httpd = NULL;
+    }
+}
+
 // ============================================================
 //  NETWORK SCAN (cached <option> list for the portal dropdown)
 // ============================================================
@@ -708,6 +749,9 @@ static void start_ap_portal(void)
 {
     ESP_LOGI(TAG, "Starting AP + captive portal (setup mode)");
 
+    // Free port 80 if the LAN OTA server was running (we're leaving STA mode).
+    stop_lan_httpd();
+
     // Drop any bridge client.
     xSemaphoreTake(s_client_mtx, portMAX_DELAY);
     if (s_client_sock >= 0) { close(s_client_sock); s_client_sock = -1; }
@@ -785,6 +829,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         ui_hide_wifi_setup();
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));  // drop the AP
         start_mdns();
+        start_lan_httpd();   // expose /update + /ota on the LAN (WiFi OTA)
         push_wifi_info_to_ui();
     }
 }

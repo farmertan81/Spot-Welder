@@ -1,0 +1,41 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Push the already-built firmware to the device over WiFi (no USB).
+      // This is the ESP-IDF equivalent of PlatformIO's espota upload.
+      // Build first with the ESP-IDF "Build" button, then run this task.
+      "label": "Flash over WiFi (OTA)",
+      "type": "shell",
+      "command": "python",
+      "args": ["${workspaceFolder}/tools/ota_flash.py"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      // Same as above but lets you type/override the device host (IP or mDNS).
+      "label": "Flash over WiFi (OTA) — choose host",
+      "type": "shell",
+      "command": "python",
+      "args": ["${workspaceFolder}/tools/ota_flash.py", "${input:otaHost}"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "otaHost",
+      "type": "promptString",
+      "description": "Device host (IP or mDNS name)",
+      "default": "192.168.1.77"
+    }
+  ]
+}

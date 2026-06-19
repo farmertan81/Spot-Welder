@@ -5,10 +5,14 @@
 // firmware over WiFi. Mirrors the OLD ESP32's ArduinoOTA feature, but uses
 // native ESP-IDF APIs (esp_https_ota) since the P4 build is pure ESP-IDF.
 //
-// USAGE (from a terminal on the same WiFi network):
-//   curl -F "file=@build/hello_world.bin" http://spotwelder.local/ota --digest -u admin:spotwelder2024
+// USAGE (from a terminal on the same WiFi network) — RAW binary POST, NOT a
+// multipart form (the handler writes the request body straight to flash):
+//   curl --data-binary @build/hello_world.bin -u admin:spotwelder2024
+//        -H "Content-Type: application/octet-stream" http://spotwelder.local/ota
 //
-// or via the Flask web UI's "Update Firmware" button (if implemented).
+// Easiest: the VS Code task "Flash over WiFi (OTA)" (tools/ota_flash.py), which
+// is the ESP-IDF equivalent of PlatformIO's espota upload. The /update web page
+// (GET /update) also works and posts the .bin as raw binary.
 //
 // The partition table (partitions.csv) has dual OTA banks (ota_0, ota_1). The
 // bootloader boots from whichever bank otadata marks as valid. After a successful
