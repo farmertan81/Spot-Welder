@@ -259,28 +259,69 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     // 3) Ask the running STM32 app to reset into ROM, over the CURRENT 1 Mbaud
     //    8N1 app link (UART driver is still installed from welder_main.cpp).
+    //    NOTE: the STM32's active BOOTLOADER handler just calls NVIC_SystemReset()
+    //    and relies ENTIRELY on the hardware BOOT0 pin being HIGH at reset to
+    //    land in the ROM. There is no software (TAMP magic) fallback in that
+    //    path, so if BOOT0 doesn't physically reach the STM32 (broken wire) or
+    //    the option bytes have nBOOT_SEL=0 (BOOT0 pin ignored), the APP simply
+    //    restarts and the ROM is never entered.
     const char *cmd = "BOOTLOADER\r\n";
     uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
 
-    // 4) CRITICAL ORDERING: reconfigure the UART to 115200 8E1 *immediately*,
-    //    while the STM32 app is still in its ~170 ms ACK-then-reset countdown.
-    //    Tearing down the driver and re-muxing the TX pin glitches the TX line
-    //    (a fake start bit). The STM32 ROM bootloader auto-bauds onto the FIRST
-    //    byte it sees after reset, so if that glitch lands AFTER the ROM is
-    //    already listening, the ROM locks to a garbage baud and our 0x7F comes
-    //    back corrupted (the 0x9A-then-silence symptom). By switching NOW, the
-    //    glitch happens BEFORE the chip resets; by the time the ROM starts
-    //    listening (~170 ms) the TX line is settled idle-high, so the very first
-    //    byte the ROM measures is our clean 0x7F.
+    // 4) DECISIVE DIAGNOSTIC — stay at the app's 1 Mbaud 8N1 and listen for up
+    //    to ~1.3 s after the reset. The app broadcasts readable "STATUS,..." /
+    //    "ACK,READY" / "DBG," text about once a second; the ROM bootloader is
+    //    SILENT until it receives a 0x7F. Reading at the matching 1 Mbaud means
+    //    any app traffic decodes as clean ASCII (no framing/parity garbage that
+    //    an 8E1/115200 read would silently drop), so this cleanly separates the
+    //    two outcomes that previously both looked like "silence":
+    //      * readable app text  -> the chip is RUNNING THE APP: BOOT0 is NOT
+    //        effective at the STM32 (broken GPIO31->BOOT0 wire, or option-byte
+    //        nBOOT_SEL=0). The ROM was never entered. Flashing cannot work until
+    //        the BOOT0 strap reaches the chip (or we switch the STM32 firmware
+    //        to the software TAMP-magic entry that ignores BOOT0).
+    //      * nothing            -> the chip is in the SILENT ROM bootloader; the
+    //        problem is purely the UART handshake and we proceed to sync.
+    {
+        char probe[160];
+        int total = 0;
+        bool app_alive = false;
+        // ~1.3 s window: comfortably longer than the app's ~1 s STATUS period.
+        for (int i = 0; i < 13 && total < (int)sizeof(probe) - 1; i++) {
+            int n = uart_read_bytes(STM_BOOT_UART,
+                                    (uint8_t *)probe + total,
+                                    sizeof(probe) - 1 - total,
+                                    pdMS_TO_TICKS(100));
+            if (n > 0) total += n;
+        }
+        probe[total > 0 ? total : 0] = '\0';
+        // Treat it as "app alive" only if we see the app's known ASCII markers,
+        // not just any noise.
+        if (total > 0 &&
+            (strstr(probe, "STATUS") || strstr(probe, "ACK") ||
+             strstr(probe, "DBG") || strstr(probe, "READY"))) {
+            app_alive = true;
+        }
+        if (app_alive) {
+            ESP_LOGE(TAG, "post-reset app-baud probe: APP IS RUNNING (%d bytes) "
+                          "-> BOOT0 is NOT effective at the STM32!", total);
+            ESP_LOGE(TAG, "  -> check the GPIO%d->STM32 BOOT0 wire, and the STM32 "
+                          "option byte nBOOT_SEL (BOOT0 pin must select boot).",
+                     STM_BOOT0_PIN);
+            ESP_LOGW(TAG, "  probe text: %.*s", total, probe);
+        } else {
+            ESP_LOGI(TAG, "post-reset app-baud probe: SILENT (%d bytes) -> STM32 "
+                          "appears to be in the ROM bootloader, proceeding", total);
+        }
+    }
+
+    // 5) Hand the link to the 115200 8E1 ROM-bootloader config (in place — no
+    //    driver teardown, so the TX line never glitches).
     switch_uart_to_bootloader();
 
-    // 5) Let the app finish its reset and the ROM bootloader come up & begin
-    //    listening. The line is idle-high (UART idle) throughout this wait.
-    vTaskDelay(pdMS_TO_TICKS(250));
-
-    // 6) Drain any residual bytes (misframed app tail) so the FIRST thing we
-    //    actively send is a pristine 0x7F.
+    // 6) Drain any residual bytes so the FIRST thing we actively send is a
+    //    pristine 0x7F.
     stmDrainRx();
 
     bool ok = false;
