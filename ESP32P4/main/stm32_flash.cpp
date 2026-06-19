@@ -286,75 +286,27 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     // 3) Ask the running STM32 app to reset into ROM, over the CURRENT 1 Mbaud
     //    8N1 app link (UART driver is still installed from welder_main.cpp).
-    //    NOTE: the STM32's active BOOTLOADER handler just calls NVIC_SystemReset()
-    //    and relies ENTIRELY on the hardware BOOT0 pin being HIGH at reset to
-    //    land in the ROM. There is no software (TAMP magic) fallback in that
-    //    path, so if BOOT0 doesn't physically reach the STM32 (broken wire) or
-    //    the option bytes have nBOOT_SEL=0 (BOOT0 pin ignored), the APP simply
-    //    restarts and the ROM is never entered.
     const char *cmd = "BOOTLOADER\r\n";
     uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
 
-    // 4) DIAGNOSTIC — stay at the app's 1 Mbaud 8N1 and listen for up to ~1.5 s
-    //    after the command. The STM32 now uses the SOFTWARE (TAMP-magic) ROM
-    //    entry, so the EXPECTED successful sequence on this link is:
-    //        "ACK,BOOTLOADER"             (command acknowledged)
-    //        "DBG,Inside requestBootloaderReset()..." / "DBG,TAMP register set..."
-    //        <warm reset>
-    //        "DBG,Boot: TAMP register = 0x...", "DBG,...Magic match - jumping..."
-    //        <SILENCE>  <- chip is now in the ROM bootloader
-    //    The chip's periodic "STATUS,..." telemetry is emitted ONLY by the main
-    //    application loop, which runs ONLY if the magic was NOT honored and the
-    //    app booted normally. So STATUS is the unambiguous failure signal:
-    //      * see "STATUS,"      -> ROM entry FAILED, app booted normally. The
-    //        TAMP magic didn't survive / wasn't detected. Flash cannot proceed.
-    //      * see DBG/ACK only   -> software entry is progressing as designed.
-    //      * total silence      -> already in ROM (e.g. very fast jump).
-    //    Reading at the matching 1 Mbaud keeps the text clean (an 8E1/115200 read
-    //    would mangle it into framing/parity noise the driver silently drops).
-    {
-        char probe[512];
-        int total = 0;
-        // ~2.5 s window: long enough to see the full pre-reset debug chatter
-        // (~120-180 ms of HAL_Delay in requestBootloaderReset), the reset itself,
-        // and the post-reset boot-time debug from early main() if the TAMP magic
-        // is detected. A normally-booted app emits STATUS within ~1 s, so this
-        // window reliably distinguishes "app booted" from "jumped to ROM".
-        for (int i = 0; i < 25 && total < (int)sizeof(probe) - 1; i++) {
-            int n = uart_read_bytes(STM_BOOT_UART,
-                                    (uint8_t *)probe + total,
-                                    sizeof(probe) - 1 - total,
-                                    pdMS_TO_TICKS(100));
-            if (n > 0) total += n;
-        }
-        probe[total > 0 ? total : 0] = '\0';
-        if (total > 0 && strstr(probe, "STATUS")) {
-            // The application's telemetry loop is running -> ROM was NOT entered.
-            ESP_LOGE(TAG, "post-cmd probe: APP IS RUNNING (saw STATUS, %d bytes) "
-                          "-> software ROM entry FAILED.", total);
-            ESP_LOGE(TAG, "  -> the TAMP magic did not survive/trigger the early- "
-                          "boot jump. Verify the STM32 carries the updated "
-                          "BOOTLOADER handler (requestBootloaderReset path).");
-        } else if (total > 0 && (strstr(probe, "Magic match") ||
-                                 strstr(probe, "Boot: TAMP") ||
-                                 strstr(probe, "ACK,BOOTLOADER") ||
-                                 strstr(probe, "DBG"))) {
-            ESP_LOGI(TAG, "post-cmd probe: software ROM entry in progress "
-                          "(%d bytes, no STATUS) -> proceeding to sync", total);
-        } else {
-            ESP_LOGI(TAG, "post-cmd probe: SILENT (%d bytes) -> STM32 appears to "
-                          "be in the ROM bootloader, proceeding", total);
-        }
-        if (total > 0) ESP_LOGW(TAG, "  probe text: %.*s", total, probe);
-    }
+    // 4) Let the STM32 complete its reset into the ROM bootloader. The working
+    //    8b63ab5 code used a simple 100ms delay here; diagnostics proved the
+    //    TAMP-magic entry works, so we go back to the proven minimal flow.
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     // 5) Hand the link to the 115200 8E1 ROM-bootloader config via a FULL clean
     //    driver reinstall (the proven .end()/.begin() behaviour), with TX held
-    //    idle-high across the gap so the line never glitches.
+    //    idle-high across the gap so the line never glitches. Match the working
+    //    8b63ab5 flow: close the 1Mbaud driver BEFORE the STM32 ROM starts
+    //    listening (no live-driver probe in between).
     switch_uart_to_bootloader();
 
-    // 6) Drain any residual bytes so the FIRST thing we actively send is a
+    // 6) Settling delay after driver reinstall, matching the proven 20ms from
+    //    8b63ab5 (the Arduino .begin() was not instant either).
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    // 7) Drain any residual bytes so the FIRST thing we actively send is a
     //    pristine 0x7F.
     stmDrainRx();
 
