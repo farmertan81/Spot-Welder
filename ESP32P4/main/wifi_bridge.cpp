@@ -26,6 +26,7 @@
 #include "lwip/netdb.h"
 
 #include "ui.h"   // ui_set_wifi_info / ui_show_wifi_setup / ui_hide_wifi_setup
+#include "ota.h"  // ota_register_handler (OTA firmware update over WiFi)
 
 static const char *TAG = "WIFI_BRIDGE";
 
@@ -511,6 +512,11 @@ static void start_portal_httpd(void)
     httpd_register_uri_handler(s_portal_httpd, &root);
     httpd_register_uri_handler(s_portal_httpd, &save);
     httpd_register_uri_handler(s_portal_httpd, &any);
+
+    // Register OTA endpoint (POST /ota, password-protected). Allows firmware
+    // updates over WiFi without needing a USB cable. Matches the OLD ESP32's
+    // ArduinoOTA feature.
+    ota_register_handler(s_portal_httpd);
 }
 
 static void stop_portal_httpd(void)

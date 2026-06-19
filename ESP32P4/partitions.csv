@@ -1,14 +1,24 @@
-# ESP32-P4 Spot-Welder Partition Table
-# Flash: 16 MB (assumed for CrowPanel P4; verify via esptool.py flash_id)
+# ESP32-P4 Spot-Welder Partition Table (OTA-enabled)
+# Flash: 16 MB (verified on CrowPanel P4)
 #
-# The full WiFi provisioning + HTTP server + captive portal + mDNS pushed the
-# binary past 1 MB, so we allocate 2 MB for the factory app (plenty of headroom
-# for future growth).
+# OTA dual-bank layout: ota_0 and ota_1 partitions (2 MB each) allow safe
+# over-the-air firmware updates. The bootloader boots from whichever partition
+# the otadata flags as valid; after a successful OTA, the device reboots into
+# the newly-flashed partition. If the new firmware crashes, the bootloader
+# falls back to the previous partition. The factory partition is optional but
+# retained for initial production flash.
 #
-# OTA partitions are NOT included yet (OTA is stubbed on the P4 build). If OTA
-# is needed later, shrink the factory partition and add ota_0/ota_1 + otadata.
+# To flash the initial firmware over USB (builds to ota_0 by default):
+#   idf.py -p COM6 flash monitor
+#
+# To update over WiFi (native ESP-IDF OTA, password-protected HTTP endpoint):
+#   curl -F "file=@build/hello_world.bin" http://spotwelder.local:8080/ota \
+#        --digest -u admin:spotwelder2024
 
-# Name,   Type, SubType, Offset,  Size,     Flags
-nvs,      data, nvs,     0x9000,  0x6000,
-phy_init, data, phy,     0xf000,  0x1000,
-factory,  app,  factory, 0x10000, 0x200000,
+# Name,     Type, SubType,  Offset,   Size,     Flags
+nvs,        data, nvs,      0x9000,   0x6000,
+phy_init,   data, phy,      0xf000,   0x1000,
+factory,    app,  factory,  0x10000,  0x200000,
+otadata,    data, ota,      0x210000, 0x2000,
+ota_0,      app,  ota_0,    0x220000, 0x200000,
+ota_1,      app,  ota_1,    0x420000, 0x200000,
