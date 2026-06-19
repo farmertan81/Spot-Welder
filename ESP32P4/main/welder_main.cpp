@@ -946,6 +946,29 @@ extern "C" void app_main(void)
              STM32_BOOT0_PIN, gpio_get_level((gpio_num_t)STM32_BOOT0_PIN));
     gpio_dump_io_configuration(stdout, (1ULL << STM32_BOOT0_PIN));
 
+    // ---- BOOT0 self-test (safe: no STM32 reset happens here) ----
+    // Drive GPIO31 HIGH briefly and read the actual pad voltage back. This is a
+    // standalone wiring diagnostic that does NOT need a flash/WiFi cycle:
+    //   readback=1 -> the ESP pin drives HIGH fine. If a flash still fails with
+    //                 the app restarting, the WIRE to the STM32 BOOT0 pad is
+    //                 open/wrong, or the STM32 option bytes ignore BOOT0.
+    //   readback=0 -> something EXTERNAL is clamping GPIO31 low (a hard short to
+    //                 GND, or a very strong pulldown on the STM32 side). A normal
+    //                 push-pull output beats the on-chip ~45k pulldown, so a 0
+    //                 here means a real external load.
+    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    int b0_hi = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
+    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int b0_lo = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
+    ESP_LOGW(TAG, "BOOT0 self-test: driven HIGH readback=%d, driven LOW "
+                  "readback=%d  (want 1 then 0)", b0_hi, b0_lo);
+    if (b0_hi != 1)
+        ESP_LOGE(TAG, "BOOT0 cannot reach HIGH — external short/strong pulldown "
+                      "on GPIO%d, the strap will never enter the ROM bootloader",
+                 STM32_BOOT0_PIN);
+
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();
     memset(&g_state, 0, sizeof(g_state));
