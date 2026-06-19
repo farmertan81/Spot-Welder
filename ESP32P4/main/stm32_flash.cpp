@@ -251,7 +251,10 @@ static void switch_uart_to_bootloader(void) {
     uart_driver_delete(STM_BOOT_UART);
 
     uart_config_t cfg = {};
-    cfg.baud_rate = 115200;
+    // NOTE: Normally 115200, but testing 57600 to rule out signal integrity issues.
+    // The STM32 ROM bootloader auto-detects baud from the 0x7F sync byte (1200-115200).
+    // If the P4 has a silicon quirk with 8E1 parity at high baud, slower might work.
+    cfg.baud_rate = 57600;  // TODO: try 115200 / 57600 / 9600
     cfg.data_bits = UART_DATA_8_BITS;
     cfg.parity    = UART_PARITY_EVEN;   // ROM bootloader is 8E1
     cfg.stop_bits = UART_STOP_BITS_1;
@@ -264,6 +267,14 @@ static void switch_uart_to_bootloader(void) {
     uart_param_config(STM_BOOT_UART, &cfg);
     uart_set_pin(STM_BOOT_UART, STM_TX_PIN, STM_RX_PIN,
                  UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    
+    // CRITICAL: Set TX pin to MAXIMUM drive strength. The P4's default drive (5mA)
+    // may be too weak for reliable 8E1 signaling, especially if there's capacitance
+    // on the wire or a long PCB trace. The loopback test passes (internal routing),
+    // but the external pad might need stronger drive for the parity bit to reach
+    // the STM32 cleanly. Drive strength 3 = ~20mA on P4 (per TRM Table 6-5).
+    gpio_set_drive_capability((gpio_num_t)STM_TX_PIN, GPIO_DRIVE_CAP_3);
+    
     uart_driver_install(STM_BOOT_UART, 4096, 0, 0, NULL, 0);
 
     uart_flush_input(STM_BOOT_UART);
@@ -271,14 +282,16 @@ static void switch_uart_to_bootloader(void) {
 
 // Internal UART loopback self-test. Uses the ESP32 hardware loopback (TX wired
 // to RX internally, no external wiring) to prove the UART can SEND and RECEIVE
-// a 0x7F byte at the CURRENT config (115200 8E1). This isolates an ESP-side UART
+// a 0x7F byte at the CURRENT config (57600/115200 8E1). This isolates an ESP-side UART
 // config bug from an external (wiring / STM32) problem:
 //   * reads back 0x7F -> the ESP UART 8E1 path is perfect; the failure is external
 //     (signal integrity on the wire, or the STM32 ROM locked onto USB/I2C/SPI).
 //   * reads back garbage / nothing -> the ESP's own 8E1 config is broken.
 // Must be called while the driver is installed at the config we want to test.
 static void uart_loopback_selftest(void) {
-    ESP_LOGI(TAG, "UART loopback self-test @115200 8E1 (internal, no wires)...");
+    uint32_t baud = 0;
+    uart_get_baudrate(STM_BOOT_UART, &baud);
+    ESP_LOGI(TAG, "UART loopback self-test @%lu 8E1 (internal, no wires)...", baud);
     uart_flush_input(STM_BOOT_UART);
     // Enable internal TX->RX loopback.
     uart_set_loop_back(STM_BOOT_UART, true);
