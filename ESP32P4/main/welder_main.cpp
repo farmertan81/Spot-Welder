@@ -689,6 +689,22 @@ static void stm32_task(void *arg)
     uint8_t *data = (uint8_t *)malloc(BUF_SIZE);
     vTaskDelay(pdMS_TO_TICKS(1000));
 
+    // Load the persistent weld counter from NVS HERE (on this task's internal-
+    // RAM stack), NOT in app_main (whose stack is in PSRAM — see app_main note).
+    // The 1s delay above gives wifi_bridge's prov_task time to run nvs_flash_init;
+    // we also call it ourselves (idempotent: returns ESP_OK if already done) so
+    // the read works even if prov_task hasn't reached it yet. nvs_flash_init and
+    // nvs_get_* both disable the flash cache, so they MUST run from an internal-
+    // RAM stack — which xTaskCreate gives this task.
+    {
+        esp_err_t r = nvs_flash_init();
+        if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            nvs_flash_erase();
+            nvs_flash_init();
+        }
+        load_weld_count_from_nvs();
+    }
+
     // Console-echo throttle. The 115200 console is ~17x slower than the 2 Mbaud
     // STM32 link, so echoing every line floods the console TX buffer, blocks
     // this read loop, overflows the 2 Mbaud RX FIFO (-> dropped bytes /
@@ -1020,8 +1036,13 @@ extern "C" void app_main(void)
     // TCP bridge (port 8888) are forwarded straight to the STM32 via stm_send.
     wifi_bridge_start(stm_send);
 
-    // Load persistent weld counter (Flask dashboard "Total Welds" display).
-    load_weld_count_from_nvs();
+    // NOTE: the persistent weld counter is loaded from NVS inside stm32_task()
+    // — NOT here. On this board the app_main (main task) stack lives in PSRAM,
+    // and any SPI-flash op (nvs_get_*) disables the flash cache, which makes the
+    // PSRAM stack unreachable -> assert in esp_task_stack_is_sane_cache_disabled().
+    // stm32_task is created with xTaskCreate (internal-RAM stack), so the NVS
+    // read is safe there. It is also the task that increments/saves the counter,
+    // so there is no cross-task race. (Same reasoning as wifi_bridge's prov_task.)
 
     ESP_LOGI(TAG, "System initialized - welder UI running");
 }
