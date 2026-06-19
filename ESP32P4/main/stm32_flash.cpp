@@ -227,7 +227,11 @@ static void switch_uart_to_bootloader(void) {
     cfg.parity     = UART_PARITY_EVEN;  // CRITICAL: STM32 ROM bootloader is 8E1
     cfg.stop_bits  = UART_STOP_BITS_1;
     cfg.flow_ctrl  = UART_HW_FLOWCTRL_DISABLE;
-    cfg.source_clk = UART_SCLK_DEFAULT;
+    // Clock the UART from the crystal (XTAL), NOT the default PLL source. The
+    // STM32 ROM bootloader auto-baud measures the bit timing of the first 0x7F;
+    // any baud error makes it mis-lock and then go silent (the 0x00-then-silence
+    // symptom). XTAL gives an exact, power-management-immune 115200 8E1.
+    cfg.source_clk = UART_SCLK_XTAL;
 
     uart_driver_install(STM_BOOT_UART, 1024, 1024, 0, NULL, 0);
     uart_param_config(STM_BOOT_UART, &cfg);
@@ -248,15 +252,38 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     // 2) Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader.
     gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(100));  // let BOOT0 settle before the reset
+    // DIAGNOSTIC: confirm the pin is actually driving HIGH (catches a broken /
+    // mis-configured GPIO before we blame the protocol).
+    int b0 = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
+    ESP_LOGI(TAG, "BOOT0 (GPIO%d) set HIGH, readback=%d %s", STM_BOOT0_PIN, b0,
+             b0 ? "(OK)" : "(FAILED — pin not driving high!)");
 
     // 3) Ask the running STM32 app to reset into ROM, over the CURRENT 1 Mbaud
     //    8N1 app link (UART driver is still installed from welder_main.cpp).
     const char *cmd = "BOOTLOADER\r\n";
     uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
-    // STM32 BOOTLOADER handler ACKs, waits ~170 ms (HAL_Delays), then resets.
-    // The G4 ROM has a narrow first-0x7F window, so wait only the minimum.
-    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // DIAGNOSTIC: sniff the 1 Mbaud app link right after the reset to tell which
+    // failure fork we are on (the serial monitor alone disambiguates A vs B):
+    //   * If BOOT0 was genuinely HIGH at reset, the STM32 lands in its SILENT
+    //     ROM bootloader -> we should see (near) nothing here.
+    //   * If BOOT0 was LOW, the normal APPLICATION restarts and immediately
+    //     streams text (boot banner / STATUS) at 1 Mbaud -> we capture a burst.
+    {
+        uint8_t sniff[96];
+        int n = uart_read_bytes(STM_BOOT_UART, sniff, sizeof(sniff) - 1,
+                                pdMS_TO_TICKS(150));
+        if (n > 0) {
+            sniff[n] = '\0';
+            ESP_LOGW(TAG, "post-reset 1Mbaud sniff: %d byte(s) -> APP probably "
+                          "RESTARTED (BOOT0 not HIGH at reset?)", n);
+            ESP_LOGW(TAG, "  sniff text: %.*s", n, (char *)sniff);
+        } else {
+            ESP_LOGI(TAG, "post-reset 1Mbaud sniff: SILENT -> STM32 likely in ROM "
+                          "bootloader (good)");
+        }
+    }
 
     // 4) Hand UART_NUM_1 to the 115200 8E1 bootloader configuration.
     switch_uart_to_bootloader();
