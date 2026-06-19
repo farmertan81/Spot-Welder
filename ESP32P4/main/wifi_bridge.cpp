@@ -412,7 +412,9 @@ static void build_portal_html(char *out, size_t outsz)
         "<input name='pass' type='password' placeholder='WiFi password'>"
         "<button type='submit'>Save &amp; Connect</button></form>"
         "<p style='text-align:center;margin-top:14px'>"
-        "<a style='color:#39c' href='/?rescan=1'>&#x21bb; Rescan networks</a></p>"
+        "<a style='color:#39c' href='/?rescan=1'>&#x21bb; Rescan networks</a>"
+        " &nbsp;|&nbsp; "
+        "<a style='color:#f90' href='/update'>🔧 Update Firmware</a></p>"
         "</div></body></html>",
         s_scan_options);
 }
@@ -429,6 +431,97 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     }
     static char html[4096];
     build_portal_html(html, sizeof(html));
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// Firmware update page (simple HTML form for uploading .bin files to /ota).
+static esp_err_t update_get_handler(httpd_req_t *req)
+{
+    const char *html = 
+        "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<style>"
+        "body{font-family:Arial,sans-serif;max-width:600px;margin:50px auto;padding:20px;background:#f5f5f5}"
+        ".card{background:white;padding:30px;border-radius:10px;box-shadow:0 2px 10px rgba(0,0,0,0.1)}"
+        "h1{color:#333;margin-top:0;border-bottom:3px solid #ff6b35;padding-bottom:10px}"
+        ".info{background:#fff3cd;border-left:4px solid #ffc107;padding:15px;margin:20px 0;border-radius:4px}"
+        ".warning{background:#f8d7da;border-left:4px solid #dc3545;padding:15px;margin:20px 0;border-radius:4px}"
+        "input[type=file]{margin:20px 0;padding:10px;border:2px dashed #ccc;border-radius:5px;width:100%;cursor:pointer}"
+        "input[type=file]:hover{border-color:#ff6b35}"
+        "button{background:#ff6b35;color:white;border:none;padding:15px 30px;font-size:16px;border-radius:5px;cursor:pointer;width:100%}"
+        "button:hover{background:#ff5722}"
+        "button:disabled{background:#ccc;cursor:not-allowed}"
+        ".progress{display:none;margin:20px 0}"
+        ".progress-bar{width:100%;height:30px;background:#e0e0e0;border-radius:5px;overflow:hidden}"
+        ".progress-fill{height:100%;background:#ff6b35;transition:width 0.3s;display:flex;align-items:center;justify-content:center;color:white;font-weight:bold}"
+        ".status{text-align:center;margin:10px 0;font-weight:bold}"
+        "a{color:#ff6b35;text-decoration:none}"
+        "a:hover{text-decoration:underline}"
+        "</style></head><body><div class='card'>"
+        "<h1>🔧 Spot Welder Firmware Update</h1>"
+        "<div class='info'><strong>ℹ️ Instructions:</strong><br>"
+        "1. Build your firmware: <code>idf.py build</code><br>"
+        "2. Select the .bin file from <code>build/</code> directory<br>"
+        "3. Click Upload and wait ~30-60 seconds<br>"
+        "4. Device will reboot automatically when complete</div>"
+        "<div class='warning'><strong>⚠️ Warning:</strong> Do not power off the device during update!</div>"
+        "<form id='form' method='POST' action='/ota' enctype='multipart/form-data'>"
+        "<input type='file' name='file' id='file' accept='.bin' required>"
+        "<button type='submit' id='btn'>Upload Firmware</button>"
+        "</form>"
+        "<div class='progress' id='progress'>"
+        "<div class='progress-bar'><div class='progress-fill' id='bar'>0%</div></div>"
+        "<div class='status' id='status'>Uploading...</div>"
+        "</div>"
+        "<div style='margin-top:30px;text-align:center'>"
+        "<a href='/'>← Back to WiFi Setup</a>"
+        "</div></div>"
+        "<script>"
+        "const form=document.getElementById('form');"
+        "const btn=document.getElementById('btn');"
+        "const fileInput=document.getElementById('file');"
+        "const progress=document.getElementById('progress');"
+        "const bar=document.getElementById('bar');"
+        "const status=document.getElementById('status');"
+        "form.onsubmit=async(e)=>{e.preventDefault();"
+        "const file=fileInput.files[0];"
+        "if(!file){alert('Please select a .bin file');return;}"
+        "if(!file.name.endsWith('.bin')){alert('File must be a .bin firmware image');return;}"
+        "btn.disabled=true;"
+        "progress.style.display='block';"
+        "status.textContent='Uploading...';"
+        "const formData=new FormData();formData.append('file',file);"
+        "try{"
+        "const xhr=new XMLHttpRequest();"
+        "xhr.upload.onprogress=(e)=>{"
+        "if(e.lengthComputable){"
+        "const pct=Math.round((e.loaded/e.total)*100);"
+        "bar.style.width=pct+'%';"
+        "bar.textContent=pct+'%';"
+        "}};"
+        "xhr.onload=()=>{"
+        "if(xhr.status===200){"
+        "bar.style.width='100%';bar.textContent='100%';"
+        "status.textContent='✅ Update complete! Device is rebooting...';"
+        "status.style.color='green';"
+        "setTimeout(()=>{window.location.href='/';},5000);"
+        "}else{"
+        "status.textContent='❌ Upload failed: '+xhr.statusText;"
+        "status.style.color='red';btn.disabled=false;"
+        "}};"
+        "xhr.onerror=()=>{"
+        "status.textContent='❌ Network error';"
+        "status.style.color='red';btn.disabled=false;"
+        "};"
+        "xhr.open('POST','/ota',true);"
+        "xhr.setRequestHeader('Authorization','Basic '+btoa('admin:spotwelder2024'));"
+        "xhr.send(formData);"
+        "}catch(err){"
+        "alert('Upload failed: '+err.message);btn.disabled=false;"
+        "}};"
+        "</script></body></html>";
+    
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;
@@ -505,11 +598,14 @@ static void start_portal_httpd(void)
     }
     httpd_uri_t root = { .uri = "/", .method = HTTP_GET,
                          .handler = root_get_handler, .user_ctx = NULL };
+    httpd_uri_t update = { .uri = "/update", .method = HTTP_GET,
+                           .handler = update_get_handler, .user_ctx = NULL };
     httpd_uri_t save = { .uri = "/save", .method = HTTP_POST,
                          .handler = save_post_handler, .user_ctx = NULL };
     httpd_uri_t any  = { .uri = "/*", .method = HTTP_GET,
                          .handler = captive_redirect_handler, .user_ctx = NULL };
     httpd_register_uri_handler(s_portal_httpd, &root);
+    httpd_register_uri_handler(s_portal_httpd, &update);
     httpd_register_uri_handler(s_portal_httpd, &save);
     httpd_register_uri_handler(s_portal_httpd, &any);
 
