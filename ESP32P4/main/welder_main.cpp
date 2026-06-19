@@ -32,6 +32,11 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_rgb.h"
 #include "esp_timer.h"
+#include "esp_system.h"
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "nvs.h"
+#include "nvs_flash.h"
 #include "lvgl.h"
 
 #include "ui.h"
@@ -113,6 +118,10 @@ float weld_v_b = 0, weld_v_a = 0;
 float cap_v_b = 0, cap_v_a = 0;
 float vcap_b = 0, vcap_a = 0;
 float energy_cap_j = 0, energy_weld_j = 0, energy_loss_j = 0;
+
+// Weld counter (persistent in NVS, incremented on WELD_DONE). Flask dashboard
+// displays this as "Total Welds" in the System Info panel.
+static uint32_t weld_count = 0;
 
 // ============================================================
 //  STC8 BACKLIGHT / PANEL POWER (I2C @ 0x2F)
@@ -223,6 +232,91 @@ static bool extract_int(const char *s, const char *key, int *out)
     return true;
 }
 
+// ============================================================
+//  WELD COUNTER (NVS persistence)
+// ============================================================
+static void load_weld_count_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("weldcount", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u32(h, "count", &weld_count);
+        nvs_close(h);
+    }
+    ESP_LOGI(TAG, "Weld count from NVS: %lu", (unsigned long)weld_count);
+}
+
+static void save_weld_count_to_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open("weldcount", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u32(h, "count", weld_count);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+// ============================================================
+//  STATUS ENRICHMENT (WiFi + System + Energy + Weld Count)
+// ============================================================
+// The OLD ESP32 enriched every STATUS line with WiFi/system/energy/weld_count
+// fields before sending to Flask. The NEW P4 must do the same — the STM32
+// doesn't know about WiFi or the weld counter, so the ESP32 injects them.
+static void enrich_and_broadcast(const char *line)
+{
+    // Only enrich STATUS packets. Forward everything else as-is.
+    if (strncmp(line, "STATUS,", 7) != 0 && strncmp(line, "STATUS2,", 8) != 0) {
+        wifi_bridge_broadcast(line);
+        return;
+    }
+
+    // Build enriched STATUS by appending WiFi/system/energy/weld_count fields.
+    char enriched[2048];
+    int len = snprintf(enriched, sizeof(enriched), "%s", line);
+    if (len < 0 || len >= (int)sizeof(enriched) - 512) {
+        wifi_bridge_broadcast(line);  // fallback if buffer too small
+        return;
+    }
+
+    // Energy (already parsed from STM32 into globals)
+    len += snprintf(enriched + len, sizeof(enriched) - len,
+                    ",energy_cap_j=%.3f,energy_weld_j=%.3f,energy_loss_j=%.3f",
+                    energy_cap_j, energy_weld_j, energy_loss_j);
+
+    // Weld counter
+    len += snprintf(enriched + len, sizeof(enriched) - len,
+                    ",weld_count=%lu", (unsigned long)weld_count);
+
+    // WiFi info
+    bool wifi_connected = false, wifi_ap_mode = false;
+    char wifi_ssid[33] = {0}, wifi_ip[16] = {0};
+    int wifi_rssi = 0;
+    wifi_bridge_get_info(&wifi_connected, &wifi_ap_mode, wifi_ssid, wifi_ip, &wifi_rssi);
+    
+    // Sanitize SSID (commas/equals break CSV parser)
+    for (char *p = wifi_ssid; *p; p++) {
+        if (*p == ',' || *p == '=') *p = ' ';
+    }
+
+    len += snprintf(enriched + len, sizeof(enriched) - len,
+                    ",wifi_connected=%d,wifi_ap_mode=%d,wifi_ssid=%s,wifi_ip=%s,wifi_rssi=%d",
+                    wifi_connected ? 1 : 0, wifi_ap_mode ? 1 : 0,
+                    wifi_ssid, wifi_ip, wifi_rssi);
+
+    // System info
+    esp_chip_info_t chip_info;
+    esp_chip_info(&chip_info);
+    const char *chip_model = CONFIG_IDF_TARGET;  // "esp32p4"
+    
+    len += snprintf(enriched + len, sizeof(enriched) - len,
+                    ",fw_version=1.0.0,chip_model=%s,flash_size=%lu,free_heap=%lu,uptime_s=%lu",
+                    chip_model,
+                    (unsigned long)spi_flash_get_chip_size(),
+                    (unsigned long)esp_get_free_heap_size(),
+                    (unsigned long)(esp_timer_get_time() / 1000000ULL));
+
+    wifi_bridge_broadcast(enriched);
+}
+
 // Parse a STATUS line from the STM32 into g_state (under mutex).
 static void parse_weld_done(const char *line)
 {
@@ -262,6 +356,10 @@ static void parse_weld_done(const char *line)
     g_state.last_weld_valid = true;
 
     xSemaphoreGive(g_state_mtx);
+
+    // Increment persistent weld counter for Flask dashboard "Total Welds".
+    weld_count++;
+    save_weld_count_to_nvs();
 }
 
 static void parse_status_line(const char *line)
@@ -365,7 +463,12 @@ static void cb_config_change(const ConfigState &cfg)
 }
 
 static void cb_trigger_source(uint8_t mode)      { stm_sendf("SET_TRIGGER_MODE,%u", mode); }
-static void cb_weld_count_reset(void)            { stm_send("RESET_WELD_COUNT"); }
+static void cb_weld_count_reset(void)
+{
+    weld_count = 0;
+    save_weld_count_to_nvs();
+    stm_send("RESET_WELD_COUNT");  // also tell STM32 (if it has its own counter)
+}
 static void cb_contact_with_pedal(bool en)       { stm_sendf("SET_CONTACT_WITH_PEDAL,%u", en ? 1 : 0); }
 static void cb_calibrate(void)                   { stm_send("CAL_LEAD_START"); }
 static void cb_contact_delay(uint8_t steps)      { stm_sendf("SET_CONTACT_HOLD,%u", steps); }
@@ -488,11 +591,12 @@ static void stm32_task(void *arg)
                     bool looks_valid = isupper((unsigned char)line[0]);
 
                     // Forward every genuine STM32 line (STATUS + async events)
-                    // to the Flask web client over the TCP bridge. Skips the
-                    // STM32's own DBG echo and obvious garbage. No-op if no
-                    // client is connected.
+                    // to the Flask web client over the TCP bridge. STATUS packets
+                    // are enriched with WiFi/system/energy/weld_count (Flask needs
+                    // these but STM32 doesn't know them). Other packets forwarded
+                    // as-is. Skips STM32's DBG echo and obvious garbage.
                     if (!is_dbg && looks_valid) {
-                        wifi_bridge_broadcast(line);
+                        enrich_and_broadcast(line);
                     }
 
                     // Calibration progress (CAL_STATUS / CAL_RESULT / CAL_ERROR).
@@ -763,6 +867,9 @@ extern "C" void app_main(void)
     // code on the Setup tab. Commands arriving from the Flask client on the
     // TCP bridge (port 8888) are forwarded straight to the STM32 via stm_send.
     wifi_bridge_start(stm_send);
+
+    // Load persistent weld counter (Flask dashboard "Total Welds" display).
+    load_weld_count_from_nvs();
 
     ESP_LOGI(TAG, "System initialized - welder UI running");
 }

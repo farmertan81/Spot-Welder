@@ -170,6 +170,41 @@ void wifi_bridge_broadcast(const char *line)
     xSemaphoreGive(s_client_mtx);
 }
 
+bool wifi_bridge_get_info(bool *out_connected, bool *out_ap_mode,
+                          char *out_ssid, char *out_ip, int *out_rssi)
+{
+    bool connected = false, ap_mode = false;
+    char ip[16] = {0};
+    const char *ssid = "";
+    int rssi = 0;
+
+    if (s_state == PROV_AP_PORTAL) {
+        connected = true;
+        ap_mode   = true;
+        ssid      = s_ap_ssid;
+        strncpy(ip, AP_IP_ADDR, sizeof(ip) - 1);
+    } else if (s_state == PROV_STA_CONNECTED) {
+        connected = true;
+        ssid      = s_ssid;
+        esp_netif_ip_info_t ipi;
+        if (s_sta_netif && esp_netif_get_ip_info(s_sta_netif, &ipi) == ESP_OK) {
+            snprintf(ip, sizeof(ip), IPSTR, IP2STR(&ipi.ip));
+        }
+        wifi_ap_record_t ap;
+        if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) rssi = ap.rssi;
+    } else {
+        ssid = s_ssid;  // the network we are trying to join
+    }
+
+    if (out_connected) *out_connected = connected;
+    if (out_ap_mode)   *out_ap_mode   = ap_mode;
+    if (out_ssid)      strncpy(out_ssid, ssid, 32), out_ssid[32] = '\0';
+    if (out_ip)        strncpy(out_ip, ip, 15), out_ip[15] = '\0';
+    if (out_rssi)      *out_rssi = rssi;
+
+    return connected;
+}
+
 static void tcp_bridge_task(void *arg)
 {
     char rx[1024];

@@ -44,6 +44,12 @@ void wifi_bridge_factory_reset(void);
 // client. Thread-safe; silently drops the line if no client is connected.
 void wifi_bridge_broadcast(const char *line);
 
+// Query current WiFi state for STATUS enrichment (Flask dashboard needs this).
+// Returns true if WiFi is up (STA connected or AP active). All out-params are
+// optional (pass NULL to skip). ssid/ip buffers must be >= 33 / 16 bytes.
+bool wifi_bridge_get_info(bool *out_connected, bool *out_ap_mode,
+                          char *out_ssid, char *out_ip, int *out_rssi);
+
 #ifdef __cplusplus
 }
 #endif
