@@ -28,6 +28,34 @@
         "panel": "shared",
         "clear": true
       }
+    },
+    {
+      // Send a freshly built STM32 firmware image to the ESP32 over WiFi; the
+      // ESP32 then flashes the STM32 over UART (AN3155). Build the STM32 in
+      // PlatformIO first; this auto-finds STM32G474CE/.pio/build/*/firmware.bin.
+      "label": "Flash STM32 over WiFi",
+      "type": "shell",
+      "command": "python",
+      "args": ["${workspaceFolder}/tools/stm32_flash_wifi.py"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
+    },
+    {
+      // Same as above but lets you type the device host and/or the .bin path.
+      "label": "Flash STM32 over WiFi — choose host",
+      "type": "shell",
+      "command": "python",
+      "args": ["${workspaceFolder}/tools/stm32_flash_wifi.py", "${input:otaHost}"],
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared",
+        "clear": true
+      }
     }
   ],
   "inputs": [

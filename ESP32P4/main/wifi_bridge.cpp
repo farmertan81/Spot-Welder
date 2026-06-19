@@ -27,6 +27,7 @@
 
 #include "ui.h"   // ui_set_wifi_info / ui_show_wifi_setup / ui_hide_wifi_setup
 #include "ota.h"  // ota_register_handler (OTA firmware update over WiFi)
+#include "stm32_flash.h"  // stm32_flash_register_handler (wireless STM32 update)
 
 static const char *TAG = "WIFI_BRIDGE";
 
@@ -475,6 +476,23 @@ static esp_err_t update_get_handler(httpd_req_t *req)
         "<div class='progress-bar'><div class='progress-fill' id='bar'>0%</div></div>"
         "<div class='status' id='status'>Uploading...</div>"
         "</div>"
+        "<hr style='margin:30px 0;border:none;border-top:1px solid #ddd'>"
+        "<h1>⚙️ STM32 Weld Controller Update</h1>"
+        "<div class='info'><strong>ℹ️ Instructions:</strong><br>"
+        "1. Build the STM32 project in PlatformIO<br>"
+        "2. Select <code>firmware.bin</code> from <code>STM32G474CE/.pio/build/&lt;env&gt;/</code><br>"
+        "3. Click Upload — the ESP32 receives it, then flashes the STM32 over UART<br>"
+        "4. Watch the welder screen for the STM32 progress bar; the device reboots when done</div>"
+        "<div class='warning'><strong>⚠️ Warning:</strong> Do not power off during the STM32 update! "
+        "Keep an ST-LINK on the SWD header handy as a recovery fallback.</div>"
+        "<form id='sform' method='POST' action='/stm32'>"
+        "<input type='file' name='file' id='sfile' accept='.bin' required>"
+        "<button type='submit' id='sbtn'>Upload STM32 Firmware</button>"
+        "</form>"
+        "<div class='progress' id='sprogress'>"
+        "<div class='progress-bar'><div class='progress-fill' id='sbar'>0%</div></div>"
+        "<div class='status' id='sstatus'>Uploading...</div>"
+        "</div>"
         "<div style='margin-top:30px;text-align:center'>"
         "<a href='/'>← Back to WiFi Setup</a>"
         "</div></div>"
@@ -520,6 +538,49 @@ static esp_err_t update_get_handler(httpd_req_t *req)
         "xhr.send(file);"
         "}catch(err){"
         "alert('Upload failed: '+err.message);btn.disabled=false;"
+        "}};"
+        // ---- STM32 firmware upload (POST /stm32) ----
+        "const sform=document.getElementById('sform');"
+        "const sbtn=document.getElementById('sbtn');"
+        "const sfileInput=document.getElementById('sfile');"
+        "const sprogress=document.getElementById('sprogress');"
+        "const sbar=document.getElementById('sbar');"
+        "const sstatus=document.getElementById('sstatus');"
+        "sform.onsubmit=async(e)=>{e.preventDefault();"
+        "const file=sfileInput.files[0];"
+        "if(!file){alert('Please select a .bin file');return;}"
+        "if(!file.name.endsWith('.bin')){alert('File must be a .bin firmware image');return;}"
+        "sbtn.disabled=true;"
+        "sprogress.style.display='block';"
+        "sstatus.textContent='Uploading to ESP32...';"
+        "try{"
+        "const xhr=new XMLHttpRequest();"
+        "xhr.upload.onprogress=(e)=>{"
+        "if(e.lengthComputable){"
+        "const pct=Math.round((e.loaded/e.total)*100);"
+        "sbar.style.width=pct+'%';"
+        "sbar.textContent=pct+'%';"
+        "if(pct>=100)sstatus.textContent='Flashing STM32 — watch the welder screen...';"
+        "}};"
+        "xhr.onload=()=>{"
+        "if(xhr.status===200){"
+        "sbar.style.width='100%';sbar.textContent='100%';"
+        "sstatus.textContent='✅ Received! Flashing STM32, device will reboot...';"
+        "sstatus.style.color='green';"
+        "setTimeout(()=>{window.location.href='/';},8000);"
+        "}else{"
+        "sstatus.textContent='❌ Upload failed: '+xhr.statusText;"
+        "sstatus.style.color='red';sbtn.disabled=false;"
+        "}};"
+        "xhr.onerror=()=>{"
+        "sstatus.textContent='❌ Network error';"
+        "sstatus.style.color='red';sbtn.disabled=false;"
+        "};"
+        "xhr.open('POST','/stm32',true);"
+        "xhr.setRequestHeader('Content-Type','application/octet-stream');"
+        "xhr.send(file);"
+        "}catch(err){"
+        "alert('Upload failed: '+err.message);sbtn.disabled=false;"
         "}};"
         "</script></body></html>";
     
@@ -614,6 +675,7 @@ static void start_portal_httpd(void)
     // updates over WiFi without needing a USB cable. Matches the OLD ESP32's
     // ArduinoOTA feature.
     ota_register_handler(s_portal_httpd);
+    stm32_flash_register_handler(s_portal_httpd);  // POST /stm32 (wireless STM32 flash)
 }
 
 static void stop_portal_httpd(void)
@@ -652,6 +714,7 @@ static void start_lan_httpd(void)
 
     // POST /ota (password-protected firmware receiver).
     ota_register_handler(s_lan_httpd);
+    stm32_flash_register_handler(s_lan_httpd);  // POST /stm32 (wireless STM32 flash)
 
     ESP_LOGI(TAG, "LAN OTA server up: GET /update, POST /ota");
 }

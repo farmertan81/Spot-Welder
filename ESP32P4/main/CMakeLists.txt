@@ -3,6 +3,7 @@ idf_component_register(SRCS "welder_main.cpp"
                             "touch_gt911.c"
                             "wifi_bridge.cpp"
                             "ota.cpp"
+                            "stm32_flash.cpp"
                        PRIV_REQUIRES spi_flash
                        INCLUDE_DIRS ""
                        REQUIRES esp_driver_uart esp_driver_gpio

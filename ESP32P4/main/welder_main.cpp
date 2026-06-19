@@ -104,6 +104,12 @@ static i2c_master_bus_handle_t g_i2c_bus    = NULL;
 static WelderDisplayState g_state;
 static SemaphoreHandle_t  g_state_mtx = NULL;
 
+// STM32 remote-flash coordination (see stm32_task pause point + the
+// welder_prep_stm32_flash() hook called by stm32_flash.cpp).
+static TaskHandle_t       s_stm32_task_handle = NULL;
+static volatile bool      s_stm32_pause_req   = false;  // flasher -> stm32_task
+static volatile bool      s_stm32_paused      = false;  // stm32_task -> flasher
+
 // Set true once the first STATUS line from the STM32 has been parsed. Used to
 // adopt the controller's flash-persisted settings into the Config UI exactly
 // once at boot ("load last settings on boot"). The STM32 is now the source of
@@ -718,6 +724,19 @@ static void stm32_task(void *arg)
     uint32_t last_display_ms = 0;
 
     while (1) {
+        // Cooperative pause point for the STM32 firmware-flasher (stm32_flash.cpp).
+        // When a remote STM32 update starts, welder_prep_stm32_flash() raises
+        // s_stm32_pause_req and waits until we park HERE — a safe spot where this
+        // task holds no UART driver call and no stdout/state mutex. That lets the
+        // flasher take over UART_NUM_1 (delete+reinstall at 115200 8E1) without
+        // racing this poll loop. We never resume (the flasher reboots the ESP32
+        // when done), but the loop is written to resume cleanly anyway.
+        if (s_stm32_pause_req) {
+            s_stm32_paused = true;
+            while (s_stm32_pause_req) vTaskDelay(pdMS_TO_TICKS(20));
+            s_stm32_paused = false;
+        }
+
         // READY heartbeat: STM32 requires periodic READY,1 to keep system_ready
         // alive (has a 10s timeout). Without this, it stays in ready=0 and
         // refuses all commands (ARM, WELD, CAL_LEAD_START) with NOT_READY/DENY.
@@ -870,6 +889,36 @@ static void lvgl_task(void *arg)
             delay_ticks = 1;
         }
         vTaskDelay(delay_ticks);
+    }
+}
+
+// ============================================================
+//  STM32 REMOTE-FLASH PLATFORM HOOK
+// ============================================================
+// Called by stm32_flash.cpp before it drives the STM32 into its ROM bootloader.
+// It (1) cooperatively parks stm32_task at its safe pause point so nothing else
+// touches UART_NUM_1, and (2) slows the RGB panel pixel clock to free PSRAM bus
+// bandwidth — with XIP-from-PSRAM the continuous scan-out otherwise jitters the
+// timing-sensitive 115200 8E1 bootloader UART and breaks the AN3155 handshake
+// (this matches the OLD board's proven quietDisplayBus() approach). The flasher
+// reboots the ESP32 when done, so there is no "un-prep" — a fresh boot restores
+// the normal stm32_task + full-speed pclk + 1 Mbaud app link.
+extern "C" void welder_prep_stm32_flash(void)
+{
+    // 1) Park stm32_task at its cooperative pause point (no UART/mutex held).
+    s_stm32_pause_req = true;
+    for (int i = 0; i < 100 && !s_stm32_paused; i++) {  // up to ~1 s
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    ESP_LOGI(TAG, "stm32_task %s for STM32 flash",
+             s_stm32_paused ? "parked" : "did NOT park in time (continuing)");
+
+    // 2) Slow the LCD pixel clock to quiet the PSRAM bus during the flash.
+    if (g_panel_handle) {
+        // 2 MHz matches the OLD board's proven quietDisplayBus() value — slow
+        // enough that the RGB scan-out DMA stops starving the bootloader UART.
+        esp_lcd_rgb_panel_set_pclk(g_panel_handle, 2 * 1000 * 1000);  // 2 MHz
+        esp_lcd_rgb_panel_restart(g_panel_handle);  // re-sync scan-out at new clk
     }
 }
 
@@ -1034,7 +1083,8 @@ extern "C" void app_main(void)
 
     // ---- Tasks ----
     xTaskCreatePinnedToCore(lvgl_task, "lvgl", 16384, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(stm32_task, "stm32", 6144, NULL, 4, NULL, 1);
+    xTaskCreatePinnedToCore(stm32_task, "stm32", 6144, NULL, 4,
+                            &s_stm32_task_handle, 1);
 
     // ---- WiFi provisioning + Flask TCP bridge ----
     // Mirrors the old Sunton S3 behaviour: load saved creds from NVS and
