@@ -51,6 +51,8 @@
 #include "arduino_compat.h"  // millis()/Serial shim (ESP-IDF port of Arduino UI)
 #include "touch_gt911.h"     // touch_is_physically_down() for anti-shudder
 #include "esp_log.h"         // ESP_LOGI for debug logging
+#include "freertos/FreeRTOS.h"  // portMUX_TYPE / taskENTER_CRITICAL (deferred WiFi UI)
+#include "freertos/task.h"
 #include <lvgl.h>
 #include <math.h>
 #include <stdio.h>   // for standard snprintf/sscanf (supports %f)
@@ -3649,8 +3651,12 @@ static lv_obj_t* _fwp_percent = nullptr;  // big "NN%" label
 static lv_obj_t* _fwp_bar     = nullptr;  // 0..100 progress bar
 static lv_obj_t* _fwp_status  = nullptr;  // status line
 
-void show_firmware_progress(const char* device, int percent,
-                            const char* status_text) {
+// Real LVGL implementation — MUST run on the LVGL task only (it CREATES LVGL
+// objects on the first call). Called by ui_poll_deferred() in lvgl_task. The
+// public show_firmware_progress() below just latches the request, so it is safe
+// to call from the OTA httpd task.
+static void apply_show_firmware_progress(const char* device, int percent,
+                                         const char* status_text) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
 
@@ -3728,12 +3734,13 @@ void show_firmware_progress(const char* device, int percent,
     if (status_text && status_text[0])
         lv_label_set_text(_fwp_status, status_text);
 
-    // Force an immediate paint: the flash/OTA routine blocks loop(), so the
-    // normal lv_timer_handler() cadence will not run until it returns.
+    // Force an immediate paint so progress is visible promptly.
     lv_refr_now(NULL);
 }
 
-void hide_firmware_progress(void) {
+// Real LVGL implementation — MUST run on the LVGL task only. Called by
+// ui_poll_deferred() in lvgl_task.
+static void apply_hide_firmware_progress(void) {
     if (_fwp_overlay) {
         lv_obj_del(_fwp_overlay);  // deletes the whole child tree (card, labels)
         _fwp_overlay = nullptr;
@@ -3870,8 +3877,11 @@ void show_firmware_result_popup(bool success, const char* message,
 // ============================================================
 // SETUP TAB: live WiFi status
 // ============================================================
-void ui_set_wifi_info(bool connected, bool ap_mode, const char* ssid,
-                      const char* ip, int rssi) {
+// Real LVGL implementation — MUST run on the LVGL task only. Called by
+// ui_poll_deferred() (which runs in lvgl_task). The public ui_set_wifi_info()
+// below just queues the request; see the deferred-UI block near ui_poll_deferred().
+static void apply_set_wifi_info(bool connected, bool ap_mode, const char* ssid,
+                                const char* ip, int rssi) {
     // --- Setup tab "Connection" panel ---
     if (lbl_setup_wifi_state) {
         if (ap_mode) {
@@ -4025,8 +4035,10 @@ static void ensure_prov_overlay() {
     lv_obj_center(lbl_prov_ip);
 }
 
-void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
-                        const char* portal_ip) {
+// Real LVGL implementation — MUST run on the LVGL task only (it CREATES LVGL
+// objects via ensure_prov_overlay). Called by ui_poll_deferred() in lvgl_task.
+static void apply_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
+                                  const char* portal_ip) {
     ensure_prov_overlay();
 
     if (prov_qr && qr_payload) {
@@ -4049,6 +4061,162 @@ void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
     lv_obj_move_foreground(prov_overlay);
 }
 
-void ui_hide_wifi_setup() {
+// Real LVGL implementation — MUST run on the LVGL task only. Called by
+// ui_poll_deferred() in lvgl_task.
+static void apply_hide_wifi_setup() {
     if (prov_overlay) lv_obj_add_flag(prov_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ============================================================
+// DEFERRED WiFi UI  (thread-safety bridge: WiFi task -> LVGL task)
+// ============================================================
+// LVGL is single-threaded: every lv_* call must happen on the task that runs
+// lv_timer_handler() (lvgl_task). The WiFi provisioning supervisor (prov_task
+// in wifi_bridge.cpp) needs to drive the on-screen UI (show the setup QR, hide
+// it, update the connection status), but it runs on its OWN task. Calling LVGL
+// directly from prov_task corrupts LVGL's object/style state and crashes (seen
+// as a Load access fault inside get_selector_style_prop when the AP portal came
+// up after an erase-flash wiped the saved creds).
+//
+// FIX: the public ui_* functions below (called by prov_task) only COPY their
+// arguments into these latched request slots under a short critical section.
+// lvgl_task calls ui_poll_deferred() every loop, which applies any pending
+// request by calling the real apply_*() functions on the LVGL task. No LVGL
+// call ever runs off-task again.
+static portMUX_TYPE s_wifi_ui_mux = portMUX_INITIALIZER_UNLOCKED;
+
+// "show setup" request
+static volatile bool s_pend_show     = false;
+static char          s_pend_qr[96]   = {0};
+static char          s_pend_ssid[40] = {0};
+static char          s_pend_ip[24]   = {0};
+
+// "hide setup" request
+static volatile bool s_pend_hide     = false;
+
+// "update wifi info" request (latched — only the latest matters)
+static volatile bool s_pend_info        = false;
+static volatile bool s_pend_info_conn   = false;
+static volatile bool s_pend_info_ap     = false;
+static char          s_pend_info_ssid[40] = {0};
+static char          s_pend_info_ip[24]   = {0};
+static volatile int  s_pend_info_rssi   = 0;
+
+// "firmware progress" request (latched — only the latest matters). Driven by
+// the OTA httpd task, which is NOT the LVGL task.
+static volatile bool s_pend_fwp_show    = false;
+static volatile bool s_pend_fwp_hide    = false;
+static char          s_pend_fwp_dev[48] = {0};
+static volatile int  s_pend_fwp_pct     = 0;
+static char          s_pend_fwp_status[64] = {0};
+
+// ---- Public API (safe to call from ANY task) ----------------------------
+// NOTE: we format strings into stack buffers FIRST, then only do ROM-safe
+// memcpy + flag writes inside the critical section. snprintf can execute from
+// flash, which must not happen inside a spinlock-protected critical section.
+void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
+                        const char* portal_ip) {
+    char qr[96], ssid[40], ip[24];
+    snprintf(qr,   sizeof(qr),   "%s", qr_payload ? qr_payload : "");
+    snprintf(ssid, sizeof(ssid), "%s", ap_ssid    ? ap_ssid    : "");
+    snprintf(ip,   sizeof(ip),   "%s", portal_ip  ? portal_ip  : "");
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    memcpy(s_pend_qr,   qr,   sizeof(qr));
+    memcpy(s_pend_ssid, ssid, sizeof(ssid));
+    memcpy(s_pend_ip,   ip,   sizeof(ip));
+    s_pend_show = true;
+    s_pend_hide = false;  // a fresh show cancels a pending hide
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+}
+
+void ui_hide_wifi_setup() {
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    s_pend_hide = true;
+    s_pend_show = false;  // a fresh hide cancels a pending show
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+}
+
+void ui_set_wifi_info(bool connected, bool ap_mode, const char* ssid,
+                      const char* ip, int rssi) {
+    char ssid_buf[40], ip_buf[24];
+    snprintf(ssid_buf, sizeof(ssid_buf), "%s", ssid ? ssid : "");
+    snprintf(ip_buf,   sizeof(ip_buf),   "%s", ip   ? ip   : "");
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    s_pend_info_conn = connected;
+    s_pend_info_ap   = ap_mode;
+    s_pend_info_rssi = rssi;
+    memcpy(s_pend_info_ssid, ssid_buf, sizeof(ssid_buf));
+    memcpy(s_pend_info_ip,   ip_buf,   sizeof(ip_buf));
+    s_pend_info = true;
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+}
+
+void show_firmware_progress(const char* device, int percent,
+                            const char* status_text) {
+    char dev[48], status[64];
+    snprintf(dev, sizeof(dev), "%s", device ? device : "");
+    // Empty/NULL status means "leave unchanged" — only overwrite when provided.
+    if (status_text && status_text[0])
+        snprintf(status, sizeof(status), "%s", status_text);
+    else
+        status[0] = '\0';
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    memcpy(s_pend_fwp_dev, dev, sizeof(dev));
+    memcpy(s_pend_fwp_status, status, sizeof(status));
+    s_pend_fwp_pct = percent;
+    s_pend_fwp_show = true;
+    s_pend_fwp_hide = false;
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+}
+
+void hide_firmware_progress(void) {
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    s_pend_fwp_hide = true;
+    s_pend_fwp_show = false;
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+}
+
+// ---- Drain pending requests. MUST be called from lvgl_task only. --------
+void ui_poll_deferred(void) {
+    // Snapshot+clear flags under the lock, then do the (slow) LVGL work outside
+    // the critical section so we never hold a spinlock across lv_* calls.
+    bool do_show = false, do_hide = false, do_info = false;
+    char qr[96], ssid[40], ip[24];
+    bool info_conn = false, info_ap = false; int info_rssi = 0;
+    char info_ssid[40], info_ip[24];
+
+    bool do_fwp_show = false, do_fwp_hide = false;
+    char fwp_dev[48], fwp_status[64]; int fwp_pct = 0;
+
+    taskENTER_CRITICAL(&s_wifi_ui_mux);
+    if (s_pend_show) {
+        do_show = true; s_pend_show = false;
+        memcpy(qr, (const void*)s_pend_qr, sizeof(qr));
+        memcpy(ssid, (const void*)s_pend_ssid, sizeof(ssid));
+        memcpy(ip, (const void*)s_pend_ip, sizeof(ip));
+    }
+    if (s_pend_hide) { do_hide = true; s_pend_hide = false; }
+    if (s_pend_info) {
+        do_info = true; s_pend_info = false;
+        info_conn = s_pend_info_conn; info_ap = s_pend_info_ap;
+        info_rssi = s_pend_info_rssi;
+        memcpy(info_ssid, (const void*)s_pend_info_ssid, sizeof(info_ssid));
+        memcpy(info_ip, (const void*)s_pend_info_ip, sizeof(info_ip));
+    }
+    if (s_pend_fwp_show) {
+        do_fwp_show = true; s_pend_fwp_show = false;
+        fwp_pct = s_pend_fwp_pct;
+        memcpy(fwp_dev, (const void*)s_pend_fwp_dev, sizeof(fwp_dev));
+        memcpy(fwp_status, (const void*)s_pend_fwp_status, sizeof(fwp_status));
+    }
+    if (s_pend_fwp_hide) { do_fwp_hide = true; s_pend_fwp_hide = false; }
+    taskEXIT_CRITICAL(&s_wifi_ui_mux);
+
+    if (do_info) apply_set_wifi_info(info_conn, info_ap, info_ssid, info_ip, info_rssi);
+    if (do_hide) apply_hide_wifi_setup();
+    if (do_show) apply_show_wifi_setup(qr, ssid, ip);
+
+    if (do_fwp_hide) apply_hide_firmware_progress();
+    if (do_fwp_show) apply_show_firmware_progress(fwp_dev, fwp_pct,
+                                                  fwp_status[0] ? fwp_status : nullptr);
 }

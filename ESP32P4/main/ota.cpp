@@ -17,6 +17,8 @@
 
 #include "ota.h"
 #include "ui.h"  // show_firmware_progress / hide_firmware_progress
+#include "freertos/FreeRTOS.h"  // vTaskDelay / pdMS_TO_TICKS
+#include "freertos/task.h"
 #include "esp_http_server.h"
 #include "esp_ota_ops.h"
 #include "esp_log.h"

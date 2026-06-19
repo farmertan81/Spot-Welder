@@ -846,6 +846,13 @@ static void lvgl_task(void *arg)
             }
         }
 
+        // Apply any WiFi-UI requests queued by the WiFi provisioning task
+        // (prov_task). Those requests CREATE/touch LVGL objects, so they must
+        // run here on the LVGL task — never directly on prov_task (doing so
+        // corrupted LVGL state and crashed in get_selector_style_prop when the
+        // AP setup portal came up after an erase-flash).
+        ui_poll_deferred();
+
         lv_timer_handler();
 
         // CRITICAL: this delay MUST block for at least 1 RTOS tick so the

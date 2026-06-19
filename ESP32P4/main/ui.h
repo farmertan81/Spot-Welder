@@ -310,4 +310,11 @@ void ui_show_wifi_setup(const char* qr_payload, const char* ap_ssid,
 // (status/info/maintenance) layout.
 void ui_hide_wifi_setup();
 
+// Drain pending WiFi-UI requests queued by ui_show_wifi_setup() /
+// ui_hide_wifi_setup() / ui_set_wifi_info(). Those public functions are safe to
+// call from ANY task (e.g. the WiFi provisioning task); they only latch their
+// arguments. This function performs the actual LVGL work and therefore MUST be
+// called from the LVGL task (the one running lv_timer_handler()), once per loop.
+void ui_poll_deferred(void);
+
 #endif // UI_H
