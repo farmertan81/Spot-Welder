@@ -1,0 +1,9 @@
+[
+  {
+    // Flash firmware over WiFi (OTA) — fast access without dropdowns.
+    // Press Ctrl+Shift+U to upload after building.
+    "key": "ctrl+shift+u",
+    "command": "workbench.action.tasks.runTask",
+    "args": "Flash over WiFi (OTA)"
+  }
+]
