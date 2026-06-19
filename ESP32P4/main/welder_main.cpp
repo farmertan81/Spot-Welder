@@ -261,10 +261,20 @@ static void save_weld_count_to_nvs(void)
 // The OLD ESP32 enriched every STATUS line with WiFi/system/energy/weld_count
 // fields before sending to Flask. The NEW P4 must do the same — the STM32
 // doesn't know about WiFi or the weld counter, so the ESP32 injects them.
+//
+// CRITICAL: Only enrich STATUS. Forward STATUS2 (battery voltages) RAW so
+// Flask's _parse_status2() handler can parse it correctly.
 static void enrich_and_broadcast(const char *line)
 {
-    // Only enrich STATUS packets. Forward everything else as-is.
-    if (strncmp(line, "STATUS,", 7) != 0 && strncmp(line, "STATUS2,", 8) != 0) {
+    // STATUS2 (battery voltages): forward raw, no enrichment. Flask has a
+    // dedicated parser for this (_parse_status2).
+    if (strncmp(line, "STATUS2,", 8) == 0) {
+        wifi_bridge_broadcast(line);
+        return;
+    }
+
+    // Only enrich STATUS packets. Forward everything else as-is (events, etc.).
+    if (strncmp(line, "STATUS,", 7) != 0) {
         wifi_bridge_broadcast(line);
         return;
     }
@@ -276,6 +286,30 @@ static void enrich_and_broadcast(const char *line)
         wifi_bridge_broadcast(line);  // fallback if buffer too small
         return;
     }
+
+    // Parse fields from STATUS to compute state/enabled (Flask needs these).
+    int armed = 0, welding = 0, ready = 0, chg_en = 0;
+    extract_int(line, "armed=", &armed);
+    extract_int(line, "welding=", &welding);
+    extract_int(line, "ready=", &ready);
+    extract_int(line, "chg_en=", &chg_en);
+
+    // Compute derived fields (Flask UI depends on these).
+    bool enabled = (armed == 1);
+    const char *state;
+    if (!enabled) {
+        state = "DISABLED";
+    } else if (welding == 1) {
+        state = "WELDING";
+    } else if (chg_en == 1) {
+        state = "CHARGING";
+    } else {
+        state = "IDLE";
+    }
+
+    // Add computed fields (Flask expects enabled for arm button, state for status label).
+    len += snprintf(enriched + len, sizeof(enriched) - len,
+                    ",enabled=%d,state=%s", enabled ? 1 : 0, state);
 
     // Energy (already parsed from STM32 into globals)
     len += snprintf(enriched + len, sizeof(enriched) - len,
