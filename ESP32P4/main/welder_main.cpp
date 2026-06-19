@@ -52,6 +52,7 @@ static const char *TAG = "WELDER_UI";
 #define STM32_TX_PIN        29
 #define STM32_RX_PIN        30
 #define STM32_BOOT0_PIN     31
+#define STM32_NRST_PIN      32  // hardware reset for ROM bootloader entry
 #define BUF_SIZE            8192  // WAVEFORM_DATA lines can be huge (OLD board used 8192)
 #define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (still generous at 1 Mbaud)
 #define STM32_BAUD          1000000  // 1 Mbaud — stable link without HW flow control
@@ -968,6 +969,20 @@ extern "C" void app_main(void)
         ESP_LOGE(TAG, "BOOT0 cannot reach HIGH — external short/strong pulldown "
                       "on GPIO%d, the strap will never enter the ROM bootloader",
                  STM32_BOOT0_PIN);
+
+    // ---- NRST (hardware reset) init ----
+    // NRST is active-LOW. The STM32 has an internal weak pull-up (~40k), but we
+    // drive it HIGH explicitly from the ESP to guarantee a clean idle state. We
+    // use INPUT_OUTPUT mode like BOOT0 so stm32_flash.cpp can read back the pin
+    // to verify it drives both levels correctly.
+    gpio_config_t nrst = {};
+    nrst.pin_bit_mask = (1ULL << STM32_NRST_PIN);
+    nrst.mode = GPIO_MODE_INPUT_OUTPUT;
+    nrst.pull_up_en = GPIO_PULLUP_ENABLE;  // match the STM32 internal pull-up
+    gpio_config(&nrst);
+    gpio_set_level((gpio_num_t)STM32_NRST_PIN, 1);  // idle HIGH (not in reset)
+    ESP_LOGI(TAG, "GPIO%d (NRST) set HIGH; readback=%d",
+             STM32_NRST_PIN, gpio_get_level((gpio_num_t)STM32_NRST_PIN));
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();

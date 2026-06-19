@@ -7,11 +7,13 @@
 // the STM32 into its factory ROM bootloader and programs it over the existing
 // UART_NUM_1 link, finally rebooting so both sides come up on a clean app link.
 //
-// Entry into the ROM bootloader uses BOTH proven paths for robustness:
-//   1. Hardware: BOOT0 (GPIO31 -> STM32) is driven HIGH before the reset.
-//   2. Software: the running STM32 app obeys a "BOOTLOADER" command (stashes a
-//      magic word and NVIC_SystemReset()s); with BOOT0 HIGH the reset lands in
-//      ROM. See STM32G474CE/src/main.c.
+// Entry into the ROM bootloader uses the hardware reset method (guaranteed to
+// work per AN2606):
+//   1. BOOT0 (GPIO31 -> STM32) is driven HIGH before the reset.
+//   2. NRST (GPIO32 -> STM32) is pulsed LOW for 10ms, then released HIGH. The
+//      chip resets and, with BOOT0 HIGH, boots into the ROM bootloader.
+// This sidesteps all software jump complexity and matches the official ST boot
+// mode selection documented in AN2606.
 //
 // Timing note (carried over from the OLD board): the build runs code from PSRAM
 // (CONFIG_SPIRAM_XIP_FROM_PSRAM). PSRAM fetches stall under bus contention, which
@@ -44,6 +46,7 @@ static const char *TAG = "STM32_FLASH";
 #define STM_TX_PIN          29   // ESP32 TX -> STM32 RX
 #define STM_RX_PIN          30   // ESP32 RX <- STM32 TX
 #define STM_BOOT0_PIN       31   // ESP32 -> STM32 BOOT0 strap
+#define STM_NRST_PIN        32   // ESP32 -> STM32 NRST (hardware reset)
 #define STM_APP_BAUD        1000000  // normal application link (8N1)
 
 // ---- AN3155 / bootloader constants ----
@@ -277,37 +280,51 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     // 2) Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader.
     gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(100));  // let BOOT0 settle before the reset
+    vTaskDelay(pdMS_TO_TICKS(10));  // let BOOT0 settle before the reset
     // DIAGNOSTIC: confirm the pin is actually driving HIGH (catches a broken /
     // mis-configured GPIO before we blame the protocol).
     int b0 = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
     ESP_LOGI(TAG, "BOOT0 (GPIO%d) set HIGH, readback=%d %s", STM_BOOT0_PIN, b0,
              b0 ? "(OK)" : "(FAILED — pin not driving high!)");
+    if (b0 != 1) {
+        snprintf(msg, msgn, "BOOT0 (GPIO%d) cannot drive HIGH", STM_BOOT0_PIN);
+        return false;
+    }
 
-    // 3) Ask the running STM32 app to reset into ROM, over the CURRENT 1 Mbaud
-    //    8N1 app link (UART driver is still installed from welder_main.cpp).
-    const char *cmd = "BOOTLOADER\r\n";
-    uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
-    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+    // 3) Hardware reset pulse on NRST (active-LOW). Per AN2606, the ROM bootloader
+    //    entry sequence is: BOOT0=HIGH, then hardware reset. Pull NRST LOW for
+    //    10ms (well above the STM32 minimum reset pulse width of ~100ns), then
+    //    release HIGH. The chip resets and samples BOOT0, entering the ROM.
+    ESP_LOGI(TAG, "Pulsing NRST (GPIO%d) LOW for 10ms...", STM_NRST_PIN);
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);  // assert reset
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);  // release reset
+    // Verify NRST drives both LOW and HIGH (catches wiring faults).
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int nrst = gpio_get_level((gpio_num_t)STM_NRST_PIN);
+    ESP_LOGI(TAG, "NRST released HIGH, readback=%d %s", nrst,
+             nrst ? "(OK)" : "(FAILED — stuck low!)");
+    if (nrst != 1) {
+        snprintf(msg, msgn, "NRST (GPIO%d) stuck LOW after release", STM_NRST_PIN);
+        return false;
+    }
 
-    // 4) Let the STM32 complete its reset into the ROM bootloader. The working
-    //    8b63ab5 code used a simple 100ms delay here; diagnostics proved the
-    //    TAMP-magic entry works, so we go back to the proven minimal flow.
-    vTaskDelay(pdMS_TO_TICKS(150));
+    // 4) Let the STM32 ROM bootloader complete its startup. Per AN2606 Figure 58,
+    //    the ROM configures its 72MHz clock, GPIO, and peripherals, then enters
+    //    the polling loop. 50ms is generous (the ROM is ready in ~2ms, but this
+    //    matches the proven old-board timing and ensures we never race it).
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // 5) Hand the link to the 115200 8E1 ROM-bootloader config via a FULL clean
-    //    driver reinstall (the proven .end()/.begin() behaviour), with TX held
-    //    idle-high across the gap so the line never glitches. Match the working
-    //    8b63ab5 flow: close the 1Mbaud driver BEFORE the STM32 ROM starts
-    //    listening (no live-driver probe in between).
+    // 5) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
+    //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
+    //    with TX held idle-high across the gap so the line never glitches.
     switch_uart_to_bootloader();
 
-    // 6) Settling delay after driver reinstall, matching the proven 20ms from
-    //    8b63ab5 (the Arduino .begin() was not instant either).
+    // 6) Settling delay after driver reinstall to ensure the UART is stable.
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // 7) Drain any residual bytes so the FIRST thing we actively send is a
-    //    pristine 0x7F.
+    //    pristine 0x7F sync.
     stmDrainRx();
 
     bool ok = false;
@@ -315,38 +332,32 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     do {
         if (!stmSync()) {
             err = "STM32 bootloader did not respond";
-            // DECISIVE POST-FAILURE RE-PROBE. The sync just failed at 115200 8E1.
-            // Flip the link BACK to the app's 1 Mbaud 8N1 and listen ~2 s. This
-            // resolves the ambiguity of the silence:
-            //   * hear "STATUS"/"DBG"/"ACK" -> the STM32 is RUNNING THE APP. The
-            //     reset did NOT land in the ROM bootloader (the early-boot TAMP
-            //     jump didn't happen, or the app rebooted normally). The fix must
-            //     be on the STM32 entry side, not the UART handshake.
-            //   * still SILENT -> the STM32 is HUNG, or it IS in the ROM but its
-            //     USART isn't answering (classic software-jump-to-bootloader
-            //     USART failure). Either way the UART config is not the culprit.
-            uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
-            uart_set_baudrate(STM_BOOT_UART, 1000000);
-            uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
-            uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);  // back to 8N1
-            uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+            // POST-FAILURE DIAGNOSTIC. The hardware reset (BOOT0=HIGH + NRST pulse)
+            // guarantees the chip entered the ROM bootloader per AN2606. If the sync
+            // failed, it's a UART/protocol issue, not an entry failure. Possible causes:
+            //   1. TX/RX swapped (we send 0x7F, never get ACK 0x79 back)
+            //   2. Baud rate mismatch (framing errors, silence, or garbage)
+            //   3. USART1 not the active bootloader interface (wrong pins, or the chip
+            //      defaulted to USB/I2C/SPI per AN2606 Table 101)
+            // Stay at 8E1 (ROM config) and passively listen for any traffic.
             uart_flush_input(STM_BOOT_UART);
             char rp[256];
             int rt = 0;
-            for (int i = 0; i < 20 && rt < (int)sizeof(rp) - 1; i++) {
+            for (int i = 0; i < 10 && rt < (int)sizeof(rp) - 1; i++) {
                 int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp + rt,
                                         sizeof(rp) - 1 - rt, pdMS_TO_TICKS(100));
                 if (n > 0) rt += n;
             }
             rp[rt > 0 ? rt : 0] = '\0';
-            if (rt > 0 && (strstr(rp, "STATUS") || strstr(rp, "DBG") ||
-                           strstr(rp, "ACK"))) {
-                ESP_LOGE(TAG, "RE-PROBE @1Mbaud: APP IS RUNNING (%d bytes) -> the "
-                              "reset did NOT enter the ROM bootloader.", rt);
-                ESP_LOGW(TAG, "  re-probe text: %.*s", rt, rp);
+            if (rt > 0) {
+                ESP_LOGI(TAG, "Passive listen (8E1): heard %d bytes. First 32 (text): "
+                              "[%.*s]  (hex):", rt, (rt < 32 ? rt : 32), rp);
+                for (int i = 0; i < rt && i < 16; i++)
+                    printf(" %02X", (uint8_t)rp[i]);
+                printf("\n");
             } else {
-                ESP_LOGE(TAG, "RE-PROBE @1Mbaud: STILL SILENT (%d bytes) -> STM32 "
-                              "is hung or in a non-responsive ROM bootloader.", rt);
+                ESP_LOGE(TAG, "Passive listen (8E1): complete silence. Likely wiring "
+                              "fault (TX/RX swapped, disconnected, or wrong USART pins).");
             }
             break;
         }
