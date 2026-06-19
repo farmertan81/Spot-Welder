@@ -6,8 +6,7 @@
 // native ESP-IDF APIs (esp_https_ota) since the P4 build is pure ESP-IDF.
 //
 // USAGE (from a terminal on the same WiFi network):
-//   curl -F "file=@build/hello_world.bin" http://spotwelder.local/ota \
-//        --digest -u admin:spotwelder2024
+//   curl -F "file=@build/hello_world.bin" http://spotwelder.local/ota --digest -u admin:spotwelder2024
 //
 // or via the Flask web UI's "Update Firmware" button (if implemented).
 //
