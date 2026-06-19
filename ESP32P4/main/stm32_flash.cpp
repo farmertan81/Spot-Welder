@@ -269,6 +269,44 @@ static void switch_uart_to_bootloader(void) {
     uart_flush_input(STM_BOOT_UART);
 }
 
+// Internal UART loopback self-test. Uses the ESP32 hardware loopback (TX wired
+// to RX internally, no external wiring) to prove the UART can SEND and RECEIVE
+// a 0x7F byte at the CURRENT config (115200 8E1). This isolates an ESP-side UART
+// config bug from an external (wiring / STM32) problem:
+//   * reads back 0x7F -> the ESP UART 8E1 path is perfect; the failure is external
+//     (signal integrity on the wire, or the STM32 ROM locked onto USB/I2C/SPI).
+//   * reads back garbage / nothing -> the ESP's own 8E1 config is broken.
+// Must be called while the driver is installed at the config we want to test.
+static void uart_loopback_selftest(void) {
+    ESP_LOGI(TAG, "UART loopback self-test @115200 8E1 (internal, no wires)...");
+    uart_flush_input(STM_BOOT_UART);
+    // Enable internal TX->RX loopback.
+    uart_set_loop_back(STM_BOOT_UART, true);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    const uint8_t tx = 0x7F;
+    uart_write_bytes(STM_BOOT_UART, &tx, 1);
+    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+    uint8_t rx = 0;
+    int n = uart_read_bytes(STM_BOOT_UART, &rx, 1, pdMS_TO_TICKS(200));
+
+    // Disable loopback so the real flash can drive the external pins.
+    uart_set_loop_back(STM_BOOT_UART, false);
+    uart_flush_input(STM_BOOT_UART);
+
+    if (n == 1 && rx == 0x7F) {
+        ESP_LOGI(TAG, "  LOOPBACK PASS: sent 0x7F, read 0x7F back. ESP UART 8E1 is "
+                      "GOOD -> failure is EXTERNAL (wire signal or STM32 ROM on "
+                      "USB/I2C/SPI, not USART1).");
+    } else if (n == 1) {
+        ESP_LOGE(TAG, "  LOOPBACK FAIL: sent 0x7F, read 0x%02X back. ESP UART 8E1 "
+                      "config is CORRUPT (framing/parity bug on the P4).", rx);
+    } else {
+        ESP_LOGE(TAG, "  LOOPBACK FAIL: sent 0x7F, read NOTHING back. ESP UART RX "
+                      "path is dead at 8E1 (driver/config bug on the P4).");
+    }
+}
+
 // Worker: programs the STM32 from the in-RAM image. Returns true on success and
 // writes a short result string to `msg`. Does NOT free the buffer or reboot —
 // the task wrapper owns that.
@@ -319,6 +357,13 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
     //    with TX held idle-high across the gap so the line never glitches.
     switch_uart_to_bootloader();
+
+    // 5b) ONE-TIME SELF-TEST: prove the ESP UART can send+receive 0x7F at 8E1
+    //     internally (no wires). This decisively separates an ESP-side 8E1 config
+    //     bug from an external (wire signal / STM32) problem. We confirmed via USB
+    //     that the STM32 DOES enter the ROM bootloader, so if this loopback PASSES,
+    //     the failure is purely external (signal integrity or ROM interface lock).
+    uart_loopback_selftest();
 
     // 6) Settling delay after driver reinstall to ensure the UART is stable.
     vTaskDelay(pdMS_TO_TICKS(50));
