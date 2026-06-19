@@ -332,32 +332,61 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     do {
         if (!stmSync()) {
             err = "STM32 bootloader did not respond";
-            // POST-FAILURE DIAGNOSTIC. The hardware reset (BOOT0=HIGH + NRST pulse)
-            // guarantees the chip entered the ROM bootloader per AN2606. If the sync
-            // failed, it's a UART/protocol issue, not an entry failure. Possible causes:
-            //   1. TX/RX swapped (we send 0x7F, never get ACK 0x79 back)
-            //   2. Baud rate mismatch (framing errors, silence, or garbage)
-            //   3. USART1 not the active bootloader interface (wrong pins, or the chip
-            //      defaulted to USB/I2C/SPI per AN2606 Table 101)
-            // Stay at 8E1 (ROM config) and passively listen for any traffic.
+            // POST-FAILURE DIAGNOSTIC. The hardware reset should have forced the STM32
+            // into the ROM bootloader, but if the sync failed we need to determine WHY.
+            // Two possibilities:
+            //   A) STM32 IS in ROM bootloader (reset worked), but UART config/wiring issue
+            //   B) STM32 did NOT reset (NRST wire fault), app still running at 1Mbaud 8N1
+            // Test: listen at 8E1 for ROM traffic, then flip to 8N1 for app traffic.
+            
+            // 1) Listen at 8E1 (ROM bootloader config) for any response
             uart_flush_input(STM_BOOT_UART);
-            char rp[256];
-            int rt = 0;
-            for (int i = 0; i < 10 && rt < (int)sizeof(rp) - 1; i++) {
-                int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp + rt,
-                                        sizeof(rp) - 1 - rt, pdMS_TO_TICKS(100));
-                if (n > 0) rt += n;
+            char rp8e1[256];
+            int n8e1 = 0;
+            for (int i = 0; i < 10 && n8e1 < (int)sizeof(rp8e1) - 1; i++) {
+                int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp8e1 + n8e1,
+                                        sizeof(rp8e1) - 1 - n8e1, pdMS_TO_TICKS(100));
+                if (n > 0) n8e1 += n;
             }
-            rp[rt > 0 ? rt : 0] = '\0';
-            if (rt > 0) {
-                ESP_LOGI(TAG, "Passive listen (8E1): heard %d bytes. First 32 (text): "
-                              "[%.*s]  (hex):", rt, (rt < 32 ? rt : 32), rp);
-                for (int i = 0; i < rt && i < 16; i++)
-                    printf(" %02X", (uint8_t)rp[i]);
+            rp8e1[n8e1 > 0 ? n8e1 : 0] = '\0';
+            
+            // 2) Switch back to 8N1 (app config) and listen for app traffic
+            uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
+            uart_set_baudrate(STM_BOOT_UART, 1000000);
+            uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
+            uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);
+            uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+            uart_flush_input(STM_BOOT_UART);
+            char rp8n1[256];
+            int n8n1 = 0;
+            for (int i = 0; i < 20 && n8n1 < (int)sizeof(rp8n1) - 1; i++) {
+                int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp8n1 + n8n1,
+                                        sizeof(rp8n1) - 1 - n8n1, pdMS_TO_TICKS(100));
+                if (n > 0) n8n1 += n;
+            }
+            rp8n1[n8n1 > 0 ? n8n1 : 0] = '\0';
+            
+            // 3) Report results
+            if (n8n1 > 0 && (strstr(rp8n1, "STATUS") || strstr(rp8n1, "DBG") ||
+                             strstr(rp8n1, "ACK"))) {
+                ESP_LOGE(TAG, "DIAGNOSTIC: STM32 APP IS STILL RUNNING (%d bytes @1Mbaud "
+                              "8N1) -> NRST did NOT reset the chip!", n8n1);
+                ESP_LOGE(TAG, "  ** CHECK NRST WIRE: GPIO32 must be physically connected "
+                              "to STM32 NRST pin **");
+                ESP_LOGW(TAG, "  App traffic heard: %.*s", (n8n1 < 64 ? n8n1 : 64), rp8n1);
+            } else if (n8e1 > 0) {
+                ESP_LOGI(TAG, "DIAGNOSTIC: heard %d bytes @115200 8E1 (ROM config), but "
+                              "no valid ACK. First 32 chars: [%.*s]  Hex:",
+                         n8e1, (n8e1 < 32 ? n8e1 : 32), rp8e1);
+                for (int i = 0; i < n8e1 && i < 16; i++)
+                    printf(" %02X", (uint8_t)rp8e1[i]);
                 printf("\n");
+                ESP_LOGE(TAG, "  Likely: TX/RX swapped, or ROM defaulted to USB/I2C/SPI "
+                              "instead of USART1");
             } else {
-                ESP_LOGE(TAG, "Passive listen (8E1): complete silence. Likely wiring "
-                              "fault (TX/RX swapped, disconnected, or wrong USART pins).");
+                ESP_LOGE(TAG, "DIAGNOSTIC: complete silence @8E1 (%d bytes) and @8N1 "
+                              "(%d bytes)", n8e1, n8n1);
+                ESP_LOGE(TAG, "  STM32 is HUNG or NRST wire is disconnected/wrong pin");
             }
             break;
         }
