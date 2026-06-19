@@ -123,6 +123,10 @@ float energy_cap_j = 0, energy_weld_j = 0, energy_loss_j = 0;
 // displays this as "Total Welds" in the System Info panel.
 static uint32_t weld_count = 0;
 
+// DISPLAY packet guard: only send after STATUS2 has populated voltage data.
+// Matches OLD ESP32 behaviour (ESP32_8048S043C line 4463: "if (hasRawStatus2Data)").
+static bool has_status2_data = false;
+
 // ============================================================
 //  VOLTAGE DISPLAY SMOOTHER (ported 1:1 from OLD ESP32)
 // ============================================================
@@ -434,10 +438,7 @@ static void send_display_packet(void)
     xSemaphoreGive(g_state_mtx);
 
     if (len > 0 && len < (int)sizeof(buf)) {
-        ESP_LOGI(TAG, "DISPLAY: %s", buf);  // Debug: confirm packet is built
         wifi_bridge_broadcast(buf);
-    } else {
-        ESP_LOGE(TAG, "DISPLAY buffer overflow! len=%d", len);
     }
 }
 
@@ -504,6 +505,9 @@ static void parse_status_line(const char *line)
         // Charger state (STATUS2 has chg_en and ichg fields).
         if (extract_int(line, "chg_en=", &iv))   g_state.charging = (iv == 1);
         if (extract_float(line, "ichg=", &fv))   g_state.charger_current = g_state.charging ? fv : 0.0f;
+        
+        // Signal that voltage data is available for DISPLAY packet.
+        has_status2_data = true;
         
         xSemaphoreGive(g_state_mtx);
         return;
@@ -708,11 +712,13 @@ static void stm32_task(void *arg)
         }
 
         // DISPLAY packet: Flask frontend waits for 'display_update' events to
-        // populate battery voltage divs. Send every 1s (matches OLD ESP32 behaviour).
+        // populate battery voltage divs. Send every 1s, but ONLY after STATUS2
+        // has populated voltage data (matches OLD ESP32 guard at line 4463).
         if (now_ms - last_display_ms >= 1000) {
-            ESP_LOGI(TAG, "DISPLAY timer triggered (now=%lu, last=%lu)", now_ms, last_display_ms);
-            send_display_packet();
-            last_display_ms = now_ms;
+            if (has_status2_data) {
+                send_display_packet();
+                last_display_ms = now_ms;
+            }
         }
 
         stm_send("STATUS");
