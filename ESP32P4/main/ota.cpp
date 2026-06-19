@@ -160,8 +160,8 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
         received += ret;
         int pct = (total > 0) ? (received * 100 / total) : 0;
 
-        // Throttle UI updates (same as OLD ESP32: only update every ~2%).
-        if (pct >= last_pct + 2 || pct >= 100) {
+        // Update UI every 1% for smooth animated progress (bar has LV_ANIM_ON).
+        if (pct > last_pct || pct >= 100) {
             last_pct = pct;
             show_firmware_progress("ESP32-P4", pct, "Writing firmware...");
             ESP_LOGI(TAG, "OTA progress: %d%%", pct);

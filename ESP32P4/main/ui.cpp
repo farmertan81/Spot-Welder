@@ -3728,14 +3728,14 @@ static void apply_show_firmware_progress(const char* device, int percent,
     char pctbuf[8];
     snprintf(pctbuf, sizeof(pctbuf), "%d%%", percent);
     lv_label_set_text(_fwp_percent, pctbuf);
-    lv_bar_set_value(_fwp_bar, percent, LV_ANIM_OFF);
+    lv_bar_set_value(_fwp_bar, percent, LV_ANIM_ON);  // smooth animation (was OFF)
 
     // Status line (only update when provided).
     if (status_text && status_text[0])
         lv_label_set_text(_fwp_status, status_text);
 
-    // Force an immediate paint so progress is visible promptly.
-    lv_refr_now(NULL);
+    // No lv_refr_now() needed: we yield CPU every chunk so lvgl_task runs
+    // frequently enough to paint smoothly via the normal refresh cycle.
 }
 
 // Real LVGL implementation — MUST run on the LVGL task only. Called by
