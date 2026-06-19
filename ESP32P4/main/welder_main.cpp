@@ -423,17 +423,22 @@ static void send_display_packet(void)
     // g_state already holds the SMOOTHED voltages (parse_status_line runs every
     // value through g_volt_smoother). So this DISPLAY packet mirrors exactly
     // what the local LVGL screen shows — one smoother, one source of truth.
-    snprintf(buf, sizeof(buf),
-             "DISPLAY,vpack=%.3f,vcap=%.3f,cell1=%.3f,cell2=%.3f,cell3=%.3f",
-             g_state.pack_voltage,
-             g_state.weld_v,  // vcap = contact voltage (weld_v), smoothed
-             g_state.cell1_v,
-             g_state.cell2_v,
-             g_state.cell3_v);
+    int len = snprintf(buf, sizeof(buf),
+                       "DISPLAY,vpack=%.3f,vcap=%.3f,cell1=%.3f,cell2=%.3f,cell3=%.3f",
+                       g_state.pack_voltage,
+                       g_state.weld_v,  // vcap = contact voltage (weld_v), smoothed
+                       g_state.cell1_v,
+                       g_state.cell2_v,
+                       g_state.cell3_v);
 
     xSemaphoreGive(g_state_mtx);
 
-    wifi_bridge_broadcast(buf);
+    if (len > 0 && len < (int)sizeof(buf)) {
+        ESP_LOGI(TAG, "DISPLAY: %s", buf);  // Debug: confirm packet is built
+        wifi_bridge_broadcast(buf);
+    } else {
+        ESP_LOGE(TAG, "DISPLAY buffer overflow! len=%d", len);
+    }
 }
 
 // Parse a STATUS line from the STM32 into g_state (under mutex).
@@ -705,6 +710,7 @@ static void stm32_task(void *arg)
         // DISPLAY packet: Flask frontend waits for 'display_update' events to
         // populate battery voltage divs. Send every 1s (matches OLD ESP32 behaviour).
         if (now_ms - last_display_ms >= 1000) {
+            ESP_LOGI(TAG, "DISPLAY timer triggered (now=%lu, last=%lu)", now_ms, last_display_ms);
             send_display_packet();
             last_display_ms = now_ms;
         }
