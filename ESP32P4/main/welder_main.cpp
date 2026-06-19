@@ -488,13 +488,24 @@ static void parse_status_line(const char *line)
     xSemaphoreTake(g_state_mtx, portMAX_DELAY);
     float fv; int iv;
 
-    // Voltages pass through the single smoother (5mV deadband) so the local
-    // screen and the Flask DISPLAY packet show identical, jitter-free values.
-    if (extract_float(line, "vpack=", &fv))  g_state.pack_voltage = g_volt_smoother.getDisplayValue(CH_VPACK, fv);
+    // Battery voltages come from STATUS2 (INA226 readings), not STATUS.
+    // Apply smoothing so the local screen and Flask DISPLAY match.
+    if (strncmp(line, "STATUS2,", 8) == 0) {
+        if (extract_float(line, "vpack=", &fv))  g_state.pack_voltage = g_volt_smoother.getDisplayValue(CH_VPACK, fv);
+        if (extract_float(line, "cell1=", &fv))  g_state.cell1_v      = g_volt_smoother.getDisplayValue(CH_CELL1, fv);
+        if (extract_float(line, "cell2=", &fv))  g_state.cell2_v      = g_volt_smoother.getDisplayValue(CH_CELL2, fv);
+        if (extract_float(line, "cell3=", &fv))  g_state.cell3_v      = g_volt_smoother.getDisplayValue(CH_CELL3, fv);
+        
+        // Charger state (STATUS2 has chg_en and ichg fields).
+        if (extract_int(line, "chg_en=", &iv))   g_state.charging = (iv == 1);
+        if (extract_float(line, "ichg=", &fv))   g_state.charger_current = g_state.charging ? fv : 0.0f;
+        
+        xSemaphoreGive(g_state_mtx);
+        return;
+    }
+
+    // STATUS packet (main telemetry + settings).
     if (extract_float(line, "temp=", &fv))   g_state.temperature  = fv;
-    if (extract_float(line, "cell1=", &fv))  g_state.cell1_v      = g_volt_smoother.getDisplayValue(CH_CELL1, fv);
-    if (extract_float(line, "cell2=", &fv))  g_state.cell2_v      = g_volt_smoother.getDisplayValue(CH_CELL2, fv);
-    if (extract_float(line, "cell3=", &fv))  g_state.cell3_v      = g_volt_smoother.getDisplayValue(CH_CELL3, fv);
 
     // Contact / cap voltage (prefer canonical weld_v, fall back to vcap).
     if (extract_float(line, "weld_v=", &fv)) { g_state.weld_v = g_volt_smoother.getDisplayValue(CH_VCAP, fv); weld_v = fv; }
