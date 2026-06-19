@@ -287,11 +287,14 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     //    Reading at the matching 1 Mbaud keeps the text clean (an 8E1/115200 read
     //    would mangle it into framing/parity noise the driver silently drops).
     {
-        char probe[256];
+        char probe[512];
         int total = 0;
-        // ~1.5 s window: longer than reset + the app's ~1 s STATUS cadence, so a
-        // normally-booted app WILL reveal a STATUS line within it.
-        for (int i = 0; i < 15 && total < (int)sizeof(probe) - 1; i++) {
+        // ~2.5 s window: long enough to see the full pre-reset debug chatter
+        // (~120-180 ms of HAL_Delay in requestBootloaderReset), the reset itself,
+        // and the post-reset boot-time debug from early main() if the TAMP magic
+        // is detected. A normally-booted app emits STATUS within ~1 s, so this
+        // window reliably distinguishes "app booted" from "jumped to ROM".
+        for (int i = 0; i < 25 && total < (int)sizeof(probe) - 1; i++) {
             int n = uart_read_bytes(STM_BOOT_UART,
                                     (uint8_t *)probe + total,
                                     sizeof(probe) - 1 - total,
