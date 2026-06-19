@@ -166,6 +166,12 @@ static esp_err_t ota_post_handler(httpd_req_t *req)
             show_firmware_progress("ESP32-P4", pct, "Writing firmware...");
             ESP_LOGI(TAG, "OTA progress: %d%%", pct);
         }
+
+        // Yield the CPU briefly so lvgl_task can refresh the screen (prevents
+        // the glitchy/frozen progress bar the old board didn't have). Network
+        // I/O is the bottleneck, so this 1-tick delay per chunk (~10ms per KB)
+        // adds negligible overhead and keeps the UI smooth during the 10s write.
+        vTaskDelay(pdMS_TO_TICKS(1));
     }
 
     free(buf);
