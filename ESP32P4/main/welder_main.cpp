@@ -124,6 +124,60 @@ float energy_cap_j = 0, energy_weld_j = 0, energy_loss_j = 0;
 static uint32_t weld_count = 0;
 
 // ============================================================
+//  VOLTAGE DISPLAY SMOOTHER (ported 1:1 from OLD ESP32)
+// ============================================================
+// Single source of smoothing: a per-channel deadband (5mV) that suppresses
+// tiny INA226 noise jitter on the displayed voltage. The SAME smoothed values
+// are mirrored to BOTH the local LVGL screen (g_state) AND the Flask web UI
+// (DISPLAY packet) — so the device and the dashboard always agree. Raw STATUS2
+// is still forwarded separately for graph/calc consumers that need raw data.
+//
+// Matches ESP32_8048S043C/src/main.cpp VoltageDisplaySmoother (lines 216-265).
+class VoltageDisplaySmoother {
+   private:
+    struct Channel {
+        float lastValue;
+        bool  initialized;
+    };
+    static const int MAX_CHANNELS = 8;
+    Channel channels[MAX_CHANNELS];
+    float   threshold;
+
+   public:
+    explicit VoltageDisplaySmoother(float thresh = 0.02f) : threshold(thresh) {
+        for (int i = 0; i < MAX_CHANNELS; i++) {
+            channels[i].initialized = false;
+            channels[i].lastValue   = 0.0f;
+        }
+    }
+
+    float getDisplayValue(int channel, float rawValue) {
+        if (channel < 0 || channel >= MAX_CHANNELS) return rawValue;
+        if (!channels[channel].initialized) {
+            channels[channel].lastValue   = rawValue;
+            channels[channel].initialized = true;
+            return rawValue;
+        }
+        float delta = fabsf(rawValue - channels[channel].lastValue);
+        if (delta < threshold) return channels[channel].lastValue;
+        channels[channel].lastValue = rawValue;
+        return rawValue;
+    }
+};
+
+enum VoltageChannel {
+    CH_VPACK = 0,
+    CH_VCAP  = 1,
+    CH_CELL1 = 2,
+    CH_CELL2 = 3,
+    CH_CELL3 = 4,
+};
+
+// Single global smoother instance — the "one place" all displayed voltages
+// pass through, so the local screen and Flask dashboard stay mirrored.
+static VoltageDisplaySmoother g_volt_smoother(0.005f);
+
+// ============================================================
 //  STC8 BACKLIGHT / PANEL POWER (I2C @ 0x2F)
 // ============================================================
 static void stc8_write(uint8_t reg, uint8_t val)
@@ -354,6 +408,34 @@ static void enrich_and_broadcast(const char *line)
     wifi_bridge_broadcast(enriched);
 }
 
+// ============================================================
+//  DISPLAY PACKET (smoothed voltages for Flask frontend)
+// ============================================================
+// Flask's frontend JavaScript updates battery voltage divs from 'display_update'
+// events (line 2253 in control.html), NOT from 'status_update'. The OLD ESP32
+// sent DISPLAY packets every 1s with smoothed voltages. The NEW P4 must send
+// these too, or the Flask UI will never show battery voltages.
+static void send_display_packet(void)
+{
+    char buf[256];
+    xSemaphoreTake(g_state_mtx, portMAX_DELAY);
+
+    // g_state already holds the SMOOTHED voltages (parse_status_line runs every
+    // value through g_volt_smoother). So this DISPLAY packet mirrors exactly
+    // what the local LVGL screen shows — one smoother, one source of truth.
+    snprintf(buf, sizeof(buf),
+             "DISPLAY,vpack=%.3f,vcap=%.3f,cell1=%.3f,cell2=%.3f,cell3=%.3f",
+             g_state.pack_voltage,
+             g_state.weld_v,  // vcap = contact voltage (weld_v), smoothed
+             g_state.cell1_v,
+             g_state.cell2_v,
+             g_state.cell3_v);
+
+    xSemaphoreGive(g_state_mtx);
+
+    wifi_bridge_broadcast(buf);
+}
+
 // Parse a STATUS line from the STM32 into g_state (under mutex).
 static void parse_weld_done(const char *line)
 {
@@ -406,15 +488,17 @@ static void parse_status_line(const char *line)
     xSemaphoreTake(g_state_mtx, portMAX_DELAY);
     float fv; int iv;
 
-    if (extract_float(line, "vpack=", &fv))  g_state.pack_voltage   = fv;
-    if (extract_float(line, "temp=", &fv))   g_state.temperature    = fv;
-    if (extract_float(line, "cell1=", &fv))  g_state.cell1_v        = fv;
-    if (extract_float(line, "cell2=", &fv))  g_state.cell2_v        = fv;
-    if (extract_float(line, "cell3=", &fv))  g_state.cell3_v        = fv;
+    // Voltages pass through the single smoother (5mV deadband) so the local
+    // screen and the Flask DISPLAY packet show identical, jitter-free values.
+    if (extract_float(line, "vpack=", &fv))  g_state.pack_voltage = g_volt_smoother.getDisplayValue(CH_VPACK, fv);
+    if (extract_float(line, "temp=", &fv))   g_state.temperature  = fv;
+    if (extract_float(line, "cell1=", &fv))  g_state.cell1_v      = g_volt_smoother.getDisplayValue(CH_CELL1, fv);
+    if (extract_float(line, "cell2=", &fv))  g_state.cell2_v      = g_volt_smoother.getDisplayValue(CH_CELL2, fv);
+    if (extract_float(line, "cell3=", &fv))  g_state.cell3_v      = g_volt_smoother.getDisplayValue(CH_CELL3, fv);
 
     // Contact / cap voltage (prefer canonical weld_v, fall back to vcap).
-    if (extract_float(line, "weld_v=", &fv)) { g_state.weld_v = fv; weld_v = fv; }
-    else if (extract_float(line, "vcap=", &fv)) { g_state.weld_v = fv; weld_v = fv; }
+    if (extract_float(line, "weld_v=", &fv)) { g_state.weld_v = g_volt_smoother.getDisplayValue(CH_VCAP, fv); weld_v = fv; }
+    else if (extract_float(line, "vcap=", &fv)) { g_state.weld_v = g_volt_smoother.getDisplayValue(CH_VCAP, fv); weld_v = fv; }
     if (extract_float(line, "cap_v=", &fv))  { g_state.cap_v = fv;  cap_v = fv; }
 
     if (extract_int(line, "armed=", &iv))    g_state.armed   = (iv == 1);
@@ -595,6 +679,7 @@ static void stm32_task(void *arg)
     //   - Everything else (EVENT / WAVEFORM / RXHEALTH / CAL / errors): printed.
     uint32_t last_status_log_ms = 0;
     uint32_t last_ready_ms = 0;
+    uint32_t last_display_ms = 0;
 
     while (1) {
         // READY heartbeat: STM32 requires periodic READY,1 to keep system_ready
@@ -604,6 +689,13 @@ static void stm32_task(void *arg)
         if (now_ms - last_ready_ms >= 1000) {
             stm_send("READY,1");
             last_ready_ms = now_ms;
+        }
+
+        // DISPLAY packet: Flask frontend waits for 'display_update' events to
+        // populate battery voltage divs. Send every 1s (matches OLD ESP32 behaviour).
+        if (now_ms - last_display_ms >= 1000) {
+            send_display_packet();
+            last_display_ms = now_ms;
         }
 
         stm_send("STATUS");
