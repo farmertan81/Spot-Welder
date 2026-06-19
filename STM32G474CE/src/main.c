@@ -4636,35 +4636,6 @@ static void jumpToBootloader(void) {
     uint32_t bootEntry = *(volatile uint32_t*)(SYSTEM_BOOTLOADER_ADDR + 4U);
     void (*bootJump)(void) = (void (*)(void))bootEntry;
 
-    /* --------------------------------------------------------------------
-     * IWDG window extension (CRITICAL for the direct, no-reset jump).
-     * We now jump straight from the running application instead of via
-     * NVIC_SystemReset(). That means the software-mode IWDG that main()
-     * started (~800 ms timeout) is STILL RUNNING, and the ROM bootloader
-     * never refreshes it - so without this the watchdog would reset the
-     * MCU out of the bootloader (back into the app) within ~800 ms.
-     * The IWDG cannot be stopped once started, but its reload value can be
-     * reconfigured on the fly. Push it to the maximum (~32.7 s @ /256, LSI
-     * 32 kHz) to give the host the longest possible flashing window.
-     * Harmless if the IWDG was never started (early-boot path). -------- */
-    IWDG->KR  = 0x5555U;            /* unlock PR/RLR write access            */
-    IWDG->PR  = IWDG_PRESCALER_256; /* slowest prescaler                     */
-    IWDG->RLR = 0x0FFFU;            /* max reload -> longest timeout         */
-    IWDG->KR  = 0xAAAAU;            /* refresh counter with the new reload   */
-
-    /* --------------------------------------------------------------------
-     * Deinitialize USART1 BEFORE jumping so the ROM bootloader inherits a
-     * clean UART peripheral. The running application has USART1 configured
-     * for 1 Mbaud 8N1 with RX interrupts; if we leave that in place the ROM
-     * bootloader's own USART1 init can collide with the stale config and the
-     * 0x7F auto-baud / RX never works. HAL_UART_DeInit() resets the registers
-     * and runs MspDeInit (GPIO + NVIC), then we kill the peripheral clock so
-     * the bootloader brings USART1 up from a true power-on state. Done while
-     * clocks/ticks are still alive (before __disable_irq), as the HAL calls
-     * expect a running SysTick. ------------------------------------------ */
-    HAL_UART_DeInit(&huart1);
-    __HAL_RCC_USART1_CLK_DISABLE();
-
     /* Mask all interrupts while we tear the system down. */
     __disable_irq();
 
@@ -4683,15 +4654,6 @@ static void jumpToBootloader(void) {
         NVIC->ICER[i] = 0xFFFFFFFFUL;
         NVIC->ICPR[i] = 0xFFFFFFFFUL;
     }
-
-    /* Remap system memory (the ROM bootloader) to 0x00000000 so the chip is
-     * in exactly the state it would be after a reset with BOOT0=1. This is
-     * the missing half of the jump - setting SCB->VTOR alone is not enough;
-     * the ROM bootloader expects to be aliased at address 0. The MEMRMP write
-     * lives in SYSCFG, whose clock HAL_RCC_DeInit() just turned off, so it
-     * must be re-enabled or the remap write is silently ignored. */
-    __HAL_RCC_SYSCFG_CLK_ENABLE();
-    __HAL_SYSCFG_REMAPMEMORY_SYSTEMFLASH();
 
     /* Point the vector table at the system-memory bootloader. */
     SCB->VTOR = SYSTEM_BOOTLOADER_ADDR;
@@ -4786,25 +4748,18 @@ int main(void) {
     if (g_boot_tamp_value == BOOTLOADER_REQUEST_MAGIC) {
         BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear so we boot normally next time */
         __DSB();
-
-        /* Bring up just enough (clock + GPIO + UART) to emit the boot debug
-         * lines BEFORE jumping. jumpToBootloader() fully de-inits the clocks
-         * and peripherals afterwards, so the ROM bootloader still starts from a
-         * clean state. This happens before MX_IWDG_Init(), so the watchdog is
-         * not yet armed and these few extra milliseconds are safe. */
-        SystemClock_Config();
-        SystemCoreClockUpdate();
-        HAL_InitTick(TICK_INT_PRIORITY);
-        MX_GPIO_Init();
-        MX_USART1_UART_Init();
-
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg), "DBG,Boot: TAMP register = 0x%08lX",
-                 (unsigned long)g_boot_tamp_value);
-        uartSend(dbg);
-        uartSend("DBG,Boot: Magic match - jumping to bootloader!");
-        HAL_Delay(30);             /* flush the UART before tearing down clocks */
-
+        /* RESTORED to the PROVEN 6cebf05 path: jump straight into the ROM
+         * bootloader IMMEDIATELY, with the clock still at its HSI 16 MHz reset
+         * default and no peripherals configured. The earlier "bring up clock +
+         * UART to print debug, then tear it all down" sequence (and the SYSCFG
+         * MEMRMP remap inside jumpToBootloader) was added during failed
+         * debugging and is NOT what worked on the old board — it left the ROM
+         * bootloader unresponsive on USART1. The pre-reset debug emitted by
+         * requestBootloaderReset() already proves this path is taken; we do not
+         * need post-reset debug here, and adding it changed the very behavior
+         * we are trying to restore. jumpToBootloader() does HAL_RCC_DeInit() so
+         * the ROM still starts from a clean HSI state and sets up its own
+         * 72 MHz PLL per AN2606 Figure 58. */
         jumpToBootloader();        /* does not return */
     }
 
