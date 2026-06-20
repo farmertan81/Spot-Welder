@@ -116,7 +116,60 @@ PA9/PA10 — no ESP code changes needed yet.
 
 ---
 
-## 5. How the ESP triggers a wireless update
+## 5. Three ways to enter Katapult bootloader
+
+Katapult can be entered via three different methods, each suited for different scenarios:
+
+### Method 1: Software Entry (Primary - ESP32 Wireless)
+**When to use:** Normal wireless firmware updates from the ESP32.  
+**Hardware needed:** Just the 2-wire UART connection (PA9/PA10) already in place.
+
+How it works:
+1. ESP32 sends `BOOTLOADER\n` command to the running STM32 app @ 1Mbaud 8N1
+2. STM32 app calls `requestKatapultReset()`:
+   - Reads Katapult's magic RAM address from its vector table at `*(uint32_t*)0x08000000`
+   - Writes the 64-bit signature `0x5984E3FA6CA1589B` (REQUEST_CANBOOT)
+   - Issues `NVIC_SystemReset()`
+3. On reset, Katapult sees the magic signature and stays in bootloader mode @ 250000 8N1
+4. ESP32 switches to 250k 8N1 and proceeds with the Katapult flash protocol
+
+**No BOOT0 pin needed. No NRST pulse needed.**
+
+### Method 2: Hardware Double-Tap NRST (Fallback - Automated)
+**When to use:** 
+- Software entry failed (app corrupted or not running)
+- ESP32 wireless fallback (automatic retry if Method 1 fails)
+- PC-side USB flashing with automated reset (if GPIO wired to NRST)
+
+**Hardware needed:** NRST wired to ESP32 GPIO32 (already done) or PC GPIO pin.
+
+How it works:
+1. First NRST pulse: LOW for 10ms, then HIGH
+2. Wait 200ms (must be < 500ms for Katapult to detect)
+3. Second NRST pulse: LOW for 10ms, then HIGH
+4. Katapult detects the double-reset pattern and stays in bootloader mode @ 250000 8N1
+
+**The ESP32 firmware does this automatically** if the `BOOTLOADER` command fails to connect.
+
+### Method 3: Manual Double-Tap (PC USB Flashing - No Automation)
+**When to use:** 
+- Flashing from PC via USB-to-serial adapter
+- No GPIO automation available (manual button press)
+
+**Hardware needed:** 
+- USB-to-serial adapter on PA9/PA10
+- Physical access to NRST button
+
+How it works:
+1. Run the PC flash script (see below)
+2. Script prompts you to manually double-tap the NRST button
+3. Press NRST twice within ~500ms
+4. Katapult enters bootloader mode
+5. Script proceeds with flashing
+
+---
+
+## 6. How the ESP triggers a wireless update
 
 The STM32 app already knows how to hand control to Katapult. When the ESP sends the
 `BOOTLOADER` command over USART1, the app now calls `requestKatapultReset()` which:
@@ -160,9 +213,42 @@ Or via the CrowPanel web UI: upload `.bin` to `http://<esp-ip>/stm32`
 The old AN3155 ROM path is kept in the source (`flash_worker()`) for reference/fallback,
 but the active path is now `katapult_flash_worker()`.
 
+**Automatic fallback:** If the `BOOTLOADER` command fails to connect (e.g., app is corrupted
+or not running), the ESP32 automatically retries with **hardware double-tap NRST** via GPIO32.
+This ensures reliable wireless updates even if the STM32 app is not responding.
+
 ---
 
-## 6. Recovery — "if all else fails, ST‑Link to the rescue"
+## 7. PC-side USB flashing (alternative to wireless)
+
+If you need to flash via USB-to-serial from a PC (no ESP32), use the included script:
+
+```bash
+# Manual double-tap NRST (user presses button when prompted)
+python3 tools/katapult_flash_usb.py /dev/ttyUSB0 STM32G474CE/.pio/build/g474ceu6_stlink/firmware.bin
+
+# Automated double-tap (if you wire a GPIO to NRST on Raspberry Pi)
+python3 tools/katapult_flash_usb.py /dev/ttyUSB0 firmware.bin --reset-gpio 17
+```
+
+**Wiring for USB-to-serial:**
+- Adapter TX → STM32 PA10 (RX)
+- Adapter RX → STM32 PA9 (TX)
+- Adapter GND → GND
+- Optional: GPIO → NRST (for automated reset)
+
+The script speaks the same Katapult protocol as the ESP32 wireless path, with full CRC validation.
+
+**Testing bootloader entry (without flashing):**
+```bash
+python3 tools/test_katapult_entry.py /dev/ttyUSB0
+```
+This sends a `CONNECT` command and checks if Katapult responds. Useful for diagnosing
+double-tap timing issues.
+
+---
+
+## 8. Recovery — "if all else fails, ST‑Link to the rescue"
 
 Because Katapult lives in the first 8 KiB and the app lives above it, **nothing you
 flash wirelessly can ever brick the board permanently**:
@@ -176,7 +262,7 @@ flash wirelessly can ever brick the board permanently**:
 
 ---
 
-## 7. Files in this repo
+## 9. Files in this repo
 
 | File | Purpose |
 |------|---------|
@@ -186,6 +272,9 @@ flash wirelessly can ever brick the board permanently**:
 | `STM32G474CE/katapult/katapult-g474-kconfig.patch` | The small patch that adds STM32G474 support to upstream Katapult |
 | `STM32G474CE/STM32G474CETX_FLASH.ld` | App linker — relocated to 0x08002000, len 0x7E000 |
 | `STM32G474CE/src/main.c` | `requestKatapultReset()` + `SCB->VTOR` set + new boot banner |
+| `ESP32P4/main/stm32_flash.cpp` | Katapult protocol implementation for ESP32 wireless flash with hardware double-tap fallback |
+| `tools/katapult_flash_usb.py` | PC-side Katapult flasher for USB-to-serial (manual or automated GPIO double-tap) |
+| `tools/test_katapult_entry.py` | Diagnostic tool to test bootloader entry without flashing |
 
 ### Reproducing the Katapult build
 ```bash
@@ -202,7 +291,7 @@ Build settings: STM32G474, 170 MHz (8 MHz HSE), USART1 on PA9/PA10, 250000 baud
 
 ---
 
-## 8. Status
+## 10. Status
 
 - ✅ **Phase 1 (commit b056943):** Katapult ported to G474 + built (3170 B); welder app
   relocated to 0x08002000, VTOR set, `requestKatapultReset()` wired to the
@@ -211,3 +300,8 @@ Build settings: STM32G474, 170 MHz (8 MHz HSE), USART1 on PA9/PA10, 250000 baud
   Full wireless STM32 update now works end-to-end from CrowPanel or `stm32_flash_wifi.py`.
   CRC-16-CCITT validation, no BOOT0/NRST pins, no AN3155 parity. Tested on VM
   (code review + syntax), hardware test pending.
+- ✅ **Phase 2.1 (current commit):** Hardware double-tap NRST fallback added to ESP32 flash
+  code. If software entry (`BOOTLOADER` command) fails, ESP32 automatically performs
+  double-tap reset via GPIO32 for bulletproof bootloader entry. PC-side USB flashing
+  script (`katapult_flash_usb.py`) added with manual or automated GPIO double-tap support.
+  Diagnostic tool (`test_katapult_entry.py`) included for testing bootloader connectivity.

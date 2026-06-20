@@ -802,6 +802,35 @@ static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t pay
 }
 
 // ============================================================
+//  KATAPULT ENTRY HELPERS
+// ============================================================
+
+// Perform hardware double-tap on NRST to enter Katapult bootloader
+// (Alternative to "BOOTLOADER" command when app is not running)
+// Timing: two resets within ~500ms window, as detected by Katapult's double-reset logic
+static void IRAM_ATTR katapult_double_tap_nrst(void) {
+    ESP_LOGI(TAG, "Katapult: performing hardware double-tap on NRST");
+    
+    // First reset pulse
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);  // Assert NRST (LOW)
+    esp_rom_delay_us(10000);  // Hold for 10ms
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);  // Release NRST (HIGH)
+    
+    // Wait ~200ms between taps (must be < 500ms for Katapult to detect)
+    esp_rom_delay_us(200000);  // 200ms
+    
+    // Second reset pulse
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);  // Assert NRST (LOW)
+    esp_rom_delay_us(10000);  // Hold for 10ms
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);  // Release NRST (HIGH)
+    
+    // Wait 300ms for Katapult to initialize
+    esp_rom_delay_us(300000);  // 300ms
+    
+    ESP_LOGI(TAG, "Katapult: double-tap complete, bootloader should be active");
+}
+
+// ============================================================
 //  KATAPULT FLASH WORKER
 // ============================================================
 
@@ -813,7 +842,7 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
     uint32_t block_size = 0;
 
     do {
-        // 1) Send BOOTLOADER command to the running app @ 1Mbaud 8N1
+        // 1) Try software entry: Send BOOTLOADER command to the running app @ 1Mbaud 8N1
         ESP_LOGI(TAG, "Katapult: requesting app to enter bootloader via 'BOOTLOADER' command @1Mbaud 8N1");
         uart_set_baudrate(STM_BOOT_UART, STM_APP_BAUD);
         uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
@@ -832,8 +861,8 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
         uart_flush_input(STM_BOOT_UART);
         vTaskDelay(pdMS_TO_TICKS(50));
 
-        // 3) Send CONNECT command
-        ESP_LOGI(TAG, "Katapult: sending CONNECT");
+        // 3) Send CONNECT command (software entry attempt)
+        ESP_LOGI(TAG, "Katapult: sending CONNECT (software entry)");
         show_firmware_progress("STM32", 2, "Connecting to bootloader...");
         if (!katapult_send_command(KATAPULT_CMD_CONNECT, NULL, 0)) {
             err = "Failed to send CONNECT";
@@ -845,16 +874,43 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
         size_t resp_len = 0;
         uint8_t resp_cmd = katapult_recv_response(connect_resp, sizeof(connect_resp), &resp_len, 1000);
         
+        // If software entry failed, try hardware double-tap fallback
         if (resp_cmd != KATAPULT_CMD_CONNECT) {
-            if (resp_cmd == KATAPULT_RESP_NACK) {
-                err = "Katapult CONNECT: received NACK";
-            } else if (resp_cmd == 0) {
-                err = "Katapult CONNECT: timeout or frame error";
-            } else {
-                snprintf(msg, msgn, "Katapult CONNECT: unexpected response 0x%02X", resp_cmd);
-                err = msg;
+            ESP_LOGW(TAG, "Katapult: software entry failed (resp 0x%02X), trying hardware double-tap fallback", resp_cmd);
+            show_firmware_progress("STM32", 3, "Retrying with hardware reset...");
+            
+            // Perform hardware double-tap on NRST
+            katapult_double_tap_nrst();
+            
+            // Switch to bootloader baud
+            uart_set_baudrate(STM_BOOT_UART, KATAPULT_BAUD);
+            uart_flush_input(STM_BOOT_UART);
+            vTaskDelay(pdMS_TO_TICKS(50));
+            
+            // Retry CONNECT
+            ESP_LOGI(TAG, "Katapult: sending CONNECT (hardware entry)");
+            if (!katapult_send_command(KATAPULT_CMD_CONNECT, NULL, 0)) {
+                err = "Failed to send CONNECT after hardware double-tap";
+                break;
             }
-            break;
+            
+            resp_cmd = katapult_recv_response(connect_resp, sizeof(connect_resp), &resp_len, 1000);
+            
+            if (resp_cmd != KATAPULT_CMD_CONNECT) {
+                if (resp_cmd == KATAPULT_RESP_NACK) {
+                    err = "Katapult CONNECT: received NACK (both software and hardware entry failed)";
+                } else if (resp_cmd == 0) {
+                    err = "Katapult CONNECT: timeout or frame error (both software and hardware entry failed)";
+                } else {
+                    snprintf(msg, msgn, "Katapult CONNECT: unexpected response 0x%02X (both software and hardware entry failed)", resp_cmd);
+                    err = msg;
+                }
+                break;
+            }
+            
+            ESP_LOGI(TAG, "Katapult: hardware double-tap entry successful!");
+        } else {
+            ESP_LOGI(TAG, "Katapult: software entry successful!");
         }
 
         // Parse CONNECT response: protocol_ver(1B) + app_start(4B) + block_size(4B) + mcu_type(16B) + version(16B)
