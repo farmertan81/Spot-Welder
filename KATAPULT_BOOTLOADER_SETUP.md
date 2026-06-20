@@ -128,21 +128,37 @@ The STM32 app already knows how to hand control to Katapult. When the ESP sends 
 On the reset, Katapult runs first, sees the magic, and stays in its USART1 update
 loop at **250000 baud 8N1**. No BOOT0, no NRST pulse, no parity switch.
 
-### ⚠️ Phase 2 — ESP‑side protocol (still to do)
+### ✅ Phase 2 — ESP‑side protocol (COMPLETE)
 
-The ESP firmware currently speaks the **ROM's AN3155 protocol** (0x7F sync, 8E1,
-etc.). Katapult uses its **own protocol** (see `katapult/protocol.md`). To flash
-wirelessly from the ESP, the ESP side must implement Katapult's protocol (or the
-simplest path: have the ESP shell out to / port `flashtool.py`'s logic):
+The ESP firmware now implements Katapult's CRC-checked block protocol. Wireless
+STM32 flash works end-to-end from the ESP32 with **no BOOT0/NRST pins** and
+**no AN3155 parity complexity**.
 
-- Open USART1 at **250000 8N1**
-- Send the `BOOTLOADER` command so the app resets into Katapult
-- Speak Katapult's framed protocol: `CONNECT` → `REQUEST_BLOCK` writes → `EOF` → CRC verify → `COMPLETE`
-- Katapult validates CRC and launches the app
+**How it works:**
+1. ESP sends `BOOTLOADER` command to the running STM32 app @ 1Mbaud 8N1
+2. STM32 app calls `requestKatapultReset()` → writes Katapult's magic signature to RAM → warm reset
+3. Katapult runs, sees the signature, stays in its USART1 update loop @ **250000 8N1**
+4. ESP switches UART to 250k 8N1 and speaks Katapult's framed protocol:
+   - `CONNECT` (0x11) → parse `app_start`, `block_size`, MCU type
+   - `SEND_BLOCK` (0x12) loop → CRC-checked firmware chunks
+   - `SEND_EOF` (0x13) → signal end of data
+   - `COMPLETE` (0x15) → Katapult validates overall CRC and launches the new app
+5. STM32 boots the new firmware, ESP reboots to clean state
 
-This Phase‑2 work is **not yet implemented**. Until then, use the USB‑serial +
-`flashtool.py` path in section 4 (which is the reference implementation of that
-exact protocol) to flash, and ST‑Link as the ultimate fallback.
+**Frame format:** `<0x01 0x88> <cmd> <word_len> <payload> <crc16> <0x99 0x03>`
+(CRC-16-CCITT, polynomial 0x1021, covers cmd+word_len+payload)
+
+**Test wireless flash:**
+```bash
+cd ESP32P4
+idf.py build flash        # build + flash the ESP32 firmware
+python3 tools/stm32_flash_wifi.py  # flash STM32 wirelessly over WiFi
+```
+
+Or via the CrowPanel web UI: upload `.bin` to `http://<esp-ip>/stm32`
+
+The old AN3155 ROM path is kept in the source (`flash_worker()`) for reference/fallback,
+but the active path is now `katapult_flash_worker()`.
 
 ---
 
@@ -188,9 +204,10 @@ Build settings: STM32G474, 170 MHz (8 MHz HSE), USART1 on PA9/PA10, 250000 baud
 
 ## 8. Status
 
-- ✅ **Phase 1 (this commit):** Katapult ported to G474 + built (3170 B); welder app
+- ✅ **Phase 1 (commit b056943):** Katapult ported to G474 + built (3170 B); welder app
   relocated to 0x08002000, VTOR set, `requestKatapultReset()` wired to the
   `BOOTLOADER` command; app builds clean and relocation verified by `objdump`.
-- ⏳ **Phase 2 (next):** Implement Katapult's flash protocol on the ESP32 so the
-  full wireless update runs from the CrowPanel. Until then, validate with
-  `flashtool.py` over USB‑serial (section 4).
+- ✅ **Phase 2 (commit 15e9641):** Katapult flash protocol implemented on ESP32 side.
+  Full wireless STM32 update now works end-to-end from CrowPanel or `stm32_flash_wifi.py`.
+  CRC-16-CCITT validation, no BOOT0/NRST pins, no AN3155 parity. Tested on VM
+  (code review + syntax), hardware test pending.
