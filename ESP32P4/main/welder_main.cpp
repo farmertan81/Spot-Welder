@@ -1016,9 +1016,21 @@ extern "C" void app_main(void)
     nrst.mode = GPIO_MODE_INPUT_OUTPUT;
     nrst.pull_up_en = GPIO_PULLUP_ENABLE;  // match the STM32 internal pull-up
     gpio_config(&nrst);
+    // Max drive strength so the push-pull HIGH charges the WeAct board's NRST
+    // reset capacitor (~100nF) FAST and overpowers the STM32's internal reset
+    // pulldown. The previous flash log showed NRST reading back 0 right after
+    // release; boosting drive + a proper settle below tells us whether that was
+    // just the RC cap charging (recovers to 1) or a real short/clamp (stays 0).
+    gpio_set_drive_capability((gpio_num_t)STM32_NRST_PIN, GPIO_DRIVE_CAP_3);
     gpio_set_level((gpio_num_t)STM32_NRST_PIN, 1);  // idle HIGH (not in reset)
-    ESP_LOGI(TAG, "GPIO%d (NRST) set HIGH; readback=%d",
-             STM32_NRST_PIN, gpio_get_level((gpio_num_t)STM32_NRST_PIN));
+    // Settle, then sample twice so we can see if the line holds high on its own.
+    vTaskDelay(pdMS_TO_TICKS(5));
+    int nrst_rb1 = gpio_get_level((gpio_num_t)STM32_NRST_PIN);
+    ESP_LOGI(TAG, "GPIO%d (NRST) set HIGH (drive=CAP_3); readback=%d (want 1)",
+             STM32_NRST_PIN, nrst_rb1);
+    if (nrst_rb1 != 1)
+        ESP_LOGE(TAG, "NRST cannot reach HIGH even at idle -> hard short to GND or "
+                      "wrong pin. The STM32 will be stuck in reset.");
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();

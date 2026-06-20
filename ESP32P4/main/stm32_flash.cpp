@@ -483,24 +483,38 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
-    // Read BOTH pins back explicitly. Both are INPUT_OUTPUT, so gpio_get_level
-    // reads the ACTUAL pad voltage. This is the key wiring diagnostic:
-    //   NRST should now read 1 (released, chip running). If it reads 0 while we
-    //   are driving it HIGH push-pull, the NRST line is shorted/clamped LOW
-    //   externally -> the STM32 is held in PERMANENT RESET (no app, no ROM, pure
-    //   silence). BOOT0 should still read 1 (held HIGH) so the chip latches
-    //   "boot from System memory" at the reset edge; if it reads 0 the wire to
-    //   PB8 is open or the pulldown is winning -> chip boots the app, not ROM.
-    int nrst_rb  = gpio_get_level((gpio_num_t)STM_NRST_PIN);
+    // MULTI-SAMPLE the NRST line as it comes back up. Both pins are INPUT_OUTPUT
+    // so gpio_get_level reads the ACTUAL pad voltage. The WeAct board has a
+    // ~100nF reset cap on NRST, so a single read taken microseconds after
+    // release can catch it mid-charge (false "stuck low"). We sample every 2ms
+    // for ~30ms to tell the two cases apart decisively:
+    //   - rises 0->1 within a few ms  => it was just the RC cap charging. NRST
+    //     is FINE; the silence is caused by something else (BOOT0 / USART / ROM).
+    //   - stays 0 the whole window     => NRST is genuinely shorted/clamped LOW
+    //     and the STM32 is held in PERMANENT RESET (explains the total silence).
+    int nrst_rb = 0;
+    int nrst_rise_ms = -1;
+    for (int i = 0; i < 16; i++) {              // up to ~32ms
+        nrst_rb = gpio_get_level((gpio_num_t)STM_NRST_PIN);
+        if (nrst_rb == 1 && nrst_rise_ms < 0) { nrst_rise_ms = i * 2; break; }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
     int boot0_rb = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
-    ESP_LOGI(TAG, "  NRST released HIGH: NRST readback=%d (want 1), "
-                  "BOOT0 readback=%d (want 1)", nrst_rb, boot0_rb);
+    if (nrst_rise_ms >= 0)
+        ESP_LOGI(TAG, "  NRST released: rose to HIGH after ~%dms (RC cap charge, "
+                      "OK). BOOT0 readback=%d (want 1)", nrst_rise_ms, boot0_rb);
+    else
+        ESP_LOGI(TAG, "  NRST released: still LOW after 32ms (readback=%d). "
+                      "BOOT0 readback=%d (want 1)", nrst_rb, boot0_rb);
+
     if (nrst_rb != 1)
-        ESP_LOGE(TAG, "  NRST STUCK LOW after release -> line shorted / clamped / "
-                      "strong external pulldown. STM32 is held in PERMANENT RESET "
-                      "(this alone explains the total silence). Check GPIO%d->NRST "
-                      "wiring & for a short to GND; suspect the board if the wire "
-                      "is good.", STM_NRST_PIN);
+        ESP_LOGE(TAG, "  NRST STUCK LOW for >32ms -> line shorted / clamped / "
+                      "strong external pulldown, OR the STM32 is holding its own "
+                      "NRST low (brown-out / continuous internal reset). The chip "
+                      "is held in PERMANENT RESET (explains the total silence). "
+                      "Check GPIO%d->NRST wiring, for a short to GND, and the "
+                      "board's 3V3 rail; suspect the board if the wire is good.",
+                 STM_NRST_PIN);
     if (boot0_rb != 1)
         ESP_LOGE(TAG, "  BOOT0 fell LOW before the chip sampled it -> wire to PB8 "
                       "open or pulldown wins. Chip will boot the app, NOT the ROM "
