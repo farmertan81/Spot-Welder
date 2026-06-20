@@ -484,10 +484,57 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
         }
     }
 
-    // Give the chip time to reset and the ROM to start (~10ms), then drain any
-    // residual app bytes before we flip to the bootloader's 115200 8E1 config.
+    // Give the chip time to reset and boot (~200ms covers reset + clock init +
+    // UART init). The chip will print boot messages @1Mbaud 8N1 if it lands in
+    // the app (including "DBG,Boot: TAMP register = 0x..." showing whether the
+    // magic survived). If it jumped to ROM, the UART is SILENT (ROM hasn't seen
+    // 0x7F yet). Read any traffic at 1Mbaud to capture the boot diagnostics.
     vTaskDelay(pdMS_TO_TICKS(200));
-    uart_flush_input(STM_BOOT_UART);
+    {
+        char boot_buf[512];
+        int boot_n = 0;
+        for (int i = 0; i < 4 && boot_n < (int)sizeof(boot_buf) - 1; i++) {
+            int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)boot_buf + boot_n,
+                                    sizeof(boot_buf) - 1 - boot_n, pdMS_TO_TICKS(50));
+            if (n > 0) boot_n += n;
+        }
+        boot_buf[boot_n > 0 ? boot_n : 0] = '\0';
+        
+        if (boot_n > 0) {
+            // The chip is transmitting @1Mbaud -> it's in the APP, not ROM.
+            // Extract the TAMP diagnostic to see if the magic was written/lost.
+            const char *tamp_line = strstr(boot_buf, "TAMP register =");
+            if (tamp_line) {
+                // Parse the hex value (format: "TAMP register = 0x12345678")
+                unsigned long tamp_val = 0;
+                const char *hex_start = strstr(tamp_line, "0x");
+                if (hex_start) {
+                    tamp_val = strtoul(hex_start, NULL, 16);
+                }
+                if (tamp_val == 0xB00710ADUL) {
+                    ESP_LOGE(TAG, "TAMP magic survived reset (0x%08lX) but jump did NOT fire! "
+                                  "The early-boot check in main() is being skipped or failing. "
+                                  "Check that main.c line 4762-4766 is actually compiled+flashed.", 
+                             tamp_val);
+                } else if (tamp_val == 0) {
+                    ESP_LOGE(TAG, "TAMP register cleared to 0x00000000 across reset -> magic did "
+                                  "NOT survive. Backup domain is being reset (power brownout? "
+                                  "option byte? VBAT disconnected?).");
+                } else {
+                    ESP_LOGW(TAG, "TAMP register has unexpected value 0x%08lX (not magic, not 0). "
+                                  "Backup domain corruption?", tamp_val);
+                }
+            } else {
+                ESP_LOGW(TAG, "App booted @1Mbaud (%d bytes) but no TAMP diagnostic line found. "
+                              "Old firmware?", boot_n);
+            }
+            ESP_LOGI(TAG, "Boot traffic (first 120 chars): [%.*s]", 
+                     (boot_n < 120 ? boot_n : 120), boot_buf);
+        } else {
+            // Silence @1Mbaud -> chip is NOT in app. Either ROM (good) or hung (bad).
+            ESP_LOGI(TAG, "No traffic @1Mbaud after reset -> chip not in app (ROM or hung)");
+        }
+    }
 
     ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (USB disabled by app, USART1 active)");
 
