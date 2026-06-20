@@ -923,9 +923,23 @@ extern "C" void welder_prep_stm32_flash(void)
         // delete+reinstall the driver anyway, so suspending mid-read is safe.
         if (s_stm32_task_handle) {
             vTaskSuspend(s_stm32_task_handle);
+            // CRITICAL (deadlock fix): vTaskSuspend froze the task wherever it
+            // happened to be — almost always INSIDE uart_read_bytes() or
+            // uart_write_bytes(), holding UART_NUM_1's rx_mux / tx_mux. If we
+            // leave the driver installed, the flasher's NEXT UART call
+            // (uart_flush_input / uart_wait_tx_done / uart_driver_delete inside
+            // switch_uart_to_bootloader) blocks FOREVER trying to take that same
+            // mutex -> the entire flash hangs right after "HARDWARE bootloader
+            // entry", and because the LCD pclk was already dropped to 2 MHz the
+            // panel just scans out garbage (the "screen changing colors" symptom).
+            // Deleting the driver NOW destroys those mutexes and unblocks
+            // everything; switch_uart_to_bootloader then reinstalls a fresh
+            // 115200 8E1 driver from scratch (its re-delete is a harmless no-op).
+            uart_driver_delete(STM32_UART_NUM);
             s_stm32_paused = true;  // treat as parked for the rest of the flow
             ESP_LOGW(TAG, "stm32_task did NOT park cooperatively -> HARD SUSPENDED "
-                          "to guarantee exclusive UART access");
+                          "+ UART driver deleted to break held mutex and "
+                          "guarantee exclusive UART access");
         } else {
             ESP_LOGE(TAG, "stm32_task did NOT park and no handle to suspend — "
                           "UART contention likely, flash may fail");

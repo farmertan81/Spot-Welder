@@ -483,9 +483,28 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
-    ESP_LOGI(TAG, "  NRST pulsed LOW(20ms)->HIGH; chip resetting into ROM "
-                  "(BOOT0 held HIGH, readback=%d)",
-             gpio_get_level((gpio_num_t)STM_NRST_PIN));
+    // Read BOTH pins back explicitly. Both are INPUT_OUTPUT, so gpio_get_level
+    // reads the ACTUAL pad voltage. This is the key wiring diagnostic:
+    //   NRST should now read 1 (released, chip running). If it reads 0 while we
+    //   are driving it HIGH push-pull, the NRST line is shorted/clamped LOW
+    //   externally -> the STM32 is held in PERMANENT RESET (no app, no ROM, pure
+    //   silence). BOOT0 should still read 1 (held HIGH) so the chip latches
+    //   "boot from System memory" at the reset edge; if it reads 0 the wire to
+    //   PB8 is open or the pulldown is winning -> chip boots the app, not ROM.
+    int nrst_rb  = gpio_get_level((gpio_num_t)STM_NRST_PIN);
+    int boot0_rb = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
+    ESP_LOGI(TAG, "  NRST released HIGH: NRST readback=%d (want 1), "
+                  "BOOT0 readback=%d (want 1)", nrst_rb, boot0_rb);
+    if (nrst_rb != 1)
+        ESP_LOGE(TAG, "  NRST STUCK LOW after release -> line shorted / clamped / "
+                      "strong external pulldown. STM32 is held in PERMANENT RESET "
+                      "(this alone explains the total silence). Check GPIO%d->NRST "
+                      "wiring & for a short to GND; suspect the board if the wire "
+                      "is good.", STM_NRST_PIN);
+    if (boot0_rb != 1)
+        ESP_LOGE(TAG, "  BOOT0 fell LOW before the chip sampled it -> wire to PB8 "
+                      "open or pulldown wins. Chip will boot the app, NOT the ROM "
+                      "bootloader. Check GPIO%d->PB8 wiring.", STM_BOOT0_PIN);
 
     // c) Brief startup window for the ROM to come up and begin polling its
     //    interfaces. We then switch our UART to 8E1 and fire 0x7F immediately so
