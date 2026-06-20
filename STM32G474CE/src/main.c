@@ -4688,50 +4688,26 @@ static void jumpToBootloader(void) {
     }
 }
 
-/* Request entry into the ROM bootloader on the next boot. Stores the magic
- * sentinel in a backup register (survives the reset) and issues a system reset.
- * The reset also stops the software-mode IWDG; the early-boot check in main()
- * then detects the flag and calls jumpToBootloader(). This does NOT return. */
+/* Wireless STM32 firmware update: enter the ROM bootloader immediately by
+ * directly calling jumpToBootloader(). The TAMP backup register approach (set
+ * magic + NVIC_SystemReset + detect on reboot) does NOT work on this WeAct
+ * STM32G474 board because VBAT is not properly connected — the backup domain
+ * is cleared across ANY reset, so the magic is lost (proven by boot diagnostic
+ * showing TAMP=0x00000000). Direct jump bypasses the backup-domain issue and
+ * works on all boards. This does NOT return. */
 static void requestBootloaderReset(void) {
-    char dbg[80];
+    uartSend("DBG,Wireless flash: jumping DIRECTLY to ROM bootloader (no reset)");
+    HAL_Delay(50);  /* let the debug line flush out of the UART before the jump */
 
-    /* Prove we actually entered this function. If this line never appears the
-     * call site itself is not being reached. */
-    uartSend("DBG,Inside requestBootloaderReset() - START");
-    HAL_Delay(50);
+    /* jumpToBootloader() never returns — it disables USB (pulls D+/D- LOW to
+     * prevent ROM from waiting for USB enumeration), tears down the app clocks/
+     * peripherals, and jumps to the STM32G4 factory ROM bootloader at 0x1FFF0000.
+     * The ROM will then listen on USART1 (PA9/PA10) at 115200 8E1 for AN3155
+     * commands from the ESP32. */
+    jumpToBootloader();
 
-    uartSend("DBG,Setting TAMP register...");
-    HAL_Delay(10);
-
-    /* Unlock the backup domain (PWR + RTC/TAMP APB clock + DBP) so the backup
-     * register is actually writable. Without this the write is silently
-     * ignored and the magic never survives the reset. */
-    bootloaderEnableBackupAccess();
-
-    /* Write the magic sentinel and force the store to complete. */
-    BOOTLOADER_FLAG_REG = BOOTLOADER_REQUEST_MAGIC;
-    __DSB();
-
-    /* Read the register straight back to prove the write actually stuck. If
-     * this does NOT show 0xB00710AD then the backup domain is still locked or
-     * the wrong register is being used. */
-    snprintf(dbg, sizeof(dbg), "DBG,TAMP register set to 0x%08lX",
-             (unsigned long)BOOTLOADER_FLAG_REG);
-    uartSend(dbg);
-    HAL_Delay(10);
-
-    snprintf(dbg, sizeof(dbg), "DBG,Expected magic    = 0x%08lX",
-             (unsigned long)BOOTLOADER_REQUEST_MAGIC);
-    uartSend(dbg);
-    HAL_Delay(10);
-
-    uartSend("DBG,Calling NVIC_SystemReset()...");
-    HAL_Delay(50);  /* let the debug lines flush out of the UART before reset */
-
-    NVIC_SystemReset();
-
-    /* If we are still alive here the reset did NOT take effect. */
-    uartSend("DBG,ERROR: NVIC_SystemReset() returned - reset FAILED!");
+    /* Unreachable. If we get here the jump itself failed (should never happen). */
+    uartSend("DBG,ERROR: jumpToBootloader() returned - jump FAILED!");
     while (1) {
     }
 }
