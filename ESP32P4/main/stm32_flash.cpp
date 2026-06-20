@@ -450,16 +450,45 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     //    design bug or leakage), the disabled USB forces the ROM to listen on USART1.
     //    The app is running at 1Mbaud 8N1, so send the command at that config.
     ESP_LOGI(TAG, "Sending SOFTWARE bootloader entry command (BOOTLOADER) @1Mbaud 8N1...");
+    uart_flush_input(STM_BOOT_UART);  // clear any in-flight telemetry first
     const char *cmd = "BOOTLOADER\n";
     uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
     uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
-    
-    // The STM32 app will ACK, then reset itself into the ROM bootloader. The ROM
-    // startup takes ~10ms (clock init + GPIO config). Wait 200ms for safety, then
-    // drain any residual app ACK bytes (they're at 8N1, we're about to flip to 8E1).
+
+    // DECISIVE DIAGNOSTIC: read the app's reply at 1Mbaud 8N1 for ~400ms. The app
+    // is supposed to print "DBG,BOOTLOADER command received" + "ACK,BOOTLOADER",
+    // then reset (after which traffic STOPS as it jumps to the silent ROM). This
+    // tells us EXACTLY what happened:
+    //   - see "ACK,BOOTLOADER" then silence -> command worked, jumped to ROM
+    //   - see "ACK,BOOTLOADER" then MORE STATUS telemetry -> jump failed, app rebooted
+    //   - see only STATUS telemetry (no ACK) -> command NOT received/recognized
+    {
+        char rbuf[512];
+        int rn = 0;
+        for (int i = 0; i < 8 && rn < (int)sizeof(rbuf) - 1; i++) {
+            int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rbuf + rn,
+                                    sizeof(rbuf) - 1 - rn, pdMS_TO_TICKS(50));
+            if (n > 0) rn += n;
+        }
+        rbuf[rn > 0 ? rn : 0] = '\0';
+        bool got_ack = (rn > 0) && (strstr(rbuf, "ACK,BOOTLOADER") != NULL ||
+                                    strstr(rbuf, "BOOTLOADER command received") != NULL);
+        if (got_ack) {
+            ESP_LOGI(TAG, "App ACKed BOOTLOADER cmd (%d bytes) -> jump requested.", rn);
+        } else if (rn > 0) {
+            ESP_LOGW(TAG, "App did NOT ACK BOOTLOADER (got %d bytes of other traffic). "
+                          "Cmd not recognized OR old firmware without USB-disable jump. "
+                          "First 80 chars: [%.*s]", rn, (rn < 80 ? rn : 80), rbuf);
+        } else {
+            ESP_LOGW(TAG, "No reply at all to BOOTLOADER cmd @1Mbaud 8N1 — UART TX issue?");
+        }
+    }
+
+    // Give the chip time to reset and the ROM to start (~10ms), then drain any
+    // residual app bytes before we flip to the bootloader's 115200 8E1 config.
     vTaskDelay(pdMS_TO_TICKS(200));
     uart_flush_input(STM_BOOT_UART);
-    
+
     ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (USB disabled by app, USART1 active)");
 
     // 3) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
