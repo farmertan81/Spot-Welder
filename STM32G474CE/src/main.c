@@ -4086,49 +4086,6 @@ static void parseCommand(char* line) {
         if (len == 0) return;  /* nothing left after trimming */
     }
 
-    /* Debug: echo exactly what we are about to compare, with its length, so the
-     * host can confirm there are no stray characters defeating the strcmp. */
-    {
-        char debugbuf[64];
-        snprintf(debugbuf, sizeof(debugbuf), "DBG,parseCommand: '%s' (len=%d)",
-                 line, (int)strlen(line));
-        uartSend(debugbuf);
-        HAL_Delay(5);
-    }
-
-    /* Debug: dump the raw bytes of the line in hex. If the line LOOKS like
-     * "BOOTLOADER" in the text print above but strcmp() still fails, a
-     * non-printable byte is hiding in here. This makes it visible. */
-    {
-        char hexbuf[96];
-        size_t n = strlen(line);
-        int off = snprintf(hexbuf, sizeof(hexbuf), "DBG,hex:");
-        for (size_t i = 0; i < n && off < (int)(sizeof(hexbuf) - 4); i++) {
-            off += snprintf(hexbuf + off, sizeof(hexbuf) - off, " %02X",
-                            (unsigned char)line[i]);
-        }
-        uartSend(hexbuf);
-        HAL_Delay(5);
-    }
-
-    /* Debug: show the EXACT line we are about to compare against "BOOTLOADER". */
-    {
-        char debugcmp[128];
-        snprintf(debugcmp, sizeof(debugcmp),
-                 "DBG,strcmp check: line='%s' len=%d", line, (int)strlen(line));
-        uartSend(debugcmp);
-        HAL_Delay(10);
-    }
-
-    /* Debug: show what strcmp(line, "BOOTLOADER") actually returns. 0 = match. */
-    {
-        int cmp_result = strcmp(line, "BOOTLOADER");
-        char debugres[64];
-        snprintf(debugres, sizeof(debugres), "DBG,strcmp result=%d", cmp_result);
-        uartSend(debugres);
-        HAL_Delay(10);
-    }
-
     /* Remote firmware update: re-enter the factory ROM bootloader so the ESP32
      * can flash a new image over UART (AN3155).
      *
@@ -4951,7 +4908,7 @@ int main(void) {
     } else {
         persistent_defaults(&g_persistent_settings);
         apply_loaded_settings(&g_persistent_settings);
-        uartSend("WARN,FLASH_LOAD_FAILED,USING_DEFAULTS");
+        uartSend("INFO,no saved settings yet, using defaults");
     }
 
     // Boot override: always start disarmed + pedal trigger, regardless of what
@@ -4959,14 +4916,6 @@ int main(void) {
     // respected, but for safety the welder must boot in the safe state.
     armed = false;
     trigger_mode = 1;  // 1 = pedal, 2 = probe contact
-
-    {
-        char buf[128];
-        snprintf(buf, sizeof(buf),
-                 "DBG,BOOT,control_mode=%d,joule_target_j=%.1f", control_mode,
-                 joule_target_j);
-        uartSend(buf);
-    }
 
     MX_ADC1_Init();
     OPAMP1->CSR &= ~OPAMP_CSR_OPAMPxEN;
@@ -5037,10 +4986,6 @@ int main(void) {
      * running. If this line is missing after a flash, the flash did not take
      * (e.g. a BlackMagic ".data MIS-MATCHED" verify failure) -- re-flash with a
      * full chip erase. */
-    uartSend("*****************************************************");
-    uartSend("***  NEW FIRMWARE RUNNING: noinit-marker-reset    ***");
-    uartSend("***  If you see THIS banner, the wired flash TOOK ***");
-    uartSend("*****************************************************");
     uartSend("BOOT,FW=KATAPULT-APP-v6-RELOCATED-0x08002000");
 
     {
