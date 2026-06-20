@@ -29,6 +29,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
@@ -62,6 +63,13 @@ extern "C" void welder_prep_stm32_flash(void);
 static volatile bool s_in_progress = false;
 static uint8_t      *s_fw  = NULL;   // owned heap buffer (freed by the task)
 static size_t        s_len = 0;
+
+// UART event queue — lets us detect PARITY/FRAME errors on RX. This is the
+// decisive diagnostic: if the STM32 ROM IS responding but the byte arrives with
+// a parity/framing mismatch, the driver silently DROPS it and it looks like
+// "silence". The event queue still reports the error, proving the STM32 is alive
+// and the problem is a config/baud mismatch (not a dead link).
+static QueueHandle_t s_uart_evt_q = NULL;
 
 bool stm32_flash_in_progress(void) { return s_in_progress; }
 
@@ -251,10 +259,10 @@ static void switch_uart_to_bootloader(void) {
     uart_driver_delete(STM_BOOT_UART);
 
     uart_config_t cfg = {};
-    // NOTE: Normally 115200, but testing 57600 to rule out signal integrity issues.
-    // The STM32 ROM bootloader auto-detects baud from the 0x7F sync byte (1200-115200).
-    // If the P4 has a silicon quirk with 8E1 parity at high baud, slower might work.
-    cfg.baud_rate = 57600;  // TODO: try 115200 / 57600 / 9600
+    // 115200 is the proven AN3155 default (old board used it). Baud is NOT the
+    // problem — 57600 failed identically — so we stay on the standard value while
+    // the event-queue diagnostic isolates the real cause.
+    cfg.baud_rate = 115200;
     cfg.data_bits = UART_DATA_8_BITS;
     cfg.parity    = UART_PARITY_EVEN;   // ROM bootloader is 8E1
     cfg.stop_bits = UART_STOP_BITS_1;
@@ -275,9 +283,14 @@ static void switch_uart_to_bootloader(void) {
     // the STM32 cleanly. Drive strength 3 = ~20mA on P4 (per TRM Table 6-5).
     gpio_set_drive_capability((gpio_num_t)STM_TX_PIN, GPIO_DRIVE_CAP_3);
     
-    uart_driver_install(STM_BOOT_UART, 4096, 0, 0, NULL, 0);
+    // Install WITH an event queue (depth 30) so we can detect UART_PARITY_ERR /
+    // UART_FRAME_ERR — i.e. whether the STM32 is replying but we're dropping the
+    // byte on a config mismatch. s_uart_evt_q is drained in the post-fail probe.
+    uart_driver_install(STM_BOOT_UART, 4096, 0, 30, &s_uart_evt_q, 0);
 
     uart_flush_input(STM_BOOT_UART);
+    // Clear any stale events from the previous driver instance.
+    if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
 }
 
 // Internal UART loopback self-test. Uses the ESP32 hardware loopback (TX wired
@@ -317,6 +330,44 @@ static void uart_loopback_selftest(void) {
     } else {
         ESP_LOGE(TAG, "  LOOPBACK FAIL: sent 0x7F, read NOTHING back. ESP UART RX "
                       "path is dead at 8E1 (driver/config bug on the P4).");
+    }
+}
+
+// Drain the UART event queue and report what happened on the RX line during sync.
+// THE decisive diagnostic: distinguishes "STM32 is replying but config mismatch"
+// from "STM32 is genuinely silent".
+static void report_uart_events(void) {
+    if (!s_uart_evt_q) {
+        ESP_LOGW(TAG, "EVENTS: no event queue installed");
+        return;
+    }
+    int parity = 0, frame = 0, data = 0, fifo_ovf = 0, buf_full = 0, brk = 0, other = 0;
+    uart_event_t ev;
+    // Non-blocking drain of everything queued during the sync attempts.
+    while (xQueueReceive(s_uart_evt_q, &ev, 0) == pdTRUE) {
+        switch (ev.type) {
+            case UART_DATA:        data++;     break;
+            case UART_PARITY_ERR:  parity++;   break;
+            case UART_FRAME_ERR:   frame++;    break;
+            case UART_FIFO_OVF:    fifo_ovf++; break;
+            case UART_BUFFER_FULL: buf_full++; break;
+            case UART_BREAK:       brk++;      break;
+            default:               other++;    break;
+        }
+    }
+    ESP_LOGI(TAG, "EVENTS during sync: DATA=%d PARITY_ERR=%d FRAME_ERR=%d "
+                  "FIFO_OVF=%d BUF_FULL=%d BREAK=%d other=%d",
+             data, parity, frame, fifo_ovf, buf_full, brk, other);
+    if (parity > 0 || frame > 0) {
+        ESP_LOGW(TAG, "  >> STM32 IS RESPONDING but bytes are dropped on "
+                      "PARITY/FRAME mismatch -> the ROM auto-baud locked to a "
+                      "DIFFERENT baud/format than the ESP. This is a baud/timing "
+                      "lock issue, NOT a dead link.");
+    } else if (data == 0) {
+        ESP_LOGW(TAG, "  >> Zero RX activity of ANY kind (no good bytes, no error "
+                      "frames). The STM32 ROM is genuinely not transmitting -> it "
+                      "did not accept our 0x7F (TX not reaching PA10) OR it is on a "
+                      "different bootloader interface.");
     }
 }
 
@@ -382,14 +433,19 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     vTaskDelay(pdMS_TO_TICKS(50));
 
     // 7) Drain any residual bytes so the FIRST thing we actively send is a
-    //    pristine 0x7F sync.
+    //    pristine 0x7F sync. Also clear the event queue so the error counts we
+    //    report afterward reflect ONLY the sync attempts (not the loopback test).
     stmDrainRx();
+    if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
 
     bool ok = false;
     const char *err = NULL;
     do {
         if (!stmSync()) {
             err = "STM32 bootloader did not respond";
+            // DECISIVE: report parity/frame errors captured during the 10 sync
+            // attempts. This tells us if the STM32 replied but we dropped it.
+            report_uart_events();
             // POST-FAILURE DIAGNOSTIC. The hardware reset should have forced the STM32
             // into the ROM bootloader, but if the sync failed we need to determine WHY.
             // Two possibilities:
