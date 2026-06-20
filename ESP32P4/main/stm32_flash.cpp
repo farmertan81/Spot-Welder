@@ -25,6 +25,7 @@
 #include "stm32_flash.h"
 
 #include <string.h>
+#include <strings.h>   // strcasecmp() for the ?method= query parse
 #include <stdio.h>
 
 #include "freertos/FreeRTOS.h"
@@ -68,6 +69,16 @@ extern "C" void welder_prep_stm32_flash(void);
 static volatile bool s_in_progress = false;
 static uint8_t      *s_fw  = NULL;   // owned heap buffer (freed by the task)
 static size_t        s_len = 0;
+
+// ROM-entry method selector, set from the /stm32?method= query before each flash:
+//   ENTRY_AUTO (default) = try the 2-wire software jump first, fall back to the
+//                          BOOT0+NRST hardware pulse if the ROM stays silent.
+//   ENTRY_SW             = software 2-wire jump ONLY (no BOOT0/NRST). For proving
+//                          the wire-free path in isolation.
+//   ENTRY_HW             = BOOT0+NRST hardware pulse ONLY. For proving the
+//                          hardware path in isolation.
+enum { ENTRY_AUTO = 0, ENTRY_SW = 1, ENTRY_HW = 2 };
+static volatile int s_entry_method = ENTRY_AUTO;
 
 // UART event queue — lets us detect PARITY/FRAME errors on RX. This is the
 // decisive diagnostic: if the STM32 ROM IS responding but the byte arrives with
@@ -589,15 +600,27 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
-    // 2) ENTER the ROM bootloader. Try the SOFTWARE jump first (works on a stock
-    //    STM32G4 where the BOOT0 pin is ignored), then fall back to the hardware
-    //    BOOT0+NRST pulse only if the app did not respond (e.g. already bricked).
-    bool entered = stm32_enter_bootloader_software();
-    if (!entered) {
-        ESP_LOGW(TAG, "Software ROM entry did not sync -> trying HARDWARE "
-                      "BOOT0+NRST fallback (only works if option bytes have "
-                      "nBOOT_SEL=0)...");
+    // 2) ENTER the ROM bootloader. Which path we use depends on s_entry_method,
+    //    set from the /stm32?method= query so each path can be proven on its own:
+    //      ENTRY_SW  -> 2-wire software jump ONLY (no BOOT0/NRST).
+    //      ENTRY_HW  -> BOOT0+NRST hardware pulse ONLY.
+    //      ENTRY_AUTO-> software jump first, hardware pulse as fallback (default).
+    bool entered = false;
+    if (s_entry_method == ENTRY_SW) {
+        ESP_LOGI(TAG, "Entry method = SOFTWARE-ONLY (2-wire, no BOOT0/NRST)");
+        entered = stm32_enter_bootloader_software();
+    } else if (s_entry_method == ENTRY_HW) {
+        ESP_LOGI(TAG, "Entry method = HARDWARE-ONLY (BOOT0+NRST pulse)");
         entered = stm32_enter_bootloader_hardware();
+    } else {
+        ESP_LOGI(TAG, "Entry method = AUTO (software first, hardware fallback)");
+        entered = stm32_enter_bootloader_software();
+        if (!entered) {
+            ESP_LOGW(TAG, "Software ROM entry did not sync -> trying HARDWARE "
+                          "BOOT0+NRST fallback (only works if option bytes have "
+                          "nBOOT_SEL=0)...");
+            entered = stm32_enter_bootloader_hardware();
+        }
     }
 
 
@@ -844,6 +867,30 @@ static esp_err_t stm32_post_handler(httpd_req_t *req) {
         httpd_resp_sendstr(req, "STM32 flash already in progress\n");
         return ESP_OK;
     }
+
+    // Parse the optional ?method=sw|hw|auto query so each ROM-entry path can be
+    // proven independently. Anything missing/unrecognised falls back to AUTO.
+    s_entry_method = ENTRY_AUTO;
+    {
+        size_t qlen = httpd_req_get_url_query_len(req) + 1;
+        if (qlen > 1 && qlen < 128) {
+            char qbuf[128];
+            if (httpd_req_get_url_query_str(req, qbuf, qlen) == ESP_OK) {
+                char val[16];
+                if (httpd_query_key_value(qbuf, "method", val, sizeof(val)) == ESP_OK) {
+                    if (strcasecmp(val, "sw") == 0 || strcasecmp(val, "software") == 0)
+                        s_entry_method = ENTRY_SW;
+                    else if (strcasecmp(val, "hw") == 0 || strcasecmp(val, "hardware") == 0)
+                        s_entry_method = ENTRY_HW;
+                    else
+                        s_entry_method = ENTRY_AUTO;
+                }
+            }
+        }
+    }
+    ESP_LOGI(TAG, "STM32 flash entry method = %s",
+             s_entry_method == ENTRY_SW ? "SOFTWARE-ONLY" :
+             s_entry_method == ENTRY_HW ? "HARDWARE-ONLY" : "AUTO");
 
     int total = req->content_len;
     ESP_LOGI(TAG, "STM32 upload started (content-length=%d)", total);

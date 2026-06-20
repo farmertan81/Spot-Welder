@@ -18,6 +18,11 @@
 #   python tools/stm32_flash_wifi.py --bin C:\path\firmware.bin
 #   python tools/stm32_flash_wifi.py spotwelder.local --bin ..\STM32G474CE\.pio\build\genericSTM32G474CE\firmware.bin
 #
+# ROM-entry method (prove each path independently):
+#   python tools/stm32_flash_wifi.py --method auto    # software jump, hw fallback (default)
+#   python tools/stm32_flash_wifi.py --method sw      # 2-wire software jump ONLY (no BOOT0/NRST)
+#   python tools/stm32_flash_wifi.py --method hw      # BOOT0+NRST hardware pulse ONLY
+#
 # It is normally launched by the VS Code task "Flash STM32 over WiFi"
 # (see .vscode/tasks.json).
 #
@@ -74,14 +79,14 @@ def find_firmware():
 
 
 def hosts_from_args():
-    # positional args that are not flags or the --bin value
+    # positional args that are not flags or the value of --bin/--method
     args = []
     skip = False
     for a in sys.argv[1:]:
         if skip:
             skip = False
             continue
-        if a == "--bin":
+        if a in ("--bin", "--method"):
             skip = True
             continue
         if a.startswith("-"):
@@ -90,8 +95,26 @@ def hosts_from_args():
     return args if args else DEFAULT_HOSTS
 
 
-def upload(host, data):
+def method_from_args():
+    # --method auto|sw|hw  (default auto). Accepts a few friendly synonyms.
+    for i, a in enumerate(sys.argv):
+        if a == "--method" and i + 1 < len(sys.argv):
+            v = sys.argv[i + 1].strip().lower()
+            if v in ("sw", "soft", "software"):
+                return "sw"
+            if v in ("hw", "hard", "hardware"):
+                return "hw"
+            if v in ("auto", ""):
+                return "auto"
+            print("ERROR: --method must be one of auto|sw|hw (got %r)" % v)
+            sys.exit(1)
+    return "auto"
+
+
+def upload(host, data, method="auto"):
     url = "http://%s/stm32" % host
+    if method and method != "auto":
+        url += "?method=%s" % method
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/octet-stream")
     req.add_header("Content-Length", str(len(data)))
@@ -108,7 +131,13 @@ def main():
     fw = find_firmware()
     with open(fw, "rb") as f:
         data = f.read()
+    method = method_from_args()
     print("STM32 firmware: %s  (%d bytes)" % (fw, len(data)))
+    print("ROM-entry method: %s" % {
+        "auto": "AUTO (software jump, hardware fallback)",
+        "sw":   "SOFTWARE-ONLY (2-wire, no BOOT0/NRST)",
+        "hw":   "HARDWARE-ONLY (BOOT0+NRST pulse)",
+    }[method])
     if len(data) < 256 or len(data) > 512 * 1024:
         print("ERROR: image size out of range (256 B .. 512 KB for G474CE).")
         return 1
@@ -117,7 +146,7 @@ def main():
     for host in hosts_from_args():
         try:
             print("\n=== Trying %s ===" % host)
-            if upload(host, data):
+            if upload(host, data, method):
                 print("\nDONE. The ESP32 received the image and is flashing the")
                 print("STM32 now. Watch the device screen for the STM32 progress")
                 print("bar; the ESP32 reboots automatically when finished.")

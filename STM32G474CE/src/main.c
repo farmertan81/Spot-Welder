@@ -268,6 +268,22 @@ static float measured_vdda = 3.3f; /* Updated periodically by measureVDDA() */
  * to equal the magic, and we always clear it right after detection). */
 __attribute__((section(".noinit"))) volatile uint32_t g_bootloader_marker;
 
+/* Bootloader-path BREADCRUMB. Also lives in .noinit, so it survives ALL resets
+ * except a true power-on (POR/BOR) - including the warm NVIC_SystemReset we do to
+ * enter the bootloader AND the external NRST pin pulse the ESP applies on the
+ * hardware fallback. We stamp it at each step of the software ROM-entry path, so
+ * on the NEXT boot we can print exactly how far the jump got:
+ *   1 = BOOTLOADER cmd received, marker set, about to NVIC_SystemReset()
+ *   2 = after reset, early-main detected the marker, about to jumpToBootloader()
+ *   3 = inside jumpToBootloader(), about to branch into the ROM at 0x1FFF0000
+ * If the post-flash boot shows stage 3 we reached the ROM jump; stage 2 means the
+ * jump faulted before branching; stage 1 means the marker was lost across reset.
+ * The value is tagged with a magic so random power-on garbage isn't mistaken for
+ * a real breadcrumb. */
+#define BLSTAGE_MAGIC 0x57130000UL
+#define BLSTAGE(n)    (BLSTAGE_MAGIC | (uint32_t)(n))
+__attribute__((section(".noinit"))) volatile uint32_t g_bl_stage;
+
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;
 static volatile uint16_t weld_d1_ms = 10;
@@ -4689,6 +4705,12 @@ static void jumpToBootloader(void) {
     __DSB();
     __ISB();
 
+    /* Breadcrumb: we made it all the way through teardown and are about to branch
+     * into the ROM. If the next boot shows stage 3, the jump itself executed and
+     * any failure is on the ROM/USART side, not in this teardown sequence. */
+    g_bl_stage = BLSTAGE(3);
+    __DSB();
+
     /* Re-enable interrupts and hand control to the bootloader. */
     __enable_irq();
     bootJump();
@@ -4718,6 +4740,8 @@ static void jumpToBootloader(void) {
  *
  * This does NOT return. */
 static void requestBootloaderReset(void) {
+    g_bl_stage = BLSTAGE(1);   /* breadcrumb: cmd received, about to reset */
+
     /* PRIMARY: SRAM marker (survives warm reset on this board). */
     g_bootloader_marker = BOOTLOADER_REQUEST_MAGIC;
 
@@ -4773,6 +4797,7 @@ int main(void) {
     bool bl_req = (g_bootloader_marker == BOOTLOADER_REQUEST_MAGIC) ||
                   (g_boot_tamp_value == BOOTLOADER_REQUEST_MAGIC);
     if (bl_req) {
+        g_bl_stage = BLSTAGE(2);   /* breadcrumb: marker seen, about to jump */
         g_bootloader_marker = 0;   /* one-shot: clear SRAM marker  */
         BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear TAMP fallback */
         __DSB();
@@ -4829,6 +4854,22 @@ int main(void) {
                  "DBG,Boot: unexpected TAMP=0x%08lX (early jump skipped?)",
                  (unsigned long)g_boot_tamp_value);
         uartSend(dbg);
+    }
+
+    /* Print the software-bootloader breadcrumb if one was stamped on the prior
+     * (pre-reset) run. .noinit survives the warm/NRST reset, so this reveals how
+     * far the last software ROM-entry attempt actually got:
+     *   3 = reached the ROM jump (failure, if any, is on the ROM/USART side)
+     *   2 = early-main saw the marker but jumpToBootloader() faulted before branch
+     *   1 = reset happened but the marker was lost across it (early jump skipped)
+     * Cleared after printing so it only reports once per attempt. */
+    if ((g_bl_stage & 0xFFFFFF00UL) == BLSTAGE_MAGIC) {
+        char dbg[80];
+        snprintf(dbg, sizeof(dbg),
+                 "DBG,BL breadcrumb: last software ROM-entry reached stage %lu/3",
+                 (unsigned long)(g_bl_stage & 0xFFUL));
+        uartSend(dbg);
+        g_bl_stage = 0;
     }
 
     persistent_defaults(&g_persistent_settings);
