@@ -271,6 +271,36 @@ static IRAM_ATTR bool stmWriteChunk(uint32_t addr, const uint8_t *data, int len)
     return stmWaitAck(2000);
 }
 
+// Read Memory (0x11): read up to 256 bytes (len = 1..256) from `addr` into
+// `out`. Returns true if the ROM ACKed every stage and all bytes were received.
+// Used by the post-write VERIFY pass to read flash back and compare it against
+// the image we just programmed — the definitive proof the flash is correct.
+static IRAM_ATTR bool stmReadChunk(uint32_t addr, uint8_t *out, int len) {
+    if (len < 1 || len > 256) return false;
+    if (!stmSendCmd(0x11)) return false;                 // Read Memory cmd + ACK
+    uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
+                    (uint8_t)(addr >> 8), (uint8_t)addr};
+    uint8_t acs = a[0] ^ a[1] ^ a[2] ^ a[3];
+    uint8_t addrpkt[5] = {a[0], a[1], a[2], a[3], acs};
+    stmWrite(addrpkt, 5);
+    stmFlushTx();
+    if (!stmWaitAck(800)) return false;                  // address ACK
+
+    uint8_t n = (uint8_t)(len - 1);                      // device expects (count-1)
+    uint8_t pkt[2] = {n, (uint8_t)(n ^ 0xFF)};           // N + its complement
+    stmWrite(pkt, 2);
+    stmFlushTx();
+    if (!stmWaitAck(800)) return false;                  // N ACK -> data follows
+
+    // Read exactly len bytes back (per-byte timeout keeps us from hanging).
+    for (int i = 0; i < len; i++) {
+        int b = stmReadByte(800);
+        if (b < 0) return false;
+        out[i] = (uint8_t)b;
+    }
+    return true;
+}
+
 // Go (0x21): jump to and run the application at `addr`.
 // NOTE: No longer used for launch (we now pulse NRST to cleanly boot the new app
 // via hardware reset). Kept for reference / optional AN3155 Go support.
@@ -698,6 +728,44 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
             vTaskDelay(1);  // let other FreeRTOS tasks run (also feeds WDT)
         }
         if (werr) { err = "STM32 write failed"; break; }
+
+        // ---- VERIFY PASS: read the flash back and compare to the image ----
+        // Per-chunk ACKs prove the ROM ACCEPTED each packet, not that the bytes
+        // landed correctly in flash. Reading it back and comparing is the
+        // definitive proof. We read in 256-byte chunks and memcmp against `fw`.
+        show_firmware_progress("STM32", 96, "Verifying...");
+        ESP_LOGI(TAG, "VERIFY: reading %u bytes back from flash to compare...",
+                 (unsigned)len);
+        uint32_t vaddr = STM32_FLASH_BASE;
+        size_t vdone = 0;
+        uint8_t vbuf[256];
+        bool verr = false;
+        while (vdone < len) {
+            size_t remain = len - vdone;
+            int r = (remain > sizeof(vbuf)) ? (int)sizeof(vbuf) : (int)remain;
+            // Read Memory (0x11) is byte-granular, so read exactly `r` bytes.
+            if (!stmReadChunk(vaddr, vbuf, r)) {
+                ESP_LOGE(TAG, "VERIFY: read-back FAILED at offset %u (ROM did not "
+                              "return data)", (unsigned)vdone);
+                verr = true; break;
+            }
+            if (memcmp(vbuf, fw + vdone, r) != 0) {
+                // Find the first differing byte for a precise diagnostic.
+                int off = 0;
+                while (off < r && vbuf[off] == fw[vdone + off]) off++;
+                ESP_LOGE(TAG, "VERIFY: MISMATCH at 0x%08lX (offset %u): "
+                              "flash=0x%02X expected=0x%02X",
+                         (unsigned long)(vaddr + off), (unsigned)(vdone + off),
+                         vbuf[off], fw[vdone + off]);
+                verr = true; break;
+            }
+            vaddr += r;
+            vdone += r;
+            vTaskDelay(1);  // feed the WDT / yield
+        }
+        if (verr) { err = "STM32 verify failed (flash does not match image)"; break; }
+        ESP_LOGI(TAG, "VERIFY OK: all %u bytes read back match the image. "
+                      "Flash is confirmed correct.", (unsigned)len);
         ok = true;
     } while (0);
 
