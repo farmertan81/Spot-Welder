@@ -4817,15 +4817,18 @@ int main(void) {
     MX_I2C1_Init(); /* I2C1 for INA226 sensors – graceful, no hang */
     MX_USART1_UART_Init();
 
-    /* Report the boot-time TAMP value now that the UART is up. On a normal
-     * power-on this should be 0x00000000 (no bootloader request). If it shows
-     * the magic 0xB00710AD here it means the early-boot jump was skipped. */
-    {
-        char dbg[64];
-        snprintf(dbg, sizeof(dbg), "DBG,Boot: TAMP register = 0x%08lX",
+    /* Bootloader-request diagnostic. The PRIMARY mechanism is now the .noinit
+     * SRAM marker (g_bootloader_marker); the TAMP register is only a fallback for
+     * boards with VBAT wired (it reads 0x00000000 on this WeAct board, which is
+     * EXPECTED and fine - the SRAM marker carries the request instead). On a
+     * normal boot neither is set and we land here. This single line is only
+     * emitted if something looks off, so a clean boot is quiet. */
+    if (g_boot_tamp_value != 0) {
+        char dbg[72];
+        snprintf(dbg, sizeof(dbg),
+                 "DBG,Boot: unexpected TAMP=0x%08lX (early jump skipped?)",
                  (unsigned long)g_boot_tamp_value);
         uartSend(dbg);
-        uartSend("DBG,Boot: No magic - normal boot");
     }
 
     persistent_defaults(&g_persistent_settings);
@@ -4926,7 +4929,7 @@ int main(void) {
     uartSend("***  NEW FIRMWARE RUNNING: noinit-marker-reset    ***");
     uartSend("***  If you see THIS banner, the wired flash TOOK ***");
     uartSend("*****************************************************");
-    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v3");
+    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v4-WIRELESS-TEST");
 
     {
         char boot_mode_msg[32];
