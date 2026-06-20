@@ -43,10 +43,17 @@ _Min_Heap_Size = 0x200; /* required amount of heap */
 _Min_Stack_Size = 0x1000; /* required amount of stack (4KB) */
 
 /* Memories definition */
+/* NOTE: The first 8 KiB of flash (0x08000000 .. 0x08001FFF) is reserved for the
+ * Katapult bootloader. The welder application is therefore linked to start at
+ * 0x08002000 (FLASH ORIGIN below) and its usable flash is 512K - 8K = 0x7E000.
+ * Katapult launches this app and sets SCB->VTOR to 0x08002000 before jumping;
+ * the app additionally re-asserts VTOR = 0x08002000 at the top of main() as a
+ * safety measure. The settings/EEPROM page at 0x0807F800 (last 2 KiB page) is
+ * unaffected (it lives at the very end of flash, well above the app). */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 128K
-  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 512K
+  FLASH    (rx)    : ORIGIN = 0x8002000,   LENGTH = 0x7E000
 }
 
 /* Sections */

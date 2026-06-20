@@ -22,6 +22,7 @@ static void i2c_bus_recovery(void);
 static void uartSend(const char* s);
 static void jumpToBootloader(void);
 static void requestBootloaderReset(void);
+static void requestKatapultReset(void);
 static inline void pwmOff(void);
 static inline void pwmOnDuty(uint16_t duty);
 static void clampParams(void);
@@ -4155,12 +4156,12 @@ static void parseCommand(char* line) {
          * which then calls jumpToBootloader() to remap system memory and jump to
          * the ROM at 0x1FFF0000. This reaches the ROM bootloader with NO reliance
          * on the BOOT0 pin at all. */
-        uartSend("DBG,BOOTLOADER command received -> NOINIT-MARKER warm-reset ROM "
-                 "entry (new firmware, BOOT0 pin not required)");
+        uartSend("DBG,BOOTLOADER command received -> requesting KATAPULT bootloader "
+                 "entry (2-wire flash on USART1 PA9/PA10, no BOOT0/NRST needed)");
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
-        requestBootloaderReset();   /* sets TAMP magic + NVIC_SystemReset(); no return */
+        requestKatapultReset();     /* sets Katapult request signature + reset; no return */
         return;                     /* unreachable */
     }
 
@@ -4780,12 +4781,67 @@ static void requestBootloaderReset(void) {
     }
 }
 
+/* Request entry into the KATAPULT bootloader (the in-flash bootloader installed
+ * at 0x08000000, ahead of this application at 0x08002000).
+ *
+ * This is the modern, bulletproof replacement for the ROM-bootloader dance.
+ * Katapult exposes its firmware-update mode on USART1 (PA9/PA10) at the same two
+ * wires the ESP32 already uses for data - NO BOOT0 pin, NO NRST pulse, NO 8E1
+ * parity switch. Katapult also CRC-checks the application on every boot and will
+ * refuse to launch a corrupt/half-flashed image, so an interrupted update can
+ * never brick the board (it simply stays in the bootloader waiting for a retry).
+ *
+ * Entry protocol (identical to Katapult's own try_request_canboot()):
+ *   1. The first word of Katapult's vector table (@0x08000000) is its initial
+ *      stack pointer, which is also the RAM address where Katapult reads its
+ *      "bootup code" request signature after a reset.
+ *   2. We write the 64-bit REQUEST_CANBOOT magic there.
+ *   3. NVIC_SystemReset(). On the ensuing reset Katapult runs first, sees the
+ *      magic, clears it, and stays in its USART1 update loop instead of
+ *      launching the app. The ESP32 then flashes new firmware over the 2 wires.
+ *
+ * Recovery layers if anything ever goes wrong: (a) double-tap NRST enters
+ * Katapult too; (b) the STM32 ROM USB-DFU (BOOT0 high, USB on PA11/PA12) can
+ * reflash via STM32CubeProgrammer; (c) ST-Link/SWD can always reflash both the
+ * bootloader and the app. This does NOT return. */
+#define KATAPULT_FLASH_BOOT_ADDRESS  0x08000000UL
+#define KATAPULT_REQUEST_CANBOOT     0x5984E3FA6CA1589BULL
+
+static void requestKatapultReset(void) {
+    /* Katapult's vector table sits at the start of flash; word[0] is the initial
+     * SP value, which is the RAM address Katapult uses for its request signature. */
+    volatile uint32_t *bl_vectors = (volatile uint32_t *)KATAPULT_FLASH_BOOT_ADDRESS;
+    volatile uint64_t *req_sig    = (volatile uint64_t *)(uintptr_t)bl_vectors[0];
+
+    __disable_irq();
+    *req_sig = KATAPULT_REQUEST_CANBOOT;
+    __DSB();
+
+    /* Warm reset -> Katapult runs, detects the signature, enters its USART1
+     * firmware-update loop. */
+    NVIC_SystemReset();
+
+    /* Unreachable. */
+    while (1) {
+    }
+}
+
 /* Boot-time snapshot of the TAMP backup register, captured before it is
  * cleared. Emitted over UART once the UART is initialised so the host can see
  * exactly what value survived the reset on a normal (no-magic) boot. */
 static uint32_t g_boot_tamp_value = 0;
 
 int main(void) {
+    /* KATAPULT BOOTLOADER RELOCATION: this application is linked to start at
+     * 0x08002000 (the first 8 KiB of flash holds the Katapult bootloader).
+     * Re-assert the vector table offset here so all interrupt vectors resolve
+     * to the application's table, regardless of how we were entered. Katapult
+     * already sets VTOR before jumping, but doing it again is harmless and makes
+     * the app robust even if launched by other means. Must run before any IRQ
+     * is enabled (HAL_Init() below configures SysTick). */
+    SCB->VTOR = 0x08002000U;
+    __DSB();
+
     /* Disable the UCPD "dead battery" pull-down behavior at the very start.
      * After reset the STM32G4 enables ~5.1k Rd pull-downs on the UCPD1_CC1 and
      * UCPD1_CC2 pins (PB6 and PB4 on this package - see RM0440 Table, PWR_CR3
@@ -4985,7 +5041,7 @@ int main(void) {
     uartSend("***  NEW FIRMWARE RUNNING: noinit-marker-reset    ***");
     uartSend("***  If you see THIS banner, the wired flash TOOK ***");
     uartSend("*****************************************************");
-    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v5-BOOT0-DRIVE-TEST");
+    uartSend("BOOT,FW=KATAPULT-APP-v6-RELOCATED-0x08002000");
 
     {
         char boot_mode_msg[32];

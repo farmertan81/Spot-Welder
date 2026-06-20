@@ -1,0 +1,53 @@
+--- src/stm32/Kconfig.bak	2026-06-20 14:15:17.869033329 +0000
++++ src/stm32/Kconfig	2026-06-20 14:15:43.274638185 +0000
+@@ -75,6 +75,9 @@
+     config MACH_STM32G431
+         bool "STM32G431"
+         select MACH_STM32G4
++    config MACH_STM32G474
++        bool "STM32G474"
++        select MACH_STM32G4
+     config MACH_STM32H723
+         bool "STM32H723"
+         select MACH_STM32H7
+@@ -147,6 +150,7 @@
+     default "stm32g0b0xx" if MACH_STM32G0B0
+     default "stm32g0b1xx" if MACH_STM32G0B1
+     default "stm32g431xx" if MACH_STM32G431
++    default "stm32g474xx" if MACH_STM32G474
+     default "stm32h723xx" if MACH_STM32H723
+     default "stm32h743xx" if MACH_STM32H743
+     default "stm32h750xx" if MACH_STM32H750
+@@ -163,6 +167,7 @@
+     default 180000000 if MACH_STM32F446
+     default 64000000 if MACH_STM32G0
+     default 150000000 if MACH_STM32G431
++    default 170000000 if MACH_STM32G474
+     default 400000000 if MACH_STM32H7 && !MACH_STM32H750
+     default 480000000 if MACH_STM32H750
+     default 80000000 if MACH_STM32L412
+@@ -176,6 +181,7 @@
+     default 0x40000 if MACH_STM32F2 || MACH_STM32F401 || MACH_STM32H723
+     default 0x80000 if MACH_STM32F4x5 || MACH_STM32F446
+     default 0x20000 if MACH_STM32G0 || MACH_STM32G431
++    default 0x80000 if MACH_STM32G474
+     default 0x20000 if MACH_STM32H750
+     default 0x200000 if MACH_STM32H743
+ 
+@@ -196,6 +202,7 @@
+     default 0x2800 if MACH_STM32F103x6
+     default 0x5000 if MACH_STM32F103 && !MACH_STM32F103x6 # Ram size of stm32f103x8
+     default 0x8000 if MACH_STM32G431
++    default 0x20000 if MACH_STM32G474
+     default 0xa000 if MACH_STM32L412
+     default 0x20000 if MACH_STM32F207
+     default 0x10000 if MACH_STM32F401
+@@ -242,7 +249,7 @@
+     config STM32_FLASH_START_7000
+         bool "28KiB bootloader" if MACH_STM32F103
+     config STM32_FLASH_START_8000
+-        bool "32KiB bootloader" if MACH_STM32F1 || MACH_STM32F2 || MACH_STM32F4 || MACH_STM32H750
++        bool "32KiB bootloader" if MACH_STM32F1 || MACH_STM32F2 || MACH_STM32F4 || MACH_STM32H750 || MACH_STM32G4
+     config STM32_FLASH_START_8800
+         bool "34KiB bootloader (Chitu v6 Bootloader)" if MACH_STM32F103
+     config STM32_FLASH_START_20200
