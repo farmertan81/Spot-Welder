@@ -61,6 +61,27 @@ static const uint8_t STM_ACK  = 0x79;
 static const uint8_t STM_NACK = 0x1F;
 #define STM32_FLASH_BASE 0x08000000UL
 
+// ---- Katapult bootloader constants ----
+#define KATAPULT_BAUD        250000   // Katapult USART1 baud rate
+#define KATAPULT_HEADER1     0x01
+#define KATAPULT_HEADER2     0x88
+#define KATAPULT_TRAILER1    0x99
+#define KATAPULT_TRAILER2    0x03
+
+// Katapult command IDs
+#define KATAPULT_CMD_CONNECT      0x11
+#define KATAPULT_CMD_SEND_BLOCK   0x12
+#define KATAPULT_CMD_SEND_EOF     0x13
+#define KATAPULT_CMD_REQUEST_BLOCK 0x14
+#define KATAPULT_CMD_COMPLETE     0x15
+#define KATAPULT_CMD_GET_CANBUS_ID 0x16
+
+// Katapult response codes
+#define KATAPULT_RESP_ACK         0xf0
+#define KATAPULT_RESP_NACK        0xf1
+#define KATAPULT_RESP_CMD_ERROR   0xf2
+#define KATAPULT_RESP_CMD_BUSY    0xf3
+
 // Implemented in welder_main.cpp: parks stm32_task at its safe pause point and
 // quiets the LCD bus before we take over UART_NUM_1.
 extern "C" void welder_prep_stm32_flash(void);
@@ -623,6 +644,356 @@ static bool stm32_enter_bootloader_hardware(void) {
 // Worker: programs the STM32 from the in-RAM image. Returns true on success and
 // writes a short result string to `msg`. Does NOT free the buffer or reboot —
 // the task wrapper owns that.
+// ============================================================
+//  KATAPULT BOOTLOADER PROTOCOL (CRC-16-CCITT + framing)
+// ============================================================
+
+// CRC-16-CCITT (polynomial 0x1021, init 0xFFFF) - standard for Katapult protocol
+static IRAM_ATTR uint16_t katapult_crc16(const uint8_t *data, size_t len) {
+    uint16_t crc = 0xFFFF;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int bit = 0; bit < 8; bit++) {
+            if (crc & 0x8000)
+                crc = (crc << 1) ^ 0x1021;
+            else
+                crc = crc << 1;
+        }
+    }
+    return crc;
+}
+
+// Send a Katapult command frame:
+// <0x01 0x88> <cmd> <payload_word_len> <payload> <crc16_hi> <crc16_lo> <0x99 0x03>
+// payload_word_len = number of 4-byte words in payload (not byte count!)
+static IRAM_ATTR bool katapult_send_command(uint8_t cmd, const uint8_t *payload,
+                                             size_t payload_bytes) {
+    uint8_t frame[512];  // max Katapult frame
+    if (payload_bytes > sizeof(frame) - 8) {
+        ESP_LOGE(TAG, "Katapult payload too large: %u bytes", (unsigned)payload_bytes);
+        return false;
+    }
+
+    // Payload must be a multiple of 4 bytes (Katapult uses word length)
+    if (payload_bytes % 4 != 0) {
+        ESP_LOGE(TAG, "Katapult payload not 4-byte aligned: %u bytes", (unsigned)payload_bytes);
+        return false;
+    }
+
+    size_t idx = 0;
+    frame[idx++] = KATAPULT_HEADER1;  // 0x01
+    frame[idx++] = KATAPULT_HEADER2;  // 0x88
+    frame[idx++] = cmd;
+    frame[idx++] = (uint8_t)(payload_bytes / 4);  // word count
+    
+    if (payload && payload_bytes > 0) {
+        memcpy(frame + idx, payload, payload_bytes);
+        idx += payload_bytes;
+    }
+
+    // CRC covers: cmd + word_len + payload
+    uint16_t crc = katapult_crc16(frame + 2, idx - 2);
+    frame[idx++] = (uint8_t)(crc >> 8);    // CRC high byte
+    frame[idx++] = (uint8_t)(crc & 0xFF);  // CRC low byte
+    frame[idx++] = KATAPULT_TRAILER1;  // 0x99
+    frame[idx++] = KATAPULT_TRAILER2;  // 0x03
+
+    stmWrite(frame, idx);
+    stmFlushTx();
+    return true;
+}
+
+// Receive a Katapult response frame.
+// Returns: response command ID (0x11, 0xf0, 0xf1, etc.) on success, or 0 on timeout/error
+// If payload_out is non-NULL, copies response payload there (max payload_max bytes)
+// Sets *payload_len_out to actual payload byte count
+static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t payload_max,
+                                                 size_t *payload_len_out, int timeout_ms) {
+    uint8_t frame[512];
+    size_t idx = 0;
+
+    // Read header (0x01 0x88)
+    int b = stmReadByte(timeout_ms);
+    if (b < 0 || (uint8_t)b != KATAPULT_HEADER1) {
+        ESP_LOGW(TAG, "Katapult: no header1 (timeout or wrong byte)");
+        return 0;
+    }
+    frame[idx++] = (uint8_t)b;
+
+    b = stmReadByte(timeout_ms);
+    if (b < 0 || (uint8_t)b != KATAPULT_HEADER2) {
+        ESP_LOGW(TAG, "Katapult: no header2");
+        return 0;
+    }
+    frame[idx++] = (uint8_t)b;
+
+    // Read cmd
+    b = stmReadByte(timeout_ms);
+    if (b < 0) {
+        ESP_LOGW(TAG, "Katapult: timeout reading cmd");
+        return 0;
+    }
+    uint8_t resp_cmd = (uint8_t)b;
+    frame[idx++] = resp_cmd;
+
+    // Read word_len
+    b = stmReadByte(timeout_ms);
+    if (b < 0) {
+        ESP_LOGW(TAG, "Katapult: timeout reading word_len");
+        return 0;
+    }
+    uint8_t word_len = (uint8_t)b;
+    frame[idx++] = word_len;
+    size_t payload_bytes = (size_t)word_len * 4;
+
+    if (payload_bytes > sizeof(frame) - 8) {
+        ESP_LOGE(TAG, "Katapult: payload too large: %u bytes", (unsigned)payload_bytes);
+        return 0;
+    }
+
+    // Read payload
+    for (size_t i = 0; i < payload_bytes; i++) {
+        b = stmReadByte(timeout_ms);
+        if (b < 0) {
+            ESP_LOGW(TAG, "Katapult: timeout reading payload byte %u/%u", (unsigned)i, (unsigned)payload_bytes);
+            return 0;
+        }
+        frame[idx++] = (uint8_t)b;
+    }
+
+    // Read CRC (2 bytes)
+    int crc_hi = stmReadByte(timeout_ms);
+    int crc_lo = stmReadByte(timeout_ms);
+    if (crc_hi < 0 || crc_lo < 0) {
+        ESP_LOGW(TAG, "Katapult: timeout reading CRC");
+        return 0;
+    }
+    uint16_t rx_crc = ((uint16_t)crc_hi << 8) | (uint16_t)crc_lo;
+
+    // Read trailer (0x99 0x03)
+    int t1 = stmReadByte(timeout_ms);
+    int t2 = stmReadByte(timeout_ms);
+    if (t1 < 0 || t2 < 0) {
+        ESP_LOGW(TAG, "Katapult: timeout reading trailer");
+        return 0;
+    }
+    if ((uint8_t)t1 != KATAPULT_TRAILER1 || (uint8_t)t2 != KATAPULT_TRAILER2) {
+        ESP_LOGE(TAG, "Katapult: bad trailer: 0x%02X 0x%02X (want 0x99 0x03)", (uint8_t)t1, (uint8_t)t2);
+        return 0;
+    }
+
+    // Verify CRC (covers cmd + word_len + payload, starting at frame[2])
+    uint16_t calc_crc = katapult_crc16(frame + 2, idx - 2);
+    if (calc_crc != rx_crc) {
+        ESP_LOGE(TAG, "Katapult: CRC mismatch: rx=0x%04X calc=0x%04X", rx_crc, calc_crc);
+        return 0;
+    }
+
+    // Copy payload to caller's buffer
+    if (payload_out && payload_bytes > 0) {
+        size_t to_copy = (payload_bytes < payload_max) ? payload_bytes : payload_max;
+        memcpy(payload_out, frame + 4, to_copy);
+    }
+    if (payload_len_out) {
+        *payload_len_out = payload_bytes;
+    }
+
+    return resp_cmd;
+}
+
+// ============================================================
+//  KATAPULT FLASH WORKER
+// ============================================================
+
+// Flash via Katapult bootloader (250000 8N1, CRC-checked block protocol)
+static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) {
+    bool ok = false;
+    const char *err = NULL;
+    uint32_t app_start = 0;
+    uint32_t block_size = 0;
+
+    do {
+        // 1) Send BOOTLOADER command to the running app @ 1Mbaud 8N1
+        ESP_LOGI(TAG, "Katapult: requesting app to enter bootloader via 'BOOTLOADER' command @1Mbaud 8N1");
+        uart_set_baudrate(STM_BOOT_UART, STM_APP_BAUD);
+        uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
+        uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);
+        uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+        uart_flush_input(STM_BOOT_UART);
+        
+        const char *bootloader_cmd = "BOOTLOADER\n";
+        uart_write_bytes(STM_BOOT_UART, bootloader_cmd, strlen(bootloader_cmd));
+        uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+
+        // 2) Wait 100ms for the app to reset into Katapult, then switch to 250k 8N1
+        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGI(TAG, "Katapult: switching to 250000 8N1 (bootloader baud)");
+        uart_set_baudrate(STM_BOOT_UART, KATAPULT_BAUD);
+        uart_flush_input(STM_BOOT_UART);
+        vTaskDelay(pdMS_TO_TICKS(50));
+
+        // 3) Send CONNECT command
+        ESP_LOGI(TAG, "Katapult: sending CONNECT");
+        show_firmware_progress("STM32", 2, "Connecting to bootloader...");
+        if (!katapult_send_command(KATAPULT_CMD_CONNECT, NULL, 0)) {
+            err = "Failed to send CONNECT";
+            break;
+        }
+
+        // 4) Receive CONNECT response
+        uint8_t connect_resp[64];
+        size_t resp_len = 0;
+        uint8_t resp_cmd = katapult_recv_response(connect_resp, sizeof(connect_resp), &resp_len, 1000);
+        
+        if (resp_cmd != KATAPULT_CMD_CONNECT) {
+            if (resp_cmd == KATAPULT_RESP_NACK) {
+                err = "Katapult CONNECT: received NACK";
+            } else if (resp_cmd == 0) {
+                err = "Katapult CONNECT: timeout or frame error";
+            } else {
+                snprintf(msg, msgn, "Katapult CONNECT: unexpected response 0x%02X", resp_cmd);
+                err = msg;
+            }
+            break;
+        }
+
+        // Parse CONNECT response: protocol_ver(1B) + app_start(4B) + block_size(4B) + mcu_type(16B) + version(16B)
+        if (resp_len < 9) {
+            snprintf(msg, msgn, "Katapult CONNECT response too short: %u bytes", (unsigned)resp_len);
+            err = msg;
+            break;
+        }
+
+        uint8_t proto_ver = connect_resp[0];
+        app_start = ((uint32_t)connect_resp[1] << 24) | ((uint32_t)connect_resp[2] << 16) |
+                    ((uint32_t)connect_resp[3] << 8)  | connect_resp[4];
+        block_size = ((uint32_t)connect_resp[5] << 24) | ((uint32_t)connect_resp[6] << 16) |
+                     ((uint32_t)connect_resp[7] << 8)  | connect_resp[8];
+
+        ESP_LOGI(TAG, "Katapult CONNECT OK: proto_ver=%u, app_start=0x%08lX, block_size=%lu",
+                 proto_ver, (unsigned long)app_start, (unsigned long)block_size);
+
+        if (app_start != 0x08002000) {
+            snprintf(msg, msgn, "Katapult app_start mismatch: 0x%08lX (expected 0x08002000)",
+                     (unsigned long)app_start);
+            err = msg;
+            break;
+        }
+
+        if (block_size == 0 || block_size > 1024) {
+            snprintf(msg, msgn, "Katapult block_size invalid: %lu", (unsigned long)block_size);
+            err = msg;
+            break;
+        }
+
+        // 5) Send firmware in blocks (SEND_BLOCK commands)
+        show_firmware_progress("STM32", 5, "Writing firmware...");
+        ESP_LOGI(TAG, "Katapult: flashing %u bytes in %lu-byte blocks", (unsigned)len, (unsigned long)block_size);
+        
+        size_t done = 0;
+        int last_pct = 5;
+        while (done < len) {
+            size_t remain = len - done;
+            size_t chunk = (remain < block_size) ? remain : block_size;
+
+            // Pad to 4-byte boundary
+            uint8_t block_buf[1024 + 4];
+            memcpy(block_buf + 4, fw + done, chunk);
+            size_t padded = chunk;
+            while (padded % 4) {
+                block_buf[4 + padded] = 0xFF;
+                padded++;
+            }
+
+            // Build payload: block_address (4 bytes) + block_data
+            uint32_t block_addr = app_start + done;
+            block_buf[0] = (uint8_t)(block_addr >> 24);
+            block_buf[1] = (uint8_t)(block_addr >> 16);
+            block_buf[2] = (uint8_t)(block_addr >> 8);
+            block_buf[3] = (uint8_t)(block_addr & 0xFF);
+
+            if (!katapult_send_command(KATAPULT_CMD_SEND_BLOCK, block_buf, 4 + padded)) {
+                snprintf(msg, msgn, "Failed to send SEND_BLOCK at offset %u", (unsigned)done);
+                err = msg;
+                break;
+            }
+
+            // Wait for ACK
+            uint8_t ack_resp = katapult_recv_response(NULL, 0, NULL, 1000);
+            if (ack_resp != KATAPULT_RESP_ACK) {
+                if (ack_resp == KATAPULT_RESP_NACK) {
+                    snprintf(msg, msgn, "Katapult SEND_BLOCK NACK at offset %u", (unsigned)done);
+                } else if (ack_resp == KATAPULT_RESP_CMD_ERROR) {
+                    snprintf(msg, msgn, "Katapult SEND_BLOCK error at offset %u", (unsigned)done);
+                } else {
+                    snprintf(msg, msgn, "Katapult SEND_BLOCK unexpected response 0x%02X at offset %u",
+                             ack_resp, (unsigned)done);
+                }
+                err = msg;
+                break;
+            }
+
+            done += chunk;
+
+            // Update progress (5% → 85%)
+            int pct = 5 + (int)((done * 80) / len);
+            if (pct > 85) pct = 85;
+            if (pct >= last_pct + 10 || done >= len) {
+                last_pct = pct;
+                show_firmware_progress("STM32", pct, "Writing firmware...");
+            }
+            vTaskDelay(1);  // yield
+        }
+
+        if (err) break;
+
+        // 6) Send EOF
+        ESP_LOGI(TAG, "Katapult: sending SEND_EOF");
+        show_firmware_progress("STM32", 90, "Finalizing...");
+        if (!katapult_send_command(KATAPULT_CMD_SEND_EOF, NULL, 0)) {
+            err = "Failed to send SEND_EOF";
+            break;
+        }
+
+        uint8_t eof_resp = katapult_recv_response(NULL, 0, NULL, 1000);
+        if (eof_resp != KATAPULT_RESP_ACK) {
+            snprintf(msg, msgn, "Katapult SEND_EOF response 0x%02X (want ACK 0xf0)", eof_resp);
+            err = msg;
+            break;
+        }
+
+        // 7) Send COMPLETE
+        ESP_LOGI(TAG, "Katapult: sending COMPLETE");
+        show_firmware_progress("STM32", 95, "Completing flash...");
+        if (!katapult_send_command(KATAPULT_CMD_COMPLETE, NULL, 0)) {
+            err = "Failed to send COMPLETE";
+            break;
+        }
+
+        uint8_t complete_resp = katapult_recv_response(NULL, 0, NULL, 1000);
+        if (complete_resp != KATAPULT_RESP_ACK) {
+            snprintf(msg, msgn, "Katapult COMPLETE response 0x%02X (want ACK 0xf0)", complete_resp);
+            err = msg;
+            break;
+        }
+
+        ESP_LOGI(TAG, "Katapult flash complete! Katapult will now launch the app.");
+        ok = true;
+
+    } while (0);
+
+    if (!ok && !err) {
+        err = "Katapult flash failed (unknown error)";
+    }
+
+    snprintf(msg, msgn, "%s", ok ? "STM32 firmware updated via Katapult. Restarting..." : err);
+    return ok;
+}
+
+// ============================================================
+//  LEGACY AN3155 FLASH WORKER (kept for fallback/comparison)
+// ============================================================
+
 static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) {
     // 1) Park stm32_task and quiet the LCD bus (frees the UART + PSRAM bandwidth).
     welder_prep_stm32_flash();
@@ -858,7 +1229,12 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 // both sides come up on a clean, re-synced 1 Mbaud app link.
 static void stm32_flash_task(void *arg) {
     char msg[128] = {0};
-    bool ok = flash_worker(s_fw, s_len, msg, sizeof(msg));
+    
+    // Park stm32_task and quiet the LCD bus (frees UART + PSRAM bandwidth)
+    welder_prep_stm32_flash();
+    
+    // Use Katapult protocol (CRC-checked, 250k 8N1, no BOOT0/NRST needed)
+    bool ok = katapult_flash_worker(s_fw, s_len, msg, sizeof(msg));
 
     ESP_LOGI(TAG, "flash %s: %s", ok ? "OK" : "FAIL", msg);
     show_firmware_progress("STM32", 100,
