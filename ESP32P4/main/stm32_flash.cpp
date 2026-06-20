@@ -446,12 +446,12 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     // 2) Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader.
     gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(10));  // let BOOT0 settle before the reset
-    // DIAGNOSTIC: confirm the pin is actually driving HIGH (catches a broken /
-    // mis-configured GPIO before we blame the protocol).
-    int b0 = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
-    ESP_LOGI(TAG, "BOOT0 (GPIO%d) set HIGH, readback=%d %s", STM_BOOT0_PIN, b0,
-             b0 ? "(OK)" : "(FAILED — pin not driving high!)");
-    if (b0 != 1) {
+    // DIAGNOSTIC: confirm the pin is actually driving HIGH on the ESP pad (catches
+    // a broken/mis-configured GPIO before we blame the protocol).
+    int b0_pre = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
+    ESP_LOGI(TAG, "BOOT0 (GPIO%d) set HIGH, readback=%d %s", STM_BOOT0_PIN, b0_pre,
+             b0_pre ? "(OK on ESP pad)" : "(FAILED — ESP pad not high!)");
+    if (b0_pre != 1) {
         snprintf(msg, msgn, "BOOT0 (GPIO%d) cannot drive HIGH", STM_BOOT0_PIN);
         return false;
     }
@@ -471,6 +471,18 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
              nrst ? "(OK)" : "(FAILED — stuck low!)");
     if (nrst != 1) {
         snprintf(msg, msgn, "NRST (GPIO%d) stuck LOW after release", STM_NRST_PIN);
+        return false;
+    }
+    
+    // CRITICAL: re-check BOOT0 is STILL HIGH after the reset pulse. If it drooped
+    // to LOW during the 10ms reset window (due to weak drive, wire resistance, or
+    // capacitance), the STM32 sampled BOOT0=LOW and booted into (corrupt) app flash
+    // instead of the ROM bootloader -> explains complete USART1 silence.
+    int b0_post = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
+    ESP_LOGI(TAG, "BOOT0 re-check after reset: readback=%d %s", b0_post,
+             b0_post ? "(OK — held HIGH)" : "(FAILED — drooped to LOW!)");
+    if (b0_post != 1) {
+        snprintf(msg, msgn, "BOOT0 drooped LOW during reset (weak drive or bad wire)");
         return false;
     }
 

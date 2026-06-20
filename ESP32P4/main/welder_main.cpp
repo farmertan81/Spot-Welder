@@ -941,6 +941,10 @@ extern "C" void app_main(void)
     boot0.pull_down_en = GPIO_PULLDOWN_ENABLE;
     gpio_config(&boot0);
     gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
+    // CRITICAL: WeAct G474 has R2 10k pull-DOWN on PB8. Set GPIO31 to MAXIMUM
+    // drive strength (~20mA) to guarantee it overcomes the pulldown + any wire
+    // resistance and holds PB8 reliably HIGH during the reset pulse.
+    gpio_set_drive_capability((gpio_num_t)STM32_BOOT0_PIN, GPIO_DRIVE_CAP_3);
     // Dump GPIO31's IO-mux state: if it prints "**RESERVED**" the pin is owned
     // by the flash/PSRAM controller and CANNOT be used for BOOT0 (pick another).
     ESP_LOGI(TAG, "GPIO%d (BOOT0) set LOW; readback=%d, dumping IO config:",
