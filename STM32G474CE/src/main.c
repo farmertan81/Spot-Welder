@@ -4139,8 +4139,8 @@ static void parseCommand(char* line) {
          * which then calls jumpToBootloader() to remap system memory and jump to
          * the ROM at 0x1FFF0000. This reaches the ROM bootloader with NO reliance
          * on the BOOT0 pin at all. */
-        uartSend("DBG,BOOTLOADER command received -> software TAMP-magic ROM entry "
-                 "(BOOT0 pin not required)");
+        uartSend("DBG,BOOTLOADER command received -> NOINIT-MARKER warm-reset ROM "
+                 "entry (new firmware, BOOT0 pin not required)");
         HAL_Delay(20);
         uartSend("ACK,BOOTLOADER");
         HAL_Delay(50);              /* ensure the ACK is fully transmitted */
@@ -4922,7 +4922,11 @@ int main(void) {
      * running. If this line is missing after a flash, the flash did not take
      * (e.g. a BlackMagic ".data MIS-MATCHED" verify failure) -- re-flash with a
      * full chip erase. */
-    uartSend("BOOT,FW=cal-dblpulse-fix-2");
+    uartSend("*****************************************************");
+    uartSend("***  NEW FIRMWARE RUNNING: noinit-marker-reset    ***");
+    uartSend("***  If you see THIS banner, the wired flash TOOK ***");
+    uartSend("*****************************************************");
+    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v3");
 
     {
         char boot_mode_msg[32];
