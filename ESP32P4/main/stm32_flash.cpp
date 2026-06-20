@@ -411,11 +411,15 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
         return false;
     }
 
-    // 4) Let the STM32 ROM bootloader complete its startup. Per AN2606 Figure 58,
-    //    the ROM configures its 72MHz clock, GPIO, and peripherals, then enters
-    //    the polling loop. 50ms is generous (the ROM is ready in ~2ms, but this
-    //    matches the proven old-board timing and ensures we never race it).
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // 4) CRITICAL: The ROM bootloader polls USART→I2C→SPI→USB in sequence and
+    //    LOCKS onto the FIRST interface that shows activity (AN2606 Fig 58). If
+    //    there's noise on I2C/SPI/USB pins during our delay, the ROM locks onto
+    //    THAT interface and permanently ignores USART1 → complete silence. The
+    //    old board used a software jump (USART1 pre-selected), but the hardware
+    //    reset cold-boots the ROM → we must claim USART1 FAST (within 2ms) before
+    //    the ROM scans other interfaces. 10ms is the minimum safe delay (ROM is
+    //    ready in <2ms per AN2606, 10ms ensures clock/GPIO stable on all G4 revs).
+    vTaskDelay(pdMS_TO_TICKS(10));
 
     // 5) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
     //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
@@ -429,8 +433,11 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
     //     the failure is purely external (signal integrity or ROM interface lock).
     uart_loopback_selftest();
 
-    // 6) Settling delay after driver reinstall to ensure the UART is stable.
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // 6) NO settling delay — the ROM is polling interfaces RIGHT NOW and will lock
+    //    onto the first one with activity. We MUST send 0x7F immediately (driver
+    //    reinstall is <1ms, loopback added ~10ms, total ~20ms from NRST release).
+    //    The old 50ms delay gave other interfaces time to show noise → ROM locked
+    //    onto I2C/SPI/USB instead of USART1 → complete silence (proven by event log).
 
     // 7) Drain any residual bytes so the FIRST thing we actively send is a
     //    pristine 0x7F sync. Also clear the event queue so the error counts we
