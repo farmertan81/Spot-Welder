@@ -908,11 +908,29 @@ extern "C" void welder_prep_stm32_flash(void)
 {
     // 1) Park stm32_task at its cooperative pause point (no UART/mutex held).
     s_stm32_pause_req = true;
-    for (int i = 0; i < 100 && !s_stm32_paused; i++) {  // up to ~1 s
+    for (int i = 0; i < 300 && !s_stm32_paused; i++) {  // up to ~3 s
         vTaskDelay(pdMS_TO_TICKS(10));
     }
-    ESP_LOGI(TAG, "stm32_task %s for STM32 flash",
-             s_stm32_paused ? "parked" : "did NOT park in time (continuing)");
+    if (s_stm32_paused) {
+        ESP_LOGI(TAG, "stm32_task parked for STM32 flash");
+    } else {
+        // HARD FALLBACK: the task did not reach its cooperative pause point in
+        // time. If we proceed now, it keeps running its poll loop — sending
+        // READY,1/STATUS and calling uart_read_bytes on UART_NUM_1 — which
+        // INTERLEAVES with the BOOTLOADER command (so the STM32 never sees a
+        // clean token and never jumps) and STEALS the app's ACK reply. Force a
+        // hard suspend so nothing else can touch the UART. We are about to
+        // delete+reinstall the driver anyway, so suspending mid-read is safe.
+        if (s_stm32_task_handle) {
+            vTaskSuspend(s_stm32_task_handle);
+            s_stm32_paused = true;  // treat as parked for the rest of the flow
+            ESP_LOGW(TAG, "stm32_task did NOT park cooperatively -> HARD SUSPENDED "
+                          "to guarantee exclusive UART access");
+        } else {
+            ESP_LOGE(TAG, "stm32_task did NOT park and no handle to suspend — "
+                          "UART contention likely, flash may fail");
+        }
+    }
 
     // 2) Slow the LCD pixel clock to quiet the PSRAM bus during the flash.
     if (g_panel_handle) {
