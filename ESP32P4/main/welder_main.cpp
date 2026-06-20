@@ -1006,6 +1006,12 @@ extern "C" void app_main(void)
                       "on GPIO%d, the strap will never enter the ROM bootloader",
                  STM32_BOOT0_PIN);
 
+    // Release BOOT0 to Hi-Z now that the self-test is done. The board's 10k
+    // pulldown holds PB8 LOW (app mode) on its own, and releasing the line means
+    // the ESP is NOT fighting an attached ST-Link/SWD debugger on the shared
+    // strap. The flasher re-claims the pin only for the brief hardware pulse.
+    gpio_set_direction((gpio_num_t)STM32_BOOT0_PIN, GPIO_MODE_INPUT);
+
     // ---- NRST (hardware reset) init ----
     // NRST is active-LOW. The STM32 has an internal weak pull-up (~40k), but we
     // drive it HIGH explicitly from the ESP to guarantee a clean idle state. We
@@ -1031,6 +1037,14 @@ extern "C" void app_main(void)
     if (nrst_rb1 != 1)
         ESP_LOGE(TAG, "NRST cannot reach HIGH even at idle -> hard short to GND or "
                       "wrong pin. The STM32 will be stuck in reset.");
+
+    // Release NRST to Hi-Z now that the self-test is done. The STM32's internal
+    // ~40k pull-up holds NRST HIGH (not in reset) on its own. CRITICAL: this hands
+    // the reset line back to any attached ST-Link/SWD debugger. While the ESP held
+    // NRST as a strong push-pull HIGH, the ST-Link could not connect
+    // ("DEV_TARGET_HELD_UNDER_RESET") and SWD programming could be corrupted. The
+    // flasher re-claims NRST only for its brief reset pulses.
+    gpio_set_direction((gpio_num_t)STM32_NRST_PIN, GPIO_MODE_INPUT);
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();

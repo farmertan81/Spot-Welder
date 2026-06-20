@@ -206,7 +206,37 @@ core **fault and reset straight back into the app** — so it looked like the
 command "did nothing". The fix was the marker‑+‑warm‑reset‑+‑early‑jump dance in
 §4 Path A.
 
-### 6.5 Remote debugging latency
+### 6.5 The shared NRST/BOOT0 lines vs. the ST-Link (the wired-flash killer)
+
+When you still flash/debug the STM32 over **SWD with an ST-Link**, the ST-Link
+**also drives NRST**. The ESP was holding **NRST and BOOT0 as strong push-pull
+outputs at all times** (max drive, NRST idle-HIGH). So two masters fought over
+the reset line:
+
+- the ST-Link tried to pull NRST **low** to connect-under-reset, while
+- the ESP shoved NRST **high** at ~40 mA.
+
+The symptom is STM32CubeProgrammer's **`Error: ST-LINK error
+(DEV_TARGET_HELD_UNDER_RESET)`** — and it only goes away when you **disconnect
+the ESP**. Worse, this same contention can corrupt an SWD flash mid-program: a
+GDB/CubeProgrammer **verify shows some sections "matched" but e.g. `.data`
+"MIS-MATCHED!"**, because the ST-Link couldn't cleanly reset the target while the
+ESP was fighting it. That partial-write looks like a mysterious "one section
+won't take" bug but is really a **two-drivers-on-one-line hardware conflict**.
+
+**The fix:** the ESP now keeps **both NRST and BOOT0 high-impedance (Hi-Z input)
+whenever it is not mid-flash**, and only briefly drives them during its own
+hardware-entry / launch pulses (returning them to Hi-Z immediately after). The
+board's own pulls give the right idle state with the ESP off the lines:
+
+- BOOT0 (PB8): 10 kΩ board pulldown → floats LOW → app mode
+- NRST: STM32 internal ~40 kΩ pull-up → floats HIGH → not in reset
+
+With the lines released, the **ST-Link and the ESP can stay wired up at the same
+time** — no more `DEV_TARGET_HELD_UNDER_RESET`, and no more half-written SWD
+flashes.
+
+### 6.6 Remote debugging latency
 
 The assistant builds the STM32 firmware in a Linux VM (PlatformIO), but the
 **user builds and flashes on Windows** and reports back the serial logs. Every

@@ -496,6 +496,33 @@ static void report_uart_events(void) {
 // the app is unresponsive (e.g. already bricked).
 // ---------------------------------------------------------------------------
 
+// ============================================================
+//  BOOT0 / NRST line ownership  (avoid fighting an attached ST-Link)
+// ============================================================
+// The STM32's NRST and BOOT0 lines are shared: the on-board ST-Link/SWD debugger
+// also drives NRST. If the ESP holds these as strong push-pull outputs all the
+// time, the ST-Link can't connect ("DEV_TARGET_HELD_UNDER_RESET") and an attempt
+// to flash over SWD can be corrupted mid-program. So the ESP keeps both pins
+// HIGH-IMPEDANCE (input) whenever it is NOT mid-flash, and only briefly drives
+// them during its own hardware-entry / launch pulses. The board's own pulls give
+// the correct idle state with the ESP off the lines:
+//   BOOT0 (PB8): 10k board pulldown  -> floats LOW  -> app mode
+//   NRST       : STM32 internal pull-up -> floats HIGH -> not in reset
+// Drive a defined level, THEN switch to output, to avoid a glitch on the line.
+static inline void stm_pin_release(int pin) {
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT);   // Hi-Z: hand the line back
+}
+static inline void stm_pin_drive(int pin, int level) {
+    gpio_set_level((gpio_num_t)pin, level);
+    gpio_set_direction((gpio_num_t)pin, GPIO_MODE_INPUT_OUTPUT);
+    gpio_set_level((gpio_num_t)pin, level);
+}
+// Put both strap lines back to Hi-Z so an attached ST-Link can own NRST/BOOT0.
+static inline void stm_release_strap_lines(void) {
+    stm_pin_release(STM_BOOT0_PIN);
+    stm_pin_release(STM_NRST_PIN);
+}
+
 // PRIMARY: ask the running app (1Mbaud 8N1) to jump straight into the ROM.
 static bool stm32_enter_bootloader_software(void) {
     ESP_LOGI(TAG, "SOFTWARE bootloader entry: sending 'BOOTLOADER' to the running "
@@ -510,9 +537,10 @@ static bool stm32_enter_bootloader_software(void) {
     uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
     uart_flush_input(STM_BOOT_UART);
 
-    // Keep BOOT0/NRST passive (BOOT0 LOW so we don't fight anything; NRST HIGH).
-    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 0);
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
+    // Keep BOOT0/NRST fully Hi-Z: the software path never touches them, and
+    // releasing the lines means we don't fight an attached ST-Link. Board pulls
+    // hold BOOT0 LOW (app mode) and NRST HIGH (running) on their own.
+    stm_release_strap_lines();
 
     // The app accepts "BOOTLOADER" or "CMD,BOOTLOADER" (CR/LF tolerant). Send it
     // a couple of times in case a status line is mid-transmission.
@@ -553,15 +581,16 @@ static bool stm32_enter_bootloader_hardware(void) {
                   "(GPIO%d->BOOT0, GPIO%d->NRST)...", STM_BOOT0_PIN, STM_NRST_PIN);
     uart_flush_input(STM_BOOT_UART);
 
-    // a) Drive BOOT0 HIGH and let the strap settle BEFORE reset is released.
-    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
+    // a) CLAIM the strap lines (they idle Hi-Z so an ST-Link can use them), then
+    //    drive BOOT0 HIGH and let the strap settle BEFORE reset is released.
+    stm_pin_drive(STM_BOOT0_PIN, 1);
     vTaskDelay(pdMS_TO_TICKS(5));
     ESP_LOGI(TAG, "  BOOT0 driven HIGH, readback=%d",
              gpio_get_level((gpio_num_t)STM_BOOT0_PIN));
 
     // b) Pulse NRST LOW->HIGH. BOOT0 stays HIGH so the chip would latch "boot
     //    from System memory" at the reset edge (IF the pin is honored).
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
+    stm_pin_drive(STM_NRST_PIN, 0);
     vTaskDelay(pdMS_TO_TICKS(20));
     gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
     // Multi-sample NRST as it comes back up (RC cap on the WeAct board).
@@ -792,24 +821,32 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
         ok = true;
     } while (0);
 
-    // 5) Drop BOOT0 LOW so the next reset boots the (new) application, not ROM.
-    //    Done unconditionally so a failed flash never leaves the STM32 in DFU.
-    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 0);
+    // 5) Release BOOT0 to Hi-Z: the board's 10k pulldown holds it LOW so the next
+    //    reset boots the (new) application, not ROM. Releasing (vs driving low)
+    //    also hands the line back to any attached ST-Link. Done unconditionally so
+    //    a failed flash never leaves the STM32 in DFU.
+    stm_pin_release(STM_BOOT0_PIN);
     vTaskDelay(pdMS_TO_TICKS(5));  // let the BOOT0 strap settle LOW before reset
 
     // 6) Launch the freshly written app with a CLEAN HARDWARE RESET (BOOT0 is now
     //    LOW, so the chip boots from main flash 0x08000000). A NRST pulse is far
     //    more reliable than the AN3155 "Go" command, which can leave ROM-configured
-    //    peripherals/clocks in a bad state for the new app. We have the NRST wire,
-    //    so use it. Done on success only — on failure we leave the chip in ROM
-    //    (BOOT0 already LOW) so the ESP reboot below can retry cleanly.
+    //    peripherals/clocks in a bad state for the new app. We drive NRST LOW to
+    //    assert reset, then RELEASE to Hi-Z so the STM32's internal pull-up brings
+    //    it back HIGH. Done on success only — on failure we leave the chip in ROM
+    //    so the ESP reboot below can retry cleanly.
     if (ok) {
         show_firmware_progress("STM32", 98, "Launching...");
-        gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
+        stm_pin_drive(STM_NRST_PIN, 0);    // assert reset
         vTaskDelay(pdMS_TO_TICKS(20));
-        gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
-        ESP_LOGI(TAG, "New app launched via NRST pulse (BOOT0 LOW).");
+        stm_pin_release(STM_NRST_PIN);     // release: pull-up raises NRST HIGH
+        ESP_LOGI(TAG, "New app launched via NRST pulse (BOOT0 released LOW).");
     }
+
+    // 7) ALWAYS finish with BOTH strap lines Hi-Z so an attached ST-Link/SWD
+    //    debugger can fully own NRST/BOOT0 (no DEV_TARGET_HELD_UNDER_RESET, no
+    //    corrupted SWD programming) even after a failed flash.
+    stm_release_strap_lines();
 
     snprintf(msg, msgn, "%s",
              ok ? "STM32 firmware updated. Restarting..."
