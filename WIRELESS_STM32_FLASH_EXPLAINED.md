@@ -284,6 +284,26 @@ Reading the result:
 3. Report the `DBG,BL breadcrumb: ... stage N/3` line. That single line tells us
    exactly which sub‑problem to fix next.
 
+### Stage 3 revealed the answer → the BOOT0 fix
+
+Field testing showed **stage 3/3** — the jump to ROM executed successfully, but
+the ROM stayed silent on USART1. The ESP received bytes (`0x00`, `0x1B`) but not
+the `0x79` ACK.
+
+**Root cause:** the ROM bootloader **checks BOOT0 when it starts**, even if we
+jumped to it via VTOR/MSP. If BOOT0 is LOW the ROM either:
+- exits back to app mode immediately (thinking "no bootloader requested"), OR
+- waits on USB/I2C instead of USART1 (based on pin sampling per AN2606).
+
+**The fix:** before the warm reset in `requestBootloaderReset()`, the STM32 app
+now **drives PB8 (BOOT0) HIGH** via GPIO push‑pull output. The 10 kΩ board
+pulldown on PB8 is easily overcome by a strong (20 mA+) GPIO drive. When the ROM
+starts it samples BOOT0=HIGH → "bootloader mode requested" → stays in ROM and
+responds on USART1 @ 115200 8E1.
+
+This fix makes the **software 2‑wire path fully functional** — no ESP BOOT0/NRST
+wires needed, the STM32 drives its own BOOT0 internally before the reset.
+
 ---
 
 ## 8. Quick reference

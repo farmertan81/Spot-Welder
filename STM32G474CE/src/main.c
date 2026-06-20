@@ -4755,6 +4755,21 @@ static void requestBootloaderReset(void) {
     uartSend("DBG,Wireless flash: marker set, resetting into ROM bootloader...");
     HAL_Delay(50);  /* let the debug line flush out of the UART before reset */
 
+    /* CRITICAL FIX (stage-3 breadcrumb diagnostic): the ROM bootloader checks
+     * BOOT0 when it starts, even if we jumped to it via VTOR. If BOOT0 is LOW
+     * the ROM might exit back to app mode immediately. Drive PB8 (BOOT0) HIGH
+     * before the reset so the ROM sees "bootloader mode requested" and stays.
+     * The 10k board pulldown on PB8 is easily overcome by a strong push-pull GPIO. */
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    GPIO_InitTypeDef boot0 = {0};
+    boot0.Pin = GPIO_PIN_8;
+    boot0.Mode = GPIO_MODE_OUTPUT_PP;
+    boot0.Pull = GPIO_NOPULL;
+    boot0.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    HAL_GPIO_Init(GPIOB, &boot0);
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);  /* BOOT0 = HIGH */
+    __DSB();  /* ensure the write commits before reset */
+
     /* Warm reset. This also STOPS the IWDG (software watchdog mode), so the ROM
      * bootloader will run with no active watchdog. On reboot the early-main check
      * sees the marker and calls jumpToBootloader() from the clean HSI context. */
@@ -4970,7 +4985,7 @@ int main(void) {
     uartSend("***  NEW FIRMWARE RUNNING: noinit-marker-reset    ***");
     uartSend("***  If you see THIS banner, the wired flash TOOK ***");
     uartSend("*****************************************************");
-    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v4-WIRELESS-TEST");
+    uartSend("BOOT,FW=NOINIT-MARKER-RESET-v5-BOOT0-DRIVE-TEST");
 
     {
         char boot_mode_msg[32];
