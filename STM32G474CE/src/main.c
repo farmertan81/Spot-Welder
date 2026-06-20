@@ -4644,6 +4644,22 @@ static void jumpToBootloader(void) {
     SysTick->LOAD = 0;
     SysTick->VAL  = 0;
 
+    /* CRITICAL FIX: Pull USB D+/D- (PA11/PA12) LOW to disable USB enumeration.
+     * If VBUS is floating HIGH (board design issue or leakage), the ROM bootloader
+     * sees it and waits for USB, completely ignoring USART1. Forcing D+/D- LOW
+     * prevents enumeration even if VBUS is high, so the ROM falls back to USART1.
+     * This must happen BEFORE HAL_RCC_DeInit() (which disables GPIO clocks). */
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef usbDisable = {0};
+    usbDisable.Pin = GPIO_PIN_11 | GPIO_PIN_12;  // USB D- and D+
+    usbDisable.Mode = GPIO_MODE_OUTPUT_PP;
+    usbDisable.Pull = GPIO_NOPULL;
+    usbDisable.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &usbDisable);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_11 | GPIO_PIN_12, GPIO_PIN_RESET);  // both LOW
+    // Brief delay to let the USB controller see the disconnect before we jump.
+    for (volatile int i = 0; i < 10000; i++);
+
     /* Return clocks and every initialised peripheral to their reset state so
      * the ROM bootloader starts from a clean, well-defined configuration. */
     HAL_RCC_DeInit();

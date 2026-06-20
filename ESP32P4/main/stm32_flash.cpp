@@ -443,60 +443,26 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
-    // 2) Assert BOOT0 HIGH so the upcoming reset lands in the ROM bootloader.
-    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));  // let BOOT0 settle before the reset
-    // DIAGNOSTIC: confirm the pin is actually driving HIGH on the ESP pad (catches
-    // a broken/mis-configured GPIO before we blame the protocol).
-    int b0_pre = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
-    ESP_LOGI(TAG, "BOOT0 (GPIO%d) set HIGH, readback=%d %s", STM_BOOT0_PIN, b0_pre,
-             b0_pre ? "(OK on ESP pad)" : "(FAILED — ESP pad not high!)");
-    if (b0_pre != 1) {
-        snprintf(msg, msgn, "BOOT0 (GPIO%d) cannot drive HIGH", STM_BOOT0_PIN);
-        return false;
-    }
-
-    // 3) Hardware reset pulse on NRST (active-LOW). Per AN2606, the ROM bootloader
-    //    entry sequence is: BOOT0=HIGH, then hardware reset. Pull NRST LOW for
-    //    10ms (well above the STM32 minimum reset pulse width of ~100ns), then
-    //    release HIGH. The chip resets and samples BOOT0, entering the ROM.
-    ESP_LOGI(TAG, "Pulsing NRST (GPIO%d) LOW for 10ms...", STM_NRST_PIN);
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);  // assert reset
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);  // release reset
-    // Verify NRST drives both LOW and HIGH (catches wiring faults).
-    vTaskDelay(pdMS_TO_TICKS(5));
-    int nrst = gpio_get_level((gpio_num_t)STM_NRST_PIN);
-    ESP_LOGI(TAG, "NRST released HIGH, readback=%d %s", nrst,
-             nrst ? "(OK)" : "(FAILED — stuck low!)");
-    if (nrst != 1) {
-        snprintf(msg, msgn, "NRST (GPIO%d) stuck LOW after release", STM_NRST_PIN);
-        return false;
-    }
+    // 2) SOFTWARE bootloader entry: send "BOOTLOADER" command to the running app.
+    //    The STM32 app's jumpToBootloader() function (main.c) pulls USB D+/D- LOW
+    //    to disable USB enumeration, then jumps to the ROM bootloader at 0x1FFF0000.
+    //    This bypasses the VBUS detection issue: even if VBUS is floating HIGH (board
+    //    design bug or leakage), the disabled USB forces the ROM to listen on USART1.
+    //    The app is running at 1Mbaud 8N1, so send the command at that config.
+    ESP_LOGI(TAG, "Sending SOFTWARE bootloader entry command (BOOTLOADER) @1Mbaud 8N1...");
+    const char *cmd = "BOOTLOADER\n";
+    uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
+    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
     
-    // CRITICAL: re-check BOOT0 is STILL HIGH after the reset pulse. If it drooped
-    // to LOW during the 10ms reset window (due to weak drive, wire resistance, or
-    // capacitance), the STM32 sampled BOOT0=LOW and booted into (corrupt) app flash
-    // instead of the ROM bootloader -> explains complete USART1 silence.
-    int b0_post = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
-    ESP_LOGI(TAG, "BOOT0 re-check after reset: readback=%d %s", b0_post,
-             b0_post ? "(OK — held HIGH)" : "(FAILED — drooped to LOW!)");
-    if (b0_post != 1) {
-        snprintf(msg, msgn, "BOOT0 drooped LOW during reset (weak drive or bad wire)");
-        return false;
-    }
+    // The STM32 app will ACK, then reset itself into the ROM bootloader. The ROM
+    // startup takes ~10ms (clock init + GPIO config). Wait 200ms for safety, then
+    // drain any residual app ACK bytes (they're at 8N1, we're about to flip to 8E1).
+    vTaskDelay(pdMS_TO_TICKS(200));
+    uart_flush_input(STM_BOOT_UART);
+    
+    ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (USB disabled by app, USART1 active)");
 
-    // 4) CRITICAL: The ROM bootloader polls USART→I2C→SPI→USB in sequence and
-    //    LOCKS onto the FIRST interface that shows activity (AN2606 Fig 58). If
-    //    there's noise on I2C/SPI/USB pins during our delay, the ROM locks onto
-    //    THAT interface and permanently ignores USART1 → complete silence. The
-    //    old board used a software jump (USART1 pre-selected), but the hardware
-    //    reset cold-boots the ROM → we must claim USART1 FAST (within 2ms) before
-    //    the ROM scans other interfaces. 10ms is the minimum safe delay (ROM is
-    //    ready in <2ms per AN2606, 10ms ensures clock/GPIO stable on all G4 revs).
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // 5) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
+    // 3) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
     //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
     //    with TX held idle-high across the gap so the line never glitches.
     switch_uart_to_bootloader();
