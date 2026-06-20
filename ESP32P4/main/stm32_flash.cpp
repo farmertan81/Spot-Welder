@@ -272,6 +272,9 @@ static IRAM_ATTR bool stmWriteChunk(uint32_t addr, const uint8_t *data, int len)
 }
 
 // Go (0x21): jump to and run the application at `addr`.
+// NOTE: No longer used for launch (we now pulse NRST to cleanly boot the new app
+// via hardware reset). Kept for reference / optional AN3155 Go support.
+__attribute__((unused))
 static IRAM_ATTR bool stmGo(uint32_t addr) {
     if (!stmSendCmd(0x21)) return false;
     uint8_t a[4] = {(uint8_t)(addr >> 24), (uint8_t)(addr >> 16),
@@ -443,100 +446,53 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
-    // 2) SOFTWARE bootloader entry: send "BOOTLOADER" command to the running app.
-    //    The STM32 app's jumpToBootloader() function (main.c) pulls USB D+/D- LOW
-    //    to disable USB enumeration, then jumps to the ROM bootloader at 0x1FFF0000.
-    //    This bypasses the VBUS detection issue: even if VBUS is floating HIGH (board
-    //    design bug or leakage), the disabled USB forces the ROM to listen on USART1.
-    //    The app is running at 1Mbaud 8N1, so send the command at that config.
-    ESP_LOGI(TAG, "Sending SOFTWARE bootloader entry command (BOOTLOADER) @1Mbaud 8N1...");
-    uart_flush_input(STM_BOOT_UART);  // clear any in-flight telemetry first
-    const char *cmd = "BOOTLOADER\n";
-    uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
-    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+    // 2) HARDWARE bootloader entry via the BOOT0 + NRST wires. This is the
+    //    bulletproof, FIRMWARE-INDEPENDENT method (AN2606): strap BOOT0 HIGH,
+    //    then pulse NRST LOW->HIGH. At the reset the STM32 samples BOOT0=HIGH and
+    //    starts the factory ROM bootloader in System memory, which listens on
+    //    USART1 (PA9/PA10) for the 0x7F auto-baud byte.
+    //
+    //    This deliberately does NOT use the app's software "BOOTLOADER" command /
+    //    jumpToBootloader() path. That path depended on the TAMP backup magic
+    //    surviving a reset, which it does NOT on the WeAct G474 board (VBAT not
+    //    wired -> backup domain clears -> chip just reboots back into the app).
+    //    Driving NRST/BOOT0 from the ESP bypasses the chip firmware entirely, so
+    //    it works no matter what is currently flashed on the STM32.
+    //
+    //    USB note: a USB cable is not connected during a wireless flash, so VBUS
+    //    is low and the G4 ROM falls through to USART1 (it polls all interfaces
+    //    and locks onto the first one that receives a valid 0x7F).
+    ESP_LOGI(TAG, "HARDWARE bootloader entry: BOOT0 HIGH + NRST pulse "
+                  "(GPIO%d->BOOT0, GPIO%d->NRST)...", STM_BOOT0_PIN, STM_NRST_PIN);
 
-    // DECISIVE DIAGNOSTIC: read the app's reply at 1Mbaud 8N1 for ~400ms. The app
-    // is supposed to print "DBG,BOOTLOADER command received" + "ACK,BOOTLOADER",
-    // then reset (after which traffic STOPS as it jumps to the silent ROM). This
-    // tells us EXACTLY what happened:
-    //   - see "ACK,BOOTLOADER" then silence -> command worked, jumped to ROM
-    //   - see "ACK,BOOTLOADER" then MORE STATUS telemetry -> jump failed, app rebooted
-    //   - see only STATUS telemetry (no ACK) -> command NOT received/recognized
-    {
-        char rbuf[512];
-        int rn = 0;
-        for (int i = 0; i < 8 && rn < (int)sizeof(rbuf) - 1; i++) {
-            int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rbuf + rn,
-                                    sizeof(rbuf) - 1 - rn, pdMS_TO_TICKS(50));
-            if (n > 0) rn += n;
-        }
-        rbuf[rn > 0 ? rn : 0] = '\0';
-        bool got_ack = (rn > 0) && (strstr(rbuf, "ACK,BOOTLOADER") != NULL ||
-                                    strstr(rbuf, "BOOTLOADER command received") != NULL);
-        if (got_ack) {
-            ESP_LOGI(TAG, "App ACKed BOOTLOADER cmd (%d bytes) -> jump requested.", rn);
-        } else if (rn > 0) {
-            ESP_LOGW(TAG, "App did NOT ACK BOOTLOADER (got %d bytes of other traffic). "
-                          "Cmd not recognized OR old firmware without USB-disable jump. "
-                          "First 80 chars: [%.*s]", rn, (rn < 80 ? rn : 80), rbuf);
-        } else {
-            ESP_LOGW(TAG, "No reply at all to BOOTLOADER cmd @1Mbaud 8N1 — UART TX issue?");
-        }
-    }
+    // Pre-check: is the app actually alive right now? (purely informational —
+    // helps distinguish "reset failed" from "reset worked" in the logs later)
+    uart_flush_input(STM_BOOT_UART);
 
-    // Give the chip time to reset and boot (~200ms covers reset + clock init +
-    // UART init). The chip will print boot messages @1Mbaud 8N1 if it lands in
-    // the app (including "DBG,Boot: TAMP register = 0x..." showing whether the
-    // magic survived). If it jumped to ROM, the UART is SILENT (ROM hasn't seen
-    // 0x7F yet). Read any traffic at 1Mbaud to capture the boot diagnostics.
-    vTaskDelay(pdMS_TO_TICKS(200));
-    {
-        char boot_buf[512];
-        int boot_n = 0;
-        for (int i = 0; i < 4 && boot_n < (int)sizeof(boot_buf) - 1; i++) {
-            int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)boot_buf + boot_n,
-                                    sizeof(boot_buf) - 1 - boot_n, pdMS_TO_TICKS(50));
-            if (n > 0) boot_n += n;
-        }
-        boot_buf[boot_n > 0 ? boot_n : 0] = '\0';
-        
-        if (boot_n > 0) {
-            // The chip is transmitting @1Mbaud -> it's in the APP, not ROM.
-            // Extract the TAMP diagnostic to see if the magic was written/lost.
-            const char *tamp_line = strstr(boot_buf, "TAMP register =");
-            if (tamp_line) {
-                // Parse the hex value (format: "TAMP register = 0x12345678")
-                unsigned long tamp_val = 0;
-                const char *hex_start = strstr(tamp_line, "0x");
-                if (hex_start) {
-                    tamp_val = strtoul(hex_start, NULL, 16);
-                }
-                if (tamp_val == 0xB00710ADUL) {
-                    ESP_LOGE(TAG, "TAMP magic survived reset (0x%08lX) but jump did NOT fire! "
-                                  "The early-boot check in main() is being skipped or failing. "
-                                  "Check that main.c line 4762-4766 is actually compiled+flashed.", 
-                             tamp_val);
-                } else if (tamp_val == 0) {
-                    ESP_LOGE(TAG, "TAMP register cleared to 0x00000000 across reset -> magic did "
-                                  "NOT survive. Backup domain is being reset (power brownout? "
-                                  "option byte? VBAT disconnected?).");
-                } else {
-                    ESP_LOGW(TAG, "TAMP register has unexpected value 0x%08lX (not magic, not 0). "
-                                  "Backup domain corruption?", tamp_val);
-                }
-            } else {
-                ESP_LOGW(TAG, "App booted @1Mbaud (%d bytes) but no TAMP diagnostic line found. "
-                              "Old firmware?", boot_n);
-            }
-            ESP_LOGI(TAG, "Boot traffic (first 120 chars): [%.*s]", 
-                     (boot_n < 120 ? boot_n : 120), boot_buf);
-        } else {
-            // Silence @1Mbaud -> chip is NOT in app. Either ROM (good) or hung (bad).
-            ESP_LOGI(TAG, "No traffic @1Mbaud after reset -> chip not in app (ROM or hung)");
-        }
-    }
+    // a) Drive BOOT0 HIGH and let the strap settle BEFORE reset is released.
+    //    GPIO31 is already at max drive strength (set in welder_main.cpp) to beat
+    //    the WeAct board's 10k pulldown on PB8.
+    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    ESP_LOGI(TAG, "  BOOT0 driven HIGH, readback=%d",
+             gpio_get_level((gpio_num_t)STM_BOOT0_PIN));
 
-    ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (USB disabled by app, USART1 active)");
+    // b) Pulse NRST LOW to reset the chip. Hold ~20ms to overcome any reset
+    //    capacitor on the board, then release HIGH. BOOT0 stays HIGH throughout,
+    //    so the chip latches "boot from System memory" at the reset edge.
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
+    ESP_LOGI(TAG, "  NRST pulsed LOW(20ms)->HIGH; chip resetting into ROM "
+                  "(BOOT0 held HIGH, readback=%d)",
+             gpio_get_level((gpio_num_t)STM_NRST_PIN));
+
+    // c) Brief startup window for the ROM to come up and begin polling its
+    //    interfaces. We then switch our UART to 8E1 and fire 0x7F immediately so
+    //    the ROM auto-baud locks onto USART1 (not I2C/SPI/USB).
+    vTaskDelay(pdMS_TO_TICKS(10));
+
+    ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (HW reset, USART1 active)");
 
     // 3) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
     //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
@@ -692,14 +648,23 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
         ok = true;
     } while (0);
 
-    // 5) Drop BOOT0 LOW so future resets boot the (new) application, not ROM.
+    // 5) Drop BOOT0 LOW so the next reset boots the (new) application, not ROM.
     //    Done unconditionally so a failed flash never leaves the STM32 in DFU.
     gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(5));  // let the BOOT0 strap settle LOW before reset
 
-    // 6) On success, launch the freshly written app via AN3155 "Go".
+    // 6) Launch the freshly written app with a CLEAN HARDWARE RESET (BOOT0 is now
+    //    LOW, so the chip boots from main flash 0x08000000). A NRST pulse is far
+    //    more reliable than the AN3155 "Go" command, which can leave ROM-configured
+    //    peripherals/clocks in a bad state for the new app. We have the NRST wire,
+    //    so use it. Done on success only — on failure we leave the chip in ROM
+    //    (BOOT0 already LOW) so the ESP reboot below can retry cleanly.
     if (ok) {
         show_firmware_progress("STM32", 98, "Launching...");
-        stmGo(STM32_FLASH_BASE);
+        gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(20));
+        gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
+        ESP_LOGI(TAG, "New app launched via NRST pulse (BOOT0 LOW).");
     }
 
     snprintf(msg, msgn, "%s",
