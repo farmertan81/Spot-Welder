@@ -490,6 +490,11 @@ static bool stm32_enter_bootloader_software(void) {
     // Now talk to the ROM at AN3155's 115200 8E1 and try to sync.
     switch_uart_to_bootloader();
     uart_loopback_selftest();          // one-time: prove ESP 8E1 path is good
+    // CRITICAL: the app sent ACK,BOOTLOADER + debug lines at 1Mbaud 8N1 BEFORE
+    // jumping. Those bytes are still arriving into the RX buffer (the driver just
+    // switched to 8E1, so they'll be decoded as garbage). Let ALL of the app's
+    // output arrive, then drain it in one shot so the ROM's 0x79 ACK is clean.
+    vTaskDelay(pdMS_TO_TICKS(100));    // let the last app bytes trickle in
     stmDrainRx();
     if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
     bool synced = stmSync();
