@@ -534,7 +534,15 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
             }
             rp8e1[n8e1 > 0 ? n8e1 : 0] = '\0';
             
-            // 2) Switch back to 8N1 (app config) and listen for app traffic
+            // 2) Switch back to 8N1 (app config) and ACTIVELY POLL the app.
+            //    CRITICAL FIX: the app does NOT broadcast unsolicited — it only
+            //    answers a "STATUS" command. The old passive listen heard nothing
+            //    even if the app was alive (nobody polled it), so it could NOT
+            //    distinguish "app running" from "app gone". We now SEND STATUS at
+            //    1Mbaud 8N1 (exact app config) and watch for a reply. This is the
+            //    decisive test for whether the GPIO reset actually entered the
+            //    bootloader during a WIRELESS flash (physical-button DFU success
+            //    does NOT prove the ESP's GPIO31/GPIO32 control works).
             uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
             uart_set_baudrate(STM_BOOT_UART, 1000000);
             uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
@@ -543,21 +551,35 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
             uart_flush_input(STM_BOOT_UART);
             char rp8n1[256];
             int n8n1 = 0;
-            for (int i = 0; i < 20 && n8n1 < (int)sizeof(rp8n1) - 1; i++) {
-                int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp8n1 + n8n1,
-                                        sizeof(rp8n1) - 1 - n8n1, pdMS_TO_TICKS(100));
-                if (n > 0) n8n1 += n;
+            // Poll 5x: send STATUS\n, then listen ~120ms for the reply.
+            for (int poll = 0; poll < 5 && n8n1 < (int)sizeof(rp8n1) - 1; poll++) {
+                const char *q = "STATUS\n";
+                uart_write_bytes(STM_BOOT_UART, q, strlen(q));
+                uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(20));
+                for (int i = 0; i < 6 && n8n1 < (int)sizeof(rp8n1) - 1; i++) {
+                    int n = uart_read_bytes(STM_BOOT_UART, (uint8_t *)rp8n1 + n8n1,
+                                            sizeof(rp8n1) - 1 - n8n1, pdMS_TO_TICKS(20));
+                    if (n > 0) n8n1 += n;
+                }
+                if (n8n1 > 0) break;  // got a reply, no need to keep polling
             }
             rp8n1[n8n1 > 0 ? n8n1 : 0] = '\0';
             
-            // 3) Report results
-            if (n8n1 > 0 && (strstr(rp8n1, "STATUS") || strstr(rp8n1, "DBG") ||
-                             strstr(rp8n1, "ACK"))) {
-                ESP_LOGE(TAG, "DIAGNOSTIC: STM32 APP IS STILL RUNNING (%d bytes @1Mbaud "
-                              "8N1) -> NRST did NOT reset the chip!", n8n1);
-                ESP_LOGE(TAG, "  ** CHECK NRST WIRE: GPIO32 must be physically connected "
-                              "to STM32 NRST pin **");
-                ESP_LOGW(TAG, "  App traffic heard: %.*s", (n8n1 < 64 ? n8n1 : 64), rp8n1);
+            // 3) Report results. ANY reply to the active STATUS poll @1Mbaud 8N1
+            //    means the app firmware is alive and answering — i.e. the chip is
+            //    NOT in the ROM bootloader. (We poll with the exact app config, so
+            //    a reply is unambiguous proof the app is running.)
+            if (n8n1 > 0) {
+                ESP_LOGE(TAG, "DIAGNOSTIC: STM32 APP IS STILL RUNNING — it answered our "
+                              "STATUS poll with %d bytes @1Mbaud 8N1.", n8n1);
+                ESP_LOGE(TAG, "  >> The chip did NOT enter the ROM bootloader. The GPIO "
+                              "reset (BOOT0=GPIO31 / NRST=GPIO32) did not take effect "
+                              "during this WIRELESS flash.");
+                ESP_LOGE(TAG, "  >> NOTE: USB-DFU success with the PHYSICAL boot/reset "
+                              "buttons does NOT prove the ESP's GPIO control works. "
+                              "Verify GPIO31->PB8(BOOT0) and GPIO32->NRST physically, "
+                              "AND that the app isn't holding/overriding those pins.");
+                ESP_LOGW(TAG, "  App reply: %.*s", (n8n1 < 96 ? n8n1 : 96), rp8n1);
             } else if (n8e1 > 0) {
                 ESP_LOGI(TAG, "DIAGNOSTIC: heard %d bytes @115200 8E1 (ROM config), but "
                               "no valid ACK. First 32 chars: [%.*s]  Hex:",
@@ -568,9 +590,13 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
                 ESP_LOGE(TAG, "  Likely: TX/RX swapped, or ROM defaulted to USB/I2C/SPI "
                               "instead of USART1");
             } else {
-                ESP_LOGE(TAG, "DIAGNOSTIC: complete silence @8E1 (%d bytes) and @8N1 "
-                              "(%d bytes)", n8e1, n8n1);
-                ESP_LOGE(TAG, "  STM32 is HUNG or NRST wire is disconnected/wrong pin");
+                ESP_LOGE(TAG, "DIAGNOSTIC: complete silence — no ROM reply @8E1 AND the "
+                              "app did NOT answer an active STATUS poll @1Mbaud 8N1.");
+                ESP_LOGE(TAG, "  >> The app is GONE (so the reset DID happen) but the ROM "
+                              "bootloader is not answering on USART1 PA9/PA10. The chip is "
+                              "in the bootloader on a DIFFERENT interface, OR our 0x7F is "
+                              "not reaching PA10. Watch the BIT-BANG sync attempts (6-10): "
+                              "if those ACK, the P4 HW-UART parity output was the culprit.");
             }
             break;
         }
