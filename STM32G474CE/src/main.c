@@ -258,6 +258,16 @@ static float measured_vdda = 3.3f; /* Updated periodically by measureVDDA() */
  * NVIC_SystemReset(). BKP0R is otherwise unused by this firmware. */
 #define BOOTLOADER_FLAG_REG (TAMP->BKP0R)
 
+/* PRIMARY warm-reset request flag: a plain-SRAM marker placed in the .noinit
+ * linker section (see STM32G474CETX_FLASH.ld). Unlike the TAMP backup register,
+ * SRAM contents SURVIVE a system reset (NVIC_SystemReset) and are only cleared
+ * by a true power-on reset - so the request reliably passes through the warm
+ * reset on this WeAct board where VBAT/backup-domain is not wired. The startup
+ * code does NOT zero this section, so we must initialise it ourselves only on a
+ * cold boot (handled implicitly: a random power-on value is extremely unlikely
+ * to equal the magic, and we always clear it right after detection). */
+__attribute__((section(".noinit"))) volatile uint32_t g_bootloader_marker;
+
 /* ============ Weld Params (defaults) ============ */
 static volatile uint8_t weld_mode = 1;
 static volatile uint16_t weld_d1_ms = 10;
@@ -4688,26 +4698,45 @@ static void jumpToBootloader(void) {
     }
 }
 
-/* Wireless STM32 firmware update: enter the ROM bootloader immediately by
- * directly calling jumpToBootloader(). The TAMP backup register approach (set
- * magic + NVIC_SystemReset + detect on reboot) does NOT work on this WeAct
- * STM32G474 board because VBAT is not properly connected — the backup domain
- * is cleared across ANY reset, so the magic is lost (proven by boot diagnostic
- * showing TAMP=0x00000000). Direct jump bypasses the backup-domain issue and
- * works on all boards. This does NOT return. */
+/* Wireless STM32 firmware update: request entry into the ROM bootloader via a
+ * WARM RESET, then a clean jump from very early in main().
+ *
+ * Why not jump directly from here?  Field testing PROVED that calling
+ * jumpToBootloader() directly from the running-app context (commit 77a5201)
+ * does NOT land in the ROM — the chip faults/resets straight back into the app
+ * (STM32 serial showed "jumping DIRECTLY..." immediately followed by the normal
+ * boot banner, still on the OLD firmware). The ONLY context that has ever worked
+ * on this hardware is jumping from the very top of main(), with the clock still
+ * at its HSI reset default and no peripherals configured.
+ *
+ * To reach that context we must survive a system reset carrying a "go to
+ * bootloader" request. The previous TAMP backup-register marker does NOT survive
+ * reset on this WeAct board (VBAT not wired -> backup domain clears, diagnostic
+ * showed TAMP=0x00000000). So we instead use a plain-SRAM marker in the .noinit
+ * section, which DOES survive a warm reset. We also still set the TAMP register
+ * (harmless, free fallback for boards where VBAT is wired).
+ *
+ * This does NOT return. */
 static void requestBootloaderReset(void) {
-    uartSend("DBG,Wireless flash: jumping DIRECTLY to ROM bootloader (no reset)");
-    HAL_Delay(50);  /* let the debug line flush out of the UART before the jump */
+    /* PRIMARY: SRAM marker (survives warm reset on this board). */
+    g_bootloader_marker = BOOTLOADER_REQUEST_MAGIC;
 
-    /* jumpToBootloader() never returns — it disables USB (pulls D+/D- LOW to
-     * prevent ROM from waiting for USB enumeration), tears down the app clocks/
-     * peripherals, and jumps to the STM32G4 factory ROM bootloader at 0x1FFF0000.
-     * The ROM will then listen on USART1 (PA9/PA10) at 115200 8E1 for AN3155
-     * commands from the ESP32. */
-    jumpToBootloader();
+    /* FALLBACK: TAMP backup register (only retained if VBAT is wired). */
+    bootloaderEnableBackupAccess();
+    BOOTLOADER_FLAG_REG = BOOTLOADER_REQUEST_MAGIC;
 
-    /* Unreachable. If we get here the jump itself failed (should never happen). */
-    uartSend("DBG,ERROR: jumpToBootloader() returned - jump FAILED!");
+    /* Make sure both writes have actually committed to memory before the reset. */
+    __DSB();
+
+    uartSend("DBG,Wireless flash: marker set, resetting into ROM bootloader...");
+    HAL_Delay(50);  /* let the debug line flush out of the UART before reset */
+
+    /* Warm reset. This also STOPS the IWDG (software watchdog mode), so the ROM
+     * bootloader will run with no active watchdog. On reboot the early-main check
+     * sees the marker and calls jumpToBootloader() from the clean HSI context. */
+    NVIC_SystemReset();
+
+    /* Unreachable. */
     while (1) {
     }
 }
@@ -4731,14 +4760,21 @@ int main(void) {
     HAL_Init();
 
     /* Software bootloader entry: if the "BOOTLOADER" UART command requested an
-     * update, requestBootloaderReset() stored a magic value in a backup register
-     * and reset the MCU (which also stopped the IWDG). Detect that here - BEFORE
-     * the clocks/peripherals are configured and BEFORE MX_IWDG_Init() re-arms the
-     * watchdog - clear the flag, and jump straight into the ROM bootloader. */
+     * update, requestBootloaderReset() stored a magic marker and reset the MCU
+     * (which also stopped the IWDG). Detect that here - BEFORE the clocks/
+     * peripherals are configured and BEFORE MX_IWDG_Init() re-arms the watchdog -
+     * clear the marker, and jump straight into the ROM bootloader.
+     *
+     * PRIMARY check: the .noinit SRAM marker, which survives a warm reset on this
+     * board. FALLBACK check: the TAMP backup register (only valid if VBAT wired).
+     * Either one being set triggers the jump. */
     bootloaderEnableBackupAccess();
     g_boot_tamp_value = BOOTLOADER_FLAG_REG;   /* snapshot for later logging */
-    if (g_boot_tamp_value == BOOTLOADER_REQUEST_MAGIC) {
-        BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear so we boot normally next time */
+    bool bl_req = (g_bootloader_marker == BOOTLOADER_REQUEST_MAGIC) ||
+                  (g_boot_tamp_value == BOOTLOADER_REQUEST_MAGIC);
+    if (bl_req) {
+        g_bootloader_marker = 0;   /* one-shot: clear SRAM marker  */
+        BOOTLOADER_FLAG_REG = 0;   /* one-shot: clear TAMP fallback */
         __DSB();
         /* RESTORED to the PROVEN 6cebf05 path: jump straight into the ROM
          * bootloader IMMEDIATELY, with the clock still at its HSI 16 MHz reset

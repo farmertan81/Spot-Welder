@@ -163,6 +163,23 @@ SECTIONS
     __bss_end__ = _ebss;
   } >RAM
 
+  /* .noinit section: NOT zero-filled by the startup code (startup only clears
+   * _sbss.._ebss and copies .data). Variables placed here therefore KEEP their
+   * contents across a warm/system reset (NVIC_SystemReset) - they are only lost
+   * on a true power-on reset. This is exactly what the bootloader-request marker
+   * needs: the TAMP/backup-domain registers do NOT survive reset on this WeAct
+   * board (VBAT not wired -> backup domain clears, reads 0x00000000), but plain
+   * SRAM does. Placed after .bss so it is outside the zero-fill range. */
+  .noinit (NOLOAD) :
+  {
+    . = ALIGN(4);
+    PROVIDE ( _snoinit = . );
+    *(.noinit)
+    *(.noinit*)
+    . = ALIGN(4);
+    PROVIDE ( _enoinit = . );
+  } >RAM
+
   /* User_heap_stack section, used to check that there is enough "RAM" Ram  type memory left */
   ._user_heap_stack :
   {
