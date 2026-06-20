@@ -33,6 +33,11 @@
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_attr.h"
+#include "esp_cpu.h"             // esp_cpu_get_cycle_count() for bit-bang timing
+#include "esp_private/esp_clk.h" // esp_clk_cpu_freq()
+#include "esp_rom_gpio.h"        // esp_rom_gpio_connect_out_signal()
+#include "esp_rom_sys.h"         // esp_rom_delay_us()
+#include "soc/gpio_sig_map.h"    // SIG_GPIO_OUT_IDX
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -134,6 +139,55 @@ static IRAM_ATTR bool stmSendCmd(uint8_t cmd) {
     return stmWaitAck(800);
 }
 
+// ---- SOFTWARE BIT-BANG TX (decisive test for a P4 HW-UART parity-pad bug) ----
+// The HW-UART loopback proves the P4 encodes 8E1 *internally*, and the app proves
+// GPIO29 drives the pad fine at 1Mbaud *8N1* (no parity). The ONE thing never
+// proven is that the P4 emits a correct EVEN-PARITY frame on the physical pad.
+// This function bypasses the UART peripheral entirely: it detaches GPIO29 from
+// the UART matrix, manually toggles the pin to clock out one 8E1 frame (start +
+// 8 data LSB-first + even-parity + stop) with cycle-accurate timing, then
+// reattaches the UART so the HW RX path can capture the ROM's ACK.
+//   * If the ROM now ACKs -> the P4 HW-UART parity output on the pad WAS broken,
+//     and bit-banging is the fix (we'll convert the whole protocol to it).
+//   * If still silent -> the ESP TX path is definitively NOT the problem.
+static IRAM_ATTR void stmBitbangByte8E1(uint8_t byte) {
+    const uint32_t cyc_per_bit = (uint32_t)(esp_clk_cpu_freq() / 115200);
+
+    // Build the 11 line levels: start(0), d0..d7 (LSB first), even parity, stop(1).
+    int levels[11];
+    levels[0] = 0;
+    int ones = 0;
+    for (int i = 0; i < 8; i++) {
+        int bit = (byte >> i) & 1;
+        levels[1 + i] = bit;
+        ones += bit;
+    }
+    levels[9]  = ones & 1;   // even parity: make total number of 1s even
+    levels[10] = 1;          // stop bit
+
+    // Detach the UART TXD signal from GPIO29 and take manual GPIO control.
+    esp_rom_gpio_connect_out_signal(STM_TX_PIN, SIG_GPIO_OUT_IDX, false, false);
+    gpio_set_direction((gpio_num_t)STM_TX_PIN, GPIO_MODE_OUTPUT);
+    gpio_set_level((gpio_num_t)STM_TX_PIN, 1);   // idle high
+    esp_rom_delay_us(50);                         // let the line settle high
+
+    // Clock out the frame with interrupts off so no ISR jitters a bit edge.
+    // 11 bits @115200 ≈ 95µs — safe to keep interrupts disabled this long.
+    portDISABLE_INTERRUPTS();
+    uint32_t t = esp_cpu_get_cycle_count();
+    for (int i = 0; i < 11; i++) {
+        gpio_set_level((gpio_num_t)STM_TX_PIN, levels[i]);
+        t += cyc_per_bit;
+        while ((int32_t)(esp_cpu_get_cycle_count() - t) < 0) { /* spin */ }
+    }
+    gpio_set_level((gpio_num_t)STM_TX_PIN, 1);   // hold idle high after stop
+    portENABLE_INTERRUPTS();
+
+    // Reattach the UART TXD signal so the normal driver owns GPIO29 again.
+    uart_set_pin(STM_BOOT_UART, STM_TX_PIN, STM_RX_PIN,
+                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+}
+
 // Bootloader auto-baud handshake: send 0x7F until the device answers.
 static IRAM_ATTR bool stmSync() {
     const int kAttempts = 10;
@@ -141,9 +195,18 @@ static IRAM_ATTR bool stmSync() {
         int drained = stmDrainRx();
         if (drained > 0)
             ESP_LOGI(TAG, "drained %d stale byte(s) before sync", drained);
-        ESP_LOGI(TAG, "sync attempt %d/%d: sending 0x7F", i + 1, kAttempts);
-        uart_write_bytes(STM_BOOT_UART, "\x7F", 1);
-        uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+        // First half of the attempts: HW-UART TX (the proven-broken path, kept
+        // for direct comparison). Second half: SOFTWARE BIT-BANG 8E1 TX — bypasses
+        // the UART peripheral's parity logic to test for a P4 parity-pad bug.
+        bool use_bitbang = (i >= kAttempts / 2);
+        ESP_LOGI(TAG, "sync attempt %d/%d: sending 0x7F (%s)", i + 1, kAttempts,
+                 use_bitbang ? "BIT-BANG 8E1" : "HW-UART 8E1");
+        if (use_bitbang) {
+            stmBitbangByte8E1(0x7F);
+        } else {
+            uart_write_bytes(STM_BOOT_UART, "\x7F", 1);
+            uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(100));
+        }
         int b = stmReadByte(500);
         if (b == STM_ACK) {
             ESP_LOGI(TAG, "sync OK (ACK)");
