@@ -437,6 +437,114 @@ static void report_uart_events(void) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bootloader ENTRY strategies. Each returns true if, after the entry attempt,
+// the STM32 ROM bootloader answers our 0x7F sync at 115200 8E1.
+//
+// PRIMARY = software jump. SECONDARY/fallback = hardware BOOT0+NRST pulse.
+//
+// Why software is primary: on the STM32G4 the factory-default option bit
+// nBOOT_SEL=1 makes the chip IGNORE the physical BOOT0 *pin* — boot mode is
+// taken from the nBOOT0 option bit instead. So strapping GPIO31->PB8 HIGH does
+// nothing on a stock chip and the ROM never starts (exactly what the field log
+// showed: NRST/BOOT0/UART all test good, yet the ROM is silent). The running
+// app, however, can jump to the ROM in software: it receives "BOOTLOADER",
+// calls jumpToBootloader() and lands in the ROM on USART1 with NO reset, NO
+// TAMP magic and NO dependence on the BOOT0 pin. This is the method that worked
+// on the old board, so we try it first and only fall back to the GPIO pulse if
+// the app is unresponsive (e.g. already bricked).
+// ---------------------------------------------------------------------------
+
+// PRIMARY: ask the running app (1Mbaud 8N1) to jump straight into the ROM.
+static bool stm32_enter_bootloader_software(void) {
+    ESP_LOGI(TAG, "SOFTWARE bootloader entry: sending 'BOOTLOADER' to the running "
+                  "app @%d 8N1 (app jumps directly to ROM, no reset/BOOT0 pin)...",
+             STM_APP_BAUD);
+
+    // Talk to the app at its normal link config.
+    uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
+    uart_set_baudrate(STM_BOOT_UART, STM_APP_BAUD);
+    uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
+    uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);
+    uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);
+    uart_flush_input(STM_BOOT_UART);
+
+    // Keep BOOT0/NRST passive (BOOT0 LOW so we don't fight anything; NRST HIGH).
+    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 0);
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
+
+    // The app accepts "BOOTLOADER" or "CMD,BOOTLOADER" (CR/LF tolerant). Send it
+    // a couple of times in case a status line is mid-transmission.
+    const char *cmd = "BOOTLOADER\r\n";
+    for (int i = 0; i < 2; i++) {
+        uart_write_bytes(STM_BOOT_UART, cmd, strlen(cmd));
+        uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    // The app prints ACK,BOOTLOADER + a debug line, waits ~50ms, then tears down
+    // its clocks/peripherals (HAL_DeInit) and jumps. Give it generous time to
+    // land in the ROM and start polling USART1 before we switch to 8E1.
+    vTaskDelay(pdMS_TO_TICKS(200));
+
+    // Now talk to the ROM at AN3155's 115200 8E1 and try to sync.
+    switch_uart_to_bootloader();
+    uart_loopback_selftest();          // one-time: prove ESP 8E1 path is good
+    stmDrainRx();
+    if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
+    bool synced = stmSync();
+    ESP_LOGI(TAG, "  software-entry sync: %s",
+             synced ? "ACK — ROM is up on USART1!" : "no response");
+    return synced;
+}
+
+// FALLBACK: hardware BOOT0 strap + NRST pulse. Only effective if the STM32
+// option bytes have nBOOT_SEL=0 (BOOT0 pin honored). On a stock G4 (nBOOT_SEL=1)
+// this cannot work — the chip ignores the pin. Kept for bricked-app recovery on
+// boards configured for pin-based boot.
+static bool stm32_enter_bootloader_hardware(void) {
+    ESP_LOGI(TAG, "HARDWARE bootloader entry: BOOT0 HIGH + NRST pulse "
+                  "(GPIO%d->BOOT0, GPIO%d->NRST)...", STM_BOOT0_PIN, STM_NRST_PIN);
+    uart_flush_input(STM_BOOT_UART);
+
+    // a) Drive BOOT0 HIGH and let the strap settle BEFORE reset is released.
+    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
+    vTaskDelay(pdMS_TO_TICKS(5));
+    ESP_LOGI(TAG, "  BOOT0 driven HIGH, readback=%d",
+             gpio_get_level((gpio_num_t)STM_BOOT0_PIN));
+
+    // b) Pulse NRST LOW->HIGH. BOOT0 stays HIGH so the chip would latch "boot
+    //    from System memory" at the reset edge (IF the pin is honored).
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
+    vTaskDelay(pdMS_TO_TICKS(20));
+    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
+    // Multi-sample NRST as it comes back up (RC cap on the WeAct board).
+    int nrst_rb = 0, nrst_rise_ms = -1;
+    for (int i = 0; i < 16; i++) {
+        nrst_rb = gpio_get_level((gpio_num_t)STM_NRST_PIN);
+        if (nrst_rb == 1) { nrst_rise_ms = i * 2; break; }
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    int boot0_rb = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
+    if (nrst_rise_ms >= 0)
+        ESP_LOGI(TAG, "  NRST released: rose to HIGH after ~%dms (RC cap, OK). "
+                      "BOOT0 readback=%d (want 1)", nrst_rise_ms, boot0_rb);
+    else
+        ESP_LOGE(TAG, "  NRST STUCK LOW >32ms (readback=%d) -> short/clamp or the "
+                      "chip is holding its own reset; board/wiring fault.", nrst_rb);
+
+    // c) Brief window for the ROM to come up, then sync at 8E1.
+    vTaskDelay(pdMS_TO_TICKS(10));
+    switch_uart_to_bootloader();
+    stmDrainRx();
+    if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
+    bool synced = stmSync();
+    ESP_LOGI(TAG, "  hardware-entry sync: %s",
+             synced ? "ACK — ROM is up!" : "no response (pin likely ignored: "
+             "nBOOT_SEL=1 on a stock G4 -> use software entry)");
+    return synced;
+}
+
 // Worker: programs the STM32 from the in-RAM image. Returns true on success and
 // writes a short result string to `msg`. Does NOT free the buffer or reboot —
 // the task wrapper owns that.
@@ -446,115 +554,22 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
 
     show_firmware_progress("STM32", 0, "Entering bootloader...");
 
-    // 2) HARDWARE bootloader entry via the BOOT0 + NRST wires. This is the
-    //    bulletproof, FIRMWARE-INDEPENDENT method (AN2606): strap BOOT0 HIGH,
-    //    then pulse NRST LOW->HIGH. At the reset the STM32 samples BOOT0=HIGH and
-    //    starts the factory ROM bootloader in System memory, which listens on
-    //    USART1 (PA9/PA10) for the 0x7F auto-baud byte.
-    //
-    //    This deliberately does NOT use the app's software "BOOTLOADER" command /
-    //    jumpToBootloader() path. That path depended on the TAMP backup magic
-    //    surviving a reset, which it does NOT on the WeAct G474 board (VBAT not
-    //    wired -> backup domain clears -> chip just reboots back into the app).
-    //    Driving NRST/BOOT0 from the ESP bypasses the chip firmware entirely, so
-    //    it works no matter what is currently flashed on the STM32.
-    //
-    //    USB note: a USB cable is not connected during a wireless flash, so VBUS
-    //    is low and the G4 ROM falls through to USART1 (it polls all interfaces
-    //    and locks onto the first one that receives a valid 0x7F).
-    ESP_LOGI(TAG, "HARDWARE bootloader entry: BOOT0 HIGH + NRST pulse "
-                  "(GPIO%d->BOOT0, GPIO%d->NRST)...", STM_BOOT0_PIN, STM_NRST_PIN);
-
-    // Pre-check: is the app actually alive right now? (purely informational —
-    // helps distinguish "reset failed" from "reset worked" in the logs later)
-    uart_flush_input(STM_BOOT_UART);
-
-    // a) Drive BOOT0 HIGH and let the strap settle BEFORE reset is released.
-    //    GPIO31 is already at max drive strength (set in welder_main.cpp) to beat
-    //    the WeAct board's 10k pulldown on PB8.
-    gpio_set_level((gpio_num_t)STM_BOOT0_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    ESP_LOGI(TAG, "  BOOT0 driven HIGH, readback=%d",
-             gpio_get_level((gpio_num_t)STM_BOOT0_PIN));
-
-    // b) Pulse NRST LOW to reset the chip. Hold ~20ms to overcome any reset
-    //    capacitor on the board, then release HIGH. BOOT0 stays HIGH throughout,
-    //    so the chip latches "boot from System memory" at the reset edge.
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    gpio_set_level((gpio_num_t)STM_NRST_PIN, 1);
-    // MULTI-SAMPLE the NRST line as it comes back up. Both pins are INPUT_OUTPUT
-    // so gpio_get_level reads the ACTUAL pad voltage. The WeAct board has a
-    // ~100nF reset cap on NRST, so a single read taken microseconds after
-    // release can catch it mid-charge (false "stuck low"). We sample every 2ms
-    // for ~30ms to tell the two cases apart decisively:
-    //   - rises 0->1 within a few ms  => it was just the RC cap charging. NRST
-    //     is FINE; the silence is caused by something else (BOOT0 / USART / ROM).
-    //   - stays 0 the whole window     => NRST is genuinely shorted/clamped LOW
-    //     and the STM32 is held in PERMANENT RESET (explains the total silence).
-    int nrst_rb = 0;
-    int nrst_rise_ms = -1;
-    for (int i = 0; i < 16; i++) {              // up to ~32ms
-        nrst_rb = gpio_get_level((gpio_num_t)STM_NRST_PIN);
-        if (nrst_rb == 1 && nrst_rise_ms < 0) { nrst_rise_ms = i * 2; break; }
-        vTaskDelay(pdMS_TO_TICKS(2));
+    // 2) ENTER the ROM bootloader. Try the SOFTWARE jump first (works on a stock
+    //    STM32G4 where the BOOT0 pin is ignored), then fall back to the hardware
+    //    BOOT0+NRST pulse only if the app did not respond (e.g. already bricked).
+    bool entered = stm32_enter_bootloader_software();
+    if (!entered) {
+        ESP_LOGW(TAG, "Software ROM entry did not sync -> trying HARDWARE "
+                      "BOOT0+NRST fallback (only works if option bytes have "
+                      "nBOOT_SEL=0)...");
+        entered = stm32_enter_bootloader_hardware();
     }
-    int boot0_rb = gpio_get_level((gpio_num_t)STM_BOOT0_PIN);
-    if (nrst_rise_ms >= 0)
-        ESP_LOGI(TAG, "  NRST released: rose to HIGH after ~%dms (RC cap charge, "
-                      "OK). BOOT0 readback=%d (want 1)", nrst_rise_ms, boot0_rb);
-    else
-        ESP_LOGI(TAG, "  NRST released: still LOW after 32ms (readback=%d). "
-                      "BOOT0 readback=%d (want 1)", nrst_rb, boot0_rb);
 
-    if (nrst_rb != 1)
-        ESP_LOGE(TAG, "  NRST STUCK LOW for >32ms -> line shorted / clamped / "
-                      "strong external pulldown, OR the STM32 is holding its own "
-                      "NRST low (brown-out / continuous internal reset). The chip "
-                      "is held in PERMANENT RESET (explains the total silence). "
-                      "Check GPIO%d->NRST wiring, for a short to GND, and the "
-                      "board's 3V3 rail; suspect the board if the wire is good.",
-                 STM_NRST_PIN);
-    if (boot0_rb != 1)
-        ESP_LOGE(TAG, "  BOOT0 fell LOW before the chip sampled it -> wire to PB8 "
-                      "open or pulldown wins. Chip will boot the app, NOT the ROM "
-                      "bootloader. Check GPIO%d->PB8 wiring.", STM_BOOT0_PIN);
-
-    // c) Brief startup window for the ROM to come up and begin polling its
-    //    interfaces. We then switch our UART to 8E1 and fire 0x7F immediately so
-    //    the ROM auto-baud locks onto USART1 (not I2C/SPI/USB).
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    ESP_LOGI(TAG, "STM32 should now be in ROM bootloader (HW reset, USART1 active)");
-
-    // 3) Switch the UART from the app's 1Mbaud 8N1 to the ROM bootloader's
-    //    115200 8E1. Full driver reinstall (the proven .end()/.begin() flow),
-    //    with TX held idle-high across the gap so the line never glitches.
-    switch_uart_to_bootloader();
-
-    // 5b) ONE-TIME SELF-TEST: prove the ESP UART can send+receive 0x7F at 8E1
-    //     internally (no wires). This decisively separates an ESP-side 8E1 config
-    //     bug from an external (wire signal / STM32) problem. We confirmed via USB
-    //     that the STM32 DOES enter the ROM bootloader, so if this loopback PASSES,
-    //     the failure is purely external (signal integrity or ROM interface lock).
-    uart_loopback_selftest();
-
-    // 6) NO settling delay — the ROM is polling interfaces RIGHT NOW and will lock
-    //    onto the first one with activity. We MUST send 0x7F immediately (driver
-    //    reinstall is <1ms, loopback added ~10ms, total ~20ms from NRST release).
-    //    The old 50ms delay gave other interfaces time to show noise → ROM locked
-    //    onto I2C/SPI/USB instead of USART1 → complete silence (proven by event log).
-
-    // 7) Drain any residual bytes so the FIRST thing we actively send is a
-    //    pristine 0x7F sync. Also clear the event queue so the error counts we
-    //    report afterward reflect ONLY the sync attempts (not the loopback test).
-    stmDrainRx();
-    if (s_uart_evt_q) xQueueReset(s_uart_evt_q);
 
     bool ok = false;
     const char *err = NULL;
     do {
-        if (!stmSync()) {
+        if (!entered) {
             err = "STM32 bootloader did not respond";
             // DECISIVE: report parity/frame errors captured during the 10 sync
             // attempts. This tells us if the STM32 replied but we dropped it.
