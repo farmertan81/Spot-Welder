@@ -5039,7 +5039,12 @@ int main(void) {
 
                 float t = readThermistor();
                 if (t > -50.0f && t < 200.0f) {
+                    /* Valid reading: apply exponential filter */
                     temp_filtered_c = (0.1f * t) + (0.9f * temp_filtered_c);
+                } else {
+                    /* Sensor fault (-99) or out-of-range: propagate immediately
+                     * instead of ignoring, so UI shows error state */
+                    temp_filtered_c = t;
                 }
             }
         }
