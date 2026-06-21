@@ -76,8 +76,10 @@ static const uint8_t STM_NACK = 0x1F;
 #define KATAPULT_CMD_COMPLETE     0x15
 #define KATAPULT_CMD_GET_CANBUS_ID 0x16
 
-// Katapult response codes
-#define KATAPULT_RESP_ACK         0xf0
+// Katapult response/ACK status codes (from flashtool.py: ACK_SUCCESS=0xa0,
+// NACK=0xf1, ACK_ERROR=0xf2, ACK_BUSY=0xf3). The status byte is the FIRST byte
+// after the 0x01 0x88 header in every response frame.
+#define KATAPULT_RESP_ACK         0xa0   // ACK_SUCCESS (was 0xf0 — wrong!)
 #define KATAPULT_RESP_NACK        0xf1
 #define KATAPULT_RESP_CMD_ERROR   0xf2
 #define KATAPULT_RESP_CMD_BUSY    0xf3
@@ -648,19 +650,24 @@ static bool stm32_enter_bootloader_hardware(void) {
 //  KATAPULT BOOTLOADER PROTOCOL (CRC-16-CCITT + framing)
 // ============================================================
 
-// CRC-16-CCITT (polynomial 0x1021, init 0xFFFF) - standard for Katapult protocol
+// CRC-16 exactly as Katapult computes it (scripts/flashtool.py crc16_ccitt):
+//     crc = 0xffff
+//     for b in buf:
+//         b   ^= crc & 0xff
+//         b   ^= (b & 0x0f) << 4
+//         crc  = ((b << 8) | (crc >> 8)) ^ (b >> 4) ^ (b << 3)
+// This is a byte-oriented reflected variant — NOT the textbook MSB-first
+// 0x1021 loop. They produce different values, so this MUST match byte-for-byte
+// or Katapult rejects every frame.
 static IRAM_ATTR uint16_t katapult_crc16(const uint8_t *data, size_t len) {
     uint16_t crc = 0xFFFF;
     for (size_t i = 0; i < len; i++) {
-        crc ^= (uint16_t)data[i] << 8;
-        for (int bit = 0; bit < 8; bit++) {
-            if (crc & 0x8000)
-                crc = (crc << 1) ^ 0x1021;
-            else
-                crc = crc << 1;
-        }
+        uint16_t b = (uint16_t)data[i];
+        b ^= crc & 0xFF;
+        b ^= (b & 0x0F) << 4;
+        crc = (uint16_t)(((b << 8) | (crc >> 8)) ^ (b >> 4) ^ (b << 3));
     }
-    return crc;
+    return crc & 0xFFFF;
 }
 
 // Send a Katapult command frame:
@@ -691,10 +698,11 @@ static IRAM_ATTR bool katapult_send_command(uint8_t cmd, const uint8_t *payload,
         idx += payload_bytes;
     }
 
-    // CRC covers: cmd + word_len + payload
+    // CRC covers: cmd + word_len + payload. Katapult sends it LITTLE-ENDIAN
+    // (struct.pack("<H", crc)) — low byte first, then high byte.
     uint16_t crc = katapult_crc16(frame + 2, idx - 2);
+    frame[idx++] = (uint8_t)(crc & 0xFF);  // CRC low byte first
     frame[idx++] = (uint8_t)(crc >> 8);    // CRC high byte
-    frame[idx++] = (uint8_t)(crc & 0xFF);  // CRC low byte
     frame[idx++] = KATAPULT_TRAILER1;  // 0x99
     frame[idx++] = KATAPULT_TRAILER2;  // 0x03
 
@@ -703,14 +711,25 @@ static IRAM_ATTR bool katapult_send_command(uint8_t cmd, const uint8_t *payload,
     return true;
 }
 
-// Receive a Katapult response frame.
-// Returns: response command ID (0x11, 0xf0, 0xf1, etc.) on success, or 0 on timeout/error
-// If payload_out is non-NULL, copies response payload there (max payload_max bytes)
-// Sets *payload_len_out to actual payload byte count
-static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t payload_max,
+// Receive a Katapult RESPONSE frame. The response layout differs from a command:
+//   <0x01 0x88> <ack_status> <word_len> <cmd_echo:4 LE> <data...> <crc:2 LE> <0x99 0x03>
+// where:
+//   ack_status = ACK_SUCCESS(0xa0) / NACK(0xf1) / ACK_ERROR(0xf2) / ACK_BUSY(0xf3)
+//   cmd_echo   = the command being acknowledged (first 4 payload bytes, LE u32)
+//   data       = the remaining (word_len*4 - 4) payload bytes
+//
+// Returns: ack_status byte on a well-formed frame, or 0 on timeout/CRC/trailer error.
+//   *echoed_cmd_out (if non-NULL) <- the acknowledged command (0 if no payload).
+//   payload_out (if non-NULL)     <- the data AFTER the 4-byte cmd echo.
+//   *payload_len_out (if non-NULL)<- length of that data in bytes.
+static IRAM_ATTR uint8_t katapult_recv_response(uint32_t *echoed_cmd_out,
+                                                 uint8_t *payload_out, size_t payload_max,
                                                  size_t *payload_len_out, int timeout_ms) {
     uint8_t frame[512];
     size_t idx = 0;
+
+    if (echoed_cmd_out)  *echoed_cmd_out = 0;
+    if (payload_len_out) *payload_len_out = 0;
 
     // Read header (0x01 0x88)
     int b = stmReadByte(timeout_ms);
@@ -727,14 +746,14 @@ static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t pay
     }
     frame[idx++] = (uint8_t)b;
 
-    // Read cmd
+    // Read ack/status byte
     b = stmReadByte(timeout_ms);
     if (b < 0) {
-        ESP_LOGW(TAG, "Katapult: timeout reading cmd");
+        ESP_LOGW(TAG, "Katapult: timeout reading ack status");
         return 0;
     }
-    uint8_t resp_cmd = (uint8_t)b;
-    frame[idx++] = resp_cmd;
+    uint8_t ack_status = (uint8_t)b;
+    frame[idx++] = ack_status;
 
     // Read word_len
     b = stmReadByte(timeout_ms);
@@ -751,7 +770,7 @@ static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t pay
         return 0;
     }
 
-    // Read payload
+    // Read payload (includes the 4-byte command echo as its first word)
     for (size_t i = 0; i < payload_bytes; i++) {
         b = stmReadByte(timeout_ms);
         if (b < 0) {
@@ -761,10 +780,10 @@ static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t pay
         frame[idx++] = (uint8_t)b;
     }
 
-    // Read CRC (2 bytes)
-    int crc_hi = stmReadByte(timeout_ms);
+    // Read CRC (2 bytes, LITTLE-ENDIAN: low byte first, then high byte)
     int crc_lo = stmReadByte(timeout_ms);
-    if (crc_hi < 0 || crc_lo < 0) {
+    int crc_hi = stmReadByte(timeout_ms);
+    if (crc_lo < 0 || crc_hi < 0) {
         ESP_LOGW(TAG, "Katapult: timeout reading CRC");
         return 0;
     }
@@ -782,23 +801,30 @@ static IRAM_ATTR uint8_t katapult_recv_response(uint8_t *payload_out, size_t pay
         return 0;
     }
 
-    // Verify CRC (covers cmd + word_len + payload, starting at frame[2])
+    // Verify CRC (covers ack + word_len + payload, starting at frame[2])
     uint16_t calc_crc = katapult_crc16(frame + 2, idx - 2);
     if (calc_crc != rx_crc) {
         ESP_LOGE(TAG, "Katapult: CRC mismatch: rx=0x%04X calc=0x%04X", rx_crc, calc_crc);
         return 0;
     }
 
-    // Copy payload to caller's buffer
-    if (payload_out && payload_bytes > 0) {
-        size_t to_copy = (payload_bytes < payload_max) ? payload_bytes : payload_max;
-        memcpy(payload_out, frame + 4, to_copy);
-    }
-    if (payload_len_out) {
-        *payload_len_out = payload_bytes;
+    // First payload word (if present) is the echoed command (little-endian).
+    if (payload_bytes >= 4 && echoed_cmd_out) {
+        *echoed_cmd_out = (uint32_t)frame[4] | ((uint32_t)frame[5] << 8) |
+                          ((uint32_t)frame[6] << 16) | ((uint32_t)frame[7] << 24);
     }
 
-    return resp_cmd;
+    // Copy the data AFTER the 4-byte command echo to the caller's buffer.
+    if (payload_bytes > 4) {
+        size_t data_bytes = payload_bytes - 4;
+        if (payload_out) {
+            size_t to_copy = (data_bytes < payload_max) ? data_bytes : payload_max;
+            memcpy(payload_out, frame + 8, to_copy);
+        }
+        if (payload_len_out) *payload_len_out = data_bytes;
+    }
+
+    return ack_status;
 }
 
 // ============================================================
@@ -869,65 +895,71 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
             break;
         }
 
-        // 4) Receive CONNECT response
-        uint8_t connect_resp[64];
-        size_t resp_len = 0;
-        uint8_t resp_cmd = katapult_recv_response(connect_resp, sizeof(connect_resp), &resp_len, 1000);
-        
+        // 4) Receive CONNECT response. A successful response has ack==ACK_SUCCESS
+        //    and echoes the CONNECT command (0x11) in the first payload word.
+        uint8_t  connect_resp[64];
+        size_t   resp_len = 0;
+        uint32_t echoed_cmd = 0;
+        uint8_t  ack = katapult_recv_response(&echoed_cmd, connect_resp,
+                                              sizeof(connect_resp), &resp_len, 1000);
+
         // If software entry failed, try hardware double-tap fallback
-        if (resp_cmd != KATAPULT_CMD_CONNECT) {
-            ESP_LOGW(TAG, "Katapult: software entry failed (resp 0x%02X), trying hardware double-tap fallback", resp_cmd);
+        if (ack != KATAPULT_RESP_ACK || echoed_cmd != KATAPULT_CMD_CONNECT) {
+            ESP_LOGW(TAG, "Katapult: software entry failed (ack 0x%02X, echo 0x%lX), trying hardware double-tap fallback",
+                     ack, (unsigned long)echoed_cmd);
             show_firmware_progress("STM32", 3, "Retrying with hardware reset...");
-            
+
             // Perform hardware double-tap on NRST
             katapult_double_tap_nrst();
-            
+
             // Switch to bootloader baud
             uart_set_baudrate(STM_BOOT_UART, KATAPULT_BAUD);
             uart_flush_input(STM_BOOT_UART);
             vTaskDelay(pdMS_TO_TICKS(50));
-            
+
             // Retry CONNECT
             ESP_LOGI(TAG, "Katapult: sending CONNECT (hardware entry)");
             if (!katapult_send_command(KATAPULT_CMD_CONNECT, NULL, 0)) {
                 err = "Failed to send CONNECT after hardware double-tap";
                 break;
             }
-            
-            resp_cmd = katapult_recv_response(connect_resp, sizeof(connect_resp), &resp_len, 1000);
-            
-            if (resp_cmd != KATAPULT_CMD_CONNECT) {
-                if (resp_cmd == KATAPULT_RESP_NACK) {
+
+            ack = katapult_recv_response(&echoed_cmd, connect_resp,
+                                         sizeof(connect_resp), &resp_len, 1000);
+
+            if (ack != KATAPULT_RESP_ACK || echoed_cmd != KATAPULT_CMD_CONNECT) {
+                if (ack == KATAPULT_RESP_NACK) {
                     err = "Katapult CONNECT: received NACK (both software and hardware entry failed)";
-                } else if (resp_cmd == 0) {
+                } else if (ack == 0) {
                     err = "Katapult CONNECT: timeout or frame error (both software and hardware entry failed)";
                 } else {
-                    snprintf(msg, msgn, "Katapult CONNECT: unexpected response 0x%02X (both software and hardware entry failed)", resp_cmd);
+                    snprintf(msg, msgn, "Katapult CONNECT: unexpected ack 0x%02X echo 0x%lX (both software and hardware entry failed)",
+                             ack, (unsigned long)echoed_cmd);
                     err = msg;
                 }
                 break;
             }
-            
+
             ESP_LOGI(TAG, "Katapult: hardware double-tap entry successful!");
         } else {
             ESP_LOGI(TAG, "Katapult: software entry successful!");
         }
 
-        // Parse CONNECT response: protocol_ver(1B) + app_start(4B) + block_size(4B) + mcu_type(16B) + version(16B)
-        if (resp_len < 9) {
+        // Parse CONNECT data (after the cmd echo): version(4B) + app_start(4B LE)
+        // + block_size(4B LE)  — matches flashtool.py struct.unpack("<4sII", ...).
+        if (resp_len < 12) {
             snprintf(msg, msgn, "Katapult CONNECT response too short: %u bytes", (unsigned)resp_len);
             err = msg;
             break;
         }
 
-        uint8_t proto_ver = connect_resp[0];
-        app_start = ((uint32_t)connect_resp[1] << 24) | ((uint32_t)connect_resp[2] << 16) |
-                    ((uint32_t)connect_resp[3] << 8)  | connect_resp[4];
-        block_size = ((uint32_t)connect_resp[5] << 24) | ((uint32_t)connect_resp[6] << 16) |
-                     ((uint32_t)connect_resp[7] << 8)  | connect_resp[8];
+        app_start = (uint32_t)connect_resp[4] | ((uint32_t)connect_resp[5] << 8) |
+                    ((uint32_t)connect_resp[6] << 16) | ((uint32_t)connect_resp[7] << 24);
+        block_size = (uint32_t)connect_resp[8] | ((uint32_t)connect_resp[9] << 8) |
+                     ((uint32_t)connect_resp[10] << 16) | ((uint32_t)connect_resp[11] << 24);
 
-        ESP_LOGI(TAG, "Katapult CONNECT OK: proto_ver=%u, app_start=0x%08lX, block_size=%lu",
-                 proto_ver, (unsigned long)app_start, (unsigned long)block_size);
+        ESP_LOGI(TAG, "Katapult CONNECT OK: app_start=0x%08lX, block_size=%lu",
+                 (unsigned long)app_start, (unsigned long)block_size);
 
         if (app_start != 0x08002000) {
             snprintf(msg, msgn, "Katapult app_start mismatch: 0x%08lX (expected 0x08002000)",
@@ -946,41 +978,51 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
         show_firmware_progress("STM32", 5, "Writing firmware...");
         ESP_LOGI(TAG, "Katapult: flashing %u bytes in %lu-byte blocks", (unsigned)len, (unsigned long)block_size);
         
+        // CRITICAL: Katapult's command_write_block (flashcmd.c) requires EXACTLY
+        // (BLOCK_SIZE/4)+1 words. The last block MUST be padded to FULL block_size,
+        // not just 4-byte aligned. The address field is the +1 word (little-endian).
         size_t done = 0;
         int last_pct = 5;
         while (done < len) {
             size_t remain = len - done;
             size_t chunk = (remain < block_size) ? remain : block_size;
 
-            // Pad to 4-byte boundary
             uint8_t block_buf[1024 + 4];
+            
+            // Copy the actual firmware data
             memcpy(block_buf + 4, fw + done, chunk);
-            size_t padded = chunk;
-            while (padded % 4) {
-                block_buf[4 + padded] = 0xFF;
-                padded++;
+
+            // Pad the rest of the block to FULL block_size with 0xFF (flash erased state)
+            // This matches flashtool.py: block + b'\xff' * (BLOCK_SIZE - len(block))
+            if (chunk < block_size) {
+                memset(block_buf + 4 + chunk, 0xFF, block_size - chunk);
             }
 
-            // Build payload: block_address (4 bytes) + block_data
+            // Build payload: block_address (4 bytes LITTLE-ENDIAN) + block_data (full block_size)
+            // Katapult expects little-endian uint32, NOT big-endian as we had before
             uint32_t block_addr = app_start + done;
-            block_buf[0] = (uint8_t)(block_addr >> 24);
-            block_buf[1] = (uint8_t)(block_addr >> 16);
-            block_buf[2] = (uint8_t)(block_addr >> 8);
-            block_buf[3] = (uint8_t)(block_addr & 0xFF);
+            block_buf[0] = (uint8_t)(block_addr & 0xFF);         // LSB first
+            block_buf[1] = (uint8_t)((block_addr >> 8) & 0xFF);
+            block_buf[2] = (uint8_t)((block_addr >> 16) & 0xFF);
+            block_buf[3] = (uint8_t)((block_addr >> 24) & 0xFF); // MSB last
 
-            if (!katapult_send_command(KATAPULT_CMD_SEND_BLOCK, block_buf, 4 + padded)) {
+            if (!katapult_send_command(KATAPULT_CMD_SEND_BLOCK, block_buf, 4 + block_size)) {
                 snprintf(msg, msgn, "Failed to send SEND_BLOCK at offset %u", (unsigned)done);
                 err = msg;
                 break;
             }
 
-            // Wait for ACK
-            uint8_t ack_resp = katapult_recv_response(NULL, 0, NULL, 1000);
-            if (ack_resp != KATAPULT_RESP_ACK) {
+            // Wait for ACK and verify echoed command
+            uint32_t echoed_cmd = 0;
+            uint8_t ack_resp = katapult_recv_response(&echoed_cmd, NULL, 0, NULL, 1000);
+            if (ack_resp != KATAPULT_RESP_ACK || echoed_cmd != KATAPULT_CMD_SEND_BLOCK) {
                 if (ack_resp == KATAPULT_RESP_NACK) {
                     snprintf(msg, msgn, "Katapult SEND_BLOCK NACK at offset %u", (unsigned)done);
                 } else if (ack_resp == KATAPULT_RESP_CMD_ERROR) {
-                    snprintf(msg, msgn, "Katapult SEND_BLOCK error at offset %u", (unsigned)done);
+                    snprintf(msg, msgn, "Katapult SEND_BLOCK CMD_ERROR at offset %u", (unsigned)done);
+                } else if (echoed_cmd != KATAPULT_CMD_SEND_BLOCK) {
+                    snprintf(msg, msgn, "Katapult SEND_BLOCK echo mismatch (got 0x%02lX, want 0x%02X) at offset %u",
+                             (unsigned long)echoed_cmd, KATAPULT_CMD_SEND_BLOCK, (unsigned)done);
                 } else {
                     snprintf(msg, msgn, "Katapult SEND_BLOCK unexpected response 0x%02X at offset %u",
                              ack_resp, (unsigned)done);
@@ -1011,9 +1053,11 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
             break;
         }
 
-        uint8_t eof_resp = katapult_recv_response(NULL, 0, NULL, 1000);
-        if (eof_resp != KATAPULT_RESP_ACK) {
-            snprintf(msg, msgn, "Katapult SEND_EOF response 0x%02X (want ACK 0xf0)", eof_resp);
+        uint32_t eof_echoed_cmd = 0;
+        uint8_t eof_resp = katapult_recv_response(&eof_echoed_cmd, NULL, 0, NULL, 1000);
+        if (eof_resp != KATAPULT_RESP_ACK || eof_echoed_cmd != KATAPULT_CMD_SEND_EOF) {
+            snprintf(msg, msgn, "Katapult SEND_EOF failed (ack=0x%02X want 0x%02X, echo=0x%02lX want 0x%02X)",
+                     eof_resp, KATAPULT_RESP_ACK, (unsigned long)eof_echoed_cmd, KATAPULT_CMD_SEND_EOF);
             err = msg;
             break;
         }
@@ -1026,9 +1070,11 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
             break;
         }
 
-        uint8_t complete_resp = katapult_recv_response(NULL, 0, NULL, 1000);
-        if (complete_resp != KATAPULT_RESP_ACK) {
-            snprintf(msg, msgn, "Katapult COMPLETE response 0x%02X (want ACK 0xf0)", complete_resp);
+        uint32_t complete_echoed_cmd = 0;
+        uint8_t complete_resp = katapult_recv_response(&complete_echoed_cmd, NULL, 0, NULL, 1000);
+        if (complete_resp != KATAPULT_RESP_ACK || complete_echoed_cmd != KATAPULT_CMD_COMPLETE) {
+            snprintf(msg, msgn, "Katapult COMPLETE failed (ack=0x%02X want 0x%02X, echo=0x%02lX want 0x%02X)",
+                     complete_resp, KATAPULT_RESP_ACK, (unsigned long)complete_echoed_cmd, KATAPULT_CMD_COMPLETE);
             err = msg;
             break;
         }
