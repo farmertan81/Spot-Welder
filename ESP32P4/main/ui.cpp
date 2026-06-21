@@ -3081,9 +3081,10 @@ void ui_update(const WelderDisplayState& st) {
     // ---- Temperature ----
     {
         bool fin = isfinite(st.temperature);
-        if (lbl_temp && (first_run || fin != prev_temp_fin ||
-                         (fin && fabsf(st.temperature - prev_temp) >= 0.05f))) {
-            if (fin) {
+        bool valid = fin && st.temperature >= -50.0f;  // -99 = sensor fault
+        if (lbl_temp && (first_run || valid != prev_temp_fin ||
+                         (valid && fabsf(st.temperature - prev_temp) >= 0.05f))) {
+            if (valid) {
                 snprintf(buf, sizeof(buf),
                          "%.1f \xC2\xB0"
                          "C",
@@ -3096,7 +3097,7 @@ void ui_update(const WelderDisplayState& st) {
                 lv_obj_set_style_text_color(lbl_temp, C_RED, LV_PART_MAIN);
             }
             prev_temp = st.temperature;
-            prev_temp_fin = fin;
+            prev_temp_fin = valid;
         }
     }
 
