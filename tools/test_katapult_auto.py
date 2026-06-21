@@ -42,11 +42,42 @@ def main():
         ser = serial.Serial(port, 1000000, timeout=0.5)
         time.sleep(0.1)
         
+        # First, drain any STATUS messages the app is streaming so we have a clean view
+        ser.reset_input_buffer()
+        time.sleep(0.05)
+
         print("Step 2: Sending BOOTLOADER command...")
         ser.write(b"BOOTLOADER\n")
         ser.flush()
+
+        # CRITICAL DIAGNOSTIC: read the app's reply at 1Mbaud BEFORE the reset.
+        # If the command reached the STM32 RX pin (PA10), the app prints
+        # "ACK,BOOTLOADER" then resets. If we see NO ack and STATUS keeps
+        # streaming, the TX->PA10 wire is not connected (monitor-only link).
+        print("        Listening at 1Mbaud for the app's reply (250ms)...")
+        time.sleep(0.05)
+        reply = ser.read(400)
+        try:
+            reply_txt = reply.decode('ascii', errors='replace')
+        except Exception:
+            reply_txt = repr(reply)
+
+        if b"ACK,BOOTLOADER" in reply or b"KATAPULT" in reply.upper():
+            print("        ✅ App acknowledged the command (ACK,BOOTLOADER seen).")
+            print("           -> Command path OK, STM32 is resetting into Katapult.")
+        elif b"STATUS" in reply:
+            print("        ⚠️  App is STILL streaming STATUS - command was NOT acted on.")
+            print("           -> Most likely the serial TX line is NOT wired to STM32 PA10 (RX).")
+            print("           -> Your link is probably monitor-only (STM32 TX -> adapter RX only).")
+            print(f"           Raw 1Mbaud reply snippet: {reply_txt[:120]!r}")
+        elif len(reply) == 0:
+            print("        ⚠️  Silence at 1Mbaud after the command.")
+            print("           -> STM32 may have reset; continuing to Katapult check.")
+        else:
+            print(f"        Reply ({len(reply)} bytes): {reply_txt[:120]!r}")
+
         print("         (STM32 should reset into Katapult now)")
-        time.sleep(0.5)  # Wait for reset + Katapult init
+        time.sleep(0.4)  # Wait for reset + Katapult init
         
         # Step 3: Switch to Katapult baud (250k)
         print("Step 3: Switching to 250,000 baud (Katapult mode)...")
