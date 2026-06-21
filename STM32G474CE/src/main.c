@@ -3619,7 +3619,7 @@ static void MX_USART1_UART_Init(void) {
     __HAL_RCC_USART1_CLK_ENABLE();
 
     huart1.Instance = USART1;
-    huart1.Init.BaudRate = 1000000;  // 1 Mbaud — stable link without HW flow control
+    huart1.Init.BaudRate = 576000;  // 576 kbaud — safe through UART3-IN level shifters
     huart1.Init.WordLength = UART_WORDLENGTH_8B;
     huart1.Init.StopBits = UART_STOPBITS_1;
     huart1.Init.Parity = UART_PARITY_NONE;

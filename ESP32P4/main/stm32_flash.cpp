@@ -50,11 +50,11 @@ static const char *TAG = "STM32_FLASH";
 
 // ---- Pins / UART (MUST match welder_main.cpp) ----
 #define STM_BOOT_UART       UART_NUM_1
-#define STM_TX_PIN          29   // ESP32 TX -> STM32 RX
-#define STM_RX_PIN          30   // ESP32 RX <- STM32 TX
+#define STM_TX_PIN          27   // ESP32 TX -> STM32 RX (UART3-IN header Pin 1)
+#define STM_RX_PIN          28   // ESP32 RX <- STM32 TX (UART3-IN header Pin 2)
 #define STM_BOOT0_PIN       31   // ESP32 -> STM32 BOOT0 strap
 #define STM_NRST_PIN        32   // ESP32 -> STM32 NRST (hardware reset)
-#define STM_APP_BAUD        1000000  // normal application link (8N1)
+#define STM_APP_BAUD        576000  // normal application link (8N1) — UART3-IN header
 
 // ---- AN3155 / bootloader constants ----
 static const uint8_t STM_ACK  = 0x79;
@@ -1162,7 +1162,7 @@ static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) 
             //    bootloader during a WIRELESS flash (physical-button DFU success
             //    does NOT prove the ESP's GPIO31/GPIO32 control works).
             uart_wait_tx_done(STM_BOOT_UART, pdMS_TO_TICKS(50));
-            uart_set_baudrate(STM_BOOT_UART, 1000000);
+            uart_set_baudrate(STM_BOOT_UART, STM_APP_BAUD);
             uart_set_word_length(STM_BOOT_UART, UART_DATA_8_BITS);
             uart_set_parity(STM_BOOT_UART, UART_PARITY_DISABLE);
             uart_set_stop_bits(STM_BOOT_UART, UART_STOP_BITS_1);

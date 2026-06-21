@@ -49,13 +49,13 @@ static const char *TAG = "WELDER_UI";
 //  PINS / CONSTANTS
 // ============================================================
 #define STM32_UART_NUM      UART_NUM_1
-#define STM32_TX_PIN        29
-#define STM32_RX_PIN        30
+#define STM32_TX_PIN        27  // UART3-IN header Pin 1 (TXD) -> GPIO27
+#define STM32_RX_PIN        28  // UART3-IN header Pin 2 (RXD) -> GPIO28
 #define STM32_BOOT0_PIN     31
 #define STM32_NRST_PIN      32  // hardware reset for ROM bootloader entry
 #define BUF_SIZE            8192  // WAVEFORM_DATA lines can be huge (OLD board used 8192)
-#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (still generous at 1 Mbaud)
-#define STM32_BAUD          1000000  // 1 Mbaud — stable link without HW flow control
+#define UART_RX_BUF_SIZE    (128 * 1024)  // 128 KB buffer (generous for 576k baud)
+#define STM32_BAUD          576000  // 576 kbaud — safe through UART3-IN level shifters
 // WiFi credentials, captive portal and the Flask TCP bridge (port 8888) are all
 // handled in wifi_bridge.cpp (provisioning is done at runtime, stored in NVS).
 
