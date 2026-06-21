@@ -56,33 +56,6 @@
         "panel": "shared",
         "clear": true
       }
-    },
-    {
-      // ONE-CLICK: Build STM32 firmware (PlatformIO) + flash it wirelessly.
-      // This is the complete end-to-end workflow: edit STM32 code -> run this task.
-      "label": "Build & Flash STM32 (PlatformIO + WiFi)",
-      "dependsOn": ["Build STM32 firmware (PlatformIO)", "Flash STM32 over WiFi"],
-      "dependsOrder": "sequence",
-      "problemMatcher": [],
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "clear": true
-      }
-    },
-    {
-      // Sub-task: Build the STM32 firmware using PlatformIO CLI.
-      // The STM32G474CE project is a sibling to ESP32P4.
-      "label": "Build STM32 firmware (PlatformIO)",
-      "type": "shell",
-      "command": "pio",
-      "args": ["run", "-d", "${workspaceFolder}/../STM32G474CE", "-e", "g474ceu6_stlink"],
-      "problemMatcher": ["$platformio"],
-      "presentation": {
-        "reveal": "always",
-        "panel": "shared",
-        "clear": false
-      }
     }
   ],
   "inputs": [
