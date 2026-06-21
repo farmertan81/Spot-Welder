@@ -3953,6 +3953,17 @@ static uint32_t adcReadChannel(uint32_t channel) {
 
 static float readThermistor(void) {
     uint32_t raw = adcReadChannel(ADC_CHANNEL_1);
+    
+    /* DEBUG: Log raw ADC value every 5 seconds to diagnose disconnected sensor */
+    static uint32_t last_debug_ms = 0;
+    uint32_t now = HAL_GetTick();
+    if ((now - last_debug_ms) >= 5000) {
+        last_debug_ms = now;
+        char dbg[64];
+        snprintf(dbg, sizeof(dbg), "THERM_DEBUG,raw=%lu\r\n", (unsigned long)raw);
+        uartSend(dbg);
+    }
+    
     if (raw == 0xFFFF || raw < 10 || raw > 4085) return -99.0f;
 
     float vdda =
