@@ -138,9 +138,21 @@ CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CLK=26
 CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CS=29
 CONFIG_ESP_HOSTED_SPI_GPIO_HANDSHAKE=30
 CONFIG_ESP_HOSTED_SPI_GPIO_DATA_READY=31
-# Reset: use XIAO's EN pin (no dedicated P4 GPIO needed)
-CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=-1
-CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_HIGH=y
+# Reset slave: GPIO32 (the freed STM32 NRST pin), wired to the XIAO RST/EN.
+# IMPORTANT: do NOT use -1 here — the esp-hosted Kconfig clamps this symbol to
+# range [0,100], so a negative value is silently rejected and reverts to the
+# P4 default of 12, which is LCD_G2 (a live RGB-panel data line!). GPIO32 gives
+# the host a real reset line to resync the XIAO at boot and keeps reset off the
+# LCD bus.  (XIAO C6 reset/EN <- P4 GPIO32.)
+CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=32
+# Reset polarity: ACTIVE-LOW. The XIAO C6 reset is its EN pin, which is
+# active-low (LOW = held in reset, HIGH = running). esp-hosted's reset sequence
+# is: idle = !active, then pulse to active, then release to !active. With
+# ACTIVE-LOW that becomes idle=HIGH (XIAO runs), pulse=LOW (XIAO in reset),
+# release=HIGH (XIAO boots) — correct. If we left this ACTIVE-HIGH the levels
+# invert and the XIAO would be held in reset forever (LCD/UI fine, WiFi dead).
+# CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_HIGH is not set
+CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_LOW=y
 # Handshake/DataReady polarity
 CONFIG_ESP_HOSTED_HS_ACTIVE_HIGH=y
 CONFIG_ESP_HOSTED_DR_ACTIVE_HIGH=y

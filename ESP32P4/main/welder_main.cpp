@@ -962,89 +962,28 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "===== ESP32-P4 Welder Display (UI port) =====");
 
-    // BOOT0 LOW first so the STM32 stays in application mode.
-    // INPUT_OUTPUT (not plain OUTPUT) so the input buffer stays enabled and
-    // gpio_get_level() reads the ACTUAL pad voltage — this lets stm32_flash.cpp
-    // verify BOOT0 truly drives HIGH before a flash (an output-only pin always
-    // reads back 0 because its input register is disconnected).
-    gpio_config_t boot0 = {};
-    boot0.pin_bit_mask = (1ULL << STM32_BOOT0_PIN);
-    boot0.mode = GPIO_MODE_INPUT_OUTPUT;
-    boot0.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    gpio_config(&boot0);
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
-    // CRITICAL: WeAct G474 has R2 10k pull-DOWN on PB8. Set GPIO31 to MAXIMUM
-    // drive strength (~20mA) to guarantee it overcomes the pulldown + any wire
-    // resistance and holds PB8 reliably HIGH during the reset pulse.
-    gpio_set_drive_capability((gpio_num_t)STM32_BOOT0_PIN, GPIO_DRIVE_CAP_3);
-    // Dump GPIO31's IO-mux state: if it prints "**RESERVED**" the pin is owned
-    // by the flash/PSRAM controller and CANNOT be used for BOOT0 (pick another).
-    ESP_LOGI(TAG, "GPIO%d (BOOT0) set LOW; readback=%d, dumping IO config:",
-             STM32_BOOT0_PIN, gpio_get_level((gpio_num_t)STM32_BOOT0_PIN));
-    gpio_dump_io_configuration(stdout, (1ULL << STM32_BOOT0_PIN));
-
-    // ---- BOOT0 self-test (safe: no STM32 reset happens here) ----
-    // Drive GPIO31 HIGH briefly and read the actual pad voltage back. This is a
-    // standalone wiring diagnostic that does NOT need a flash/WiFi cycle:
-    //   readback=1 -> the ESP pin drives HIGH fine. If a flash still fails with
-    //                 the app restarting, the WIRE to the STM32 BOOT0 pad is
-    //                 open/wrong, or the STM32 option bytes ignore BOOT0.
-    //   readback=0 -> something EXTERNAL is clamping GPIO31 low (a hard short to
-    //                 GND, or a very strong pulldown on the STM32 side). A normal
-    //                 push-pull output beats the on-chip ~45k pulldown, so a 0
-    //                 here means a real external load.
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    int b0_hi = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    int b0_lo = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
-    ESP_LOGW(TAG, "BOOT0 self-test: driven HIGH readback=%d, driven LOW "
-                  "readback=%d  (want 1 then 0)", b0_hi, b0_lo);
-    if (b0_hi != 1)
-        ESP_LOGE(TAG, "BOOT0 cannot reach HIGH — external short/strong pulldown "
-                      "on GPIO%d, the strap will never enter the ROM bootloader",
-                 STM32_BOOT0_PIN);
-
-    // Release BOOT0 to Hi-Z now that the self-test is done. The board's 10k
-    // pulldown holds PB8 LOW (app mode) on its own, and releasing the line means
-    // the ESP is NOT fighting an attached ST-Link/SWD debugger on the shared
-    // strap. The flasher re-claims the pin only for the brief hardware pulse.
-    gpio_set_direction((gpio_num_t)STM32_BOOT0_PIN, GPIO_MODE_INPUT);
-
-    // ---- NRST (hardware reset) init ----
-    // NRST is active-LOW. The STM32 has an internal weak pull-up (~40k), but we
-    // drive it HIGH explicitly from the ESP to guarantee a clean idle state. We
-    // use INPUT_OUTPUT mode like BOOT0 so stm32_flash.cpp can read back the pin
-    // to verify it drives both levels correctly.
-    gpio_config_t nrst = {};
-    nrst.pin_bit_mask = (1ULL << STM32_NRST_PIN);
-    nrst.mode = GPIO_MODE_INPUT_OUTPUT;
-    nrst.pull_up_en = GPIO_PULLUP_ENABLE;  // match the STM32 internal pull-up
-    gpio_config(&nrst);
-    // Max drive strength so the push-pull HIGH charges the WeAct board's NRST
-    // reset capacitor (~100nF) FAST and overpowers the STM32's internal reset
-    // pulldown. The previous flash log showed NRST reading back 0 right after
-    // release; boosting drive + a proper settle below tells us whether that was
-    // just the RC cap charging (recovers to 1) or a real short/clamp (stays 0).
-    gpio_set_drive_capability((gpio_num_t)STM32_NRST_PIN, GPIO_DRIVE_CAP_3);
-    gpio_set_level((gpio_num_t)STM32_NRST_PIN, 1);  // idle HIGH (not in reset)
-    // Settle, then sample twice so we can see if the line holds high on its own.
-    vTaskDelay(pdMS_TO_TICKS(5));
-    int nrst_rb1 = gpio_get_level((gpio_num_t)STM32_NRST_PIN);
-    ESP_LOGI(TAG, "GPIO%d (NRST) set HIGH (drive=CAP_3); readback=%d (want 1)",
-             STM32_NRST_PIN, nrst_rb1);
-    if (nrst_rb1 != 1)
-        ESP_LOGE(TAG, "NRST cannot reach HIGH even at idle -> hard short to GND or "
-                      "wrong pin. The STM32 will be stuck in reset.");
-
-    // Release NRST to Hi-Z now that the self-test is done. The STM32's internal
-    // ~40k pull-up holds NRST HIGH (not in reset) on its own. CRITICAL: this hands
-    // the reset line back to any attached ST-Link/SWD debugger. While the ESP held
-    // NRST as a strong push-pull HIGH, the ST-Link could not connect
-    // ("DEV_TARGET_HELD_UNDER_RESET") and SWD programming could be corrupted. The
-    // flasher re-claims NRST only for its brief reset pulses.
-    gpio_set_direction((gpio_num_t)STM32_NRST_PIN, GPIO_MODE_INPUT);
+    // ---- GPIO31 / GPIO32 are now owned by the esp-hosted WiFi link ----
+    // These two pins were formerly the STM32 ROM-bootloader straps (GPIO31=BOOT0,
+    // GPIO32=NRST). The STM32 is no longer flashed/reset from the P4 over these
+    // straps, so both pins are repurposed for the external XIAO ESP32-C6 SPI link:
+    //
+    //   GPIO31 -> esp-hosted SPI "Data Ready"  (input, IRQ; XIAO D7/GPIO17)
+    //   GPIO32 -> esp-hosted SPI "Reset Slave" (output pulse; XIAO RST/EN)
+    //
+    // CRITICAL: esp-hosted configures GPIO31 as its Data-Ready INTERRUPT during
+    // transport init (which runs BEFORE app_main). The old code here used to
+    // reconfigure GPIO31 as a push-pull OUTPUT for a BOOT0 self-test ~26 ms later,
+    // which CLOBBERED esp-hosted's interrupt on the DR line and broke the SPI
+    // handshake (slave logged "rx_pkt len+offset[131070]", host timed out with
+    // "Failed to get ESP_Hosted slave transport up"). That self-test is removed.
+    // Do NOT drive GPIO31 or GPIO32 from here — esp-hosted owns them now.
+    //
+    // The esp-hosted reset GPIO is set via menuconfig / sdkconfig:
+    //   CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=32   (was defaulting to 12=LCD_G2!)
+    // Routing reset to GPIO32 (a) gives the host a REAL reset line to the XIAO so
+    // host+slave start their transaction state machines in sync, and (b) moves
+    // reset OFF GPIO12, which is LCD_G2 on the RGB panel (the old default toggled
+    // a live display data line every boot).
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();
