@@ -40,7 +40,11 @@ esp32/wifi_config_from_esp_live.py
 **/.pio/
 
 # VS Code local settings and generated files
-.vscode/
-**/.vscode/
+.vscode/*
+**/.vscode/*
+# ...but DO track tasks.json so the pinned Flash-over-WiFi / Flash-STM32-over-WiFi
+# tasks sync across machines (they were lost when .vscode got fully ignored).
+!.vscode/tasks.json
+!**/.vscode/tasks.json
 # VM agent tool logs (not part of project)
 .logs/
