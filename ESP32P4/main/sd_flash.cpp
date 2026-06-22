@@ -117,8 +117,8 @@ static bool sd_flash_force_remount(void)
 
     // If currently mounted, unmount and deinit
     if (g_sd_mounted) {
-        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
-        s_card = NULL;
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, g_sd_card);
+        g_sd_card = NULL;
         g_sd_mounted = false;
         ESP_LOGI(TAG, "  Unmounted stale card");
     }
