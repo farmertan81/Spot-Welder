@@ -74,47 +74,76 @@ CONFIG_ESP_TASK_WDT_TIMEOUT_S=60
 #   Component config -> ESP System Settings
 #     -> Task Watchdog timeout period (seconds)        = 30
 
-# ===== WiFi / radio (ESP32-P4 + onboard ESP32-C6) =====
-# The ESP32-P4 has NO native WiFi radio. On this CrowPanel board the radio is
-# the onboard ESP32-C6, reached over SDIO via the esp_hosted / esp_wifi_remote
-# managed components (declared in main/idf_component.yml). The standard esp_wifi
-# API in wifi_bridge.cpp works transparently through that link.
+# ===== WiFi / radio (ESP32-P4 + external XIAO ESP32-C6) =====
+# The ESP32-P4 has NO native WiFi radio. WiFi is provided by an EXTERNAL Seeed
+# XIAO ESP32-C6 connected via SPI to the CrowPanel J7 wireless module header.
+# This frees the P4's SDMMC controller for the SD card (avoiding the SDIO conflict
+# with the onboard C6). The standard esp_wifi API in wifi_bridge.cpp works
+# transparently through esp_hosted / esp_wifi_remote (main/idf_component.yml).
 #
-# --- ESP-Hosted SDIO transport pins (CrowPanel Advance ESP32-P4 5" V1.0) ---
-# CRITICAL: the esp_hosted defaults (CLK18 CMD19 D0-14..D3-17, reset GPIO54
-# active-low) are for Espressif's own P4 EV board and are WRONG for this
-# CrowPanel. With the wrong pins the C6 never answers and the boot log shows:
-#     E SD_HOST: sd_host_start_command returned 0x107   (0x107 = TIMEOUT)
-#     E sdio_wrapper: sdmmc_card_init failed
-#     E transport: ensure_slave_bus_ready failed / "ESP-Hosted link not yet up"
+# --- ESP-Hosted SPI transport pins (J7 header → XIAO C6 slave) ---
+# CRITICAL: These pins connect the P4 SPI master to the XIAO C6 SPI slave via
+# the J7 wireless module header. The XIAO slave firmware (xiao-c6-slave) MUST
+# be flashed with matching pin configuration (see INTEGRATION_GUIDE.md).
 #
-# The values below are taken verbatim from Elecrow's official CrowPanel ESP-IDF
-# example (Squareline_LVGL_LED/sdkconfig.defaults) and Arduino board_config.h,
-# cross-checked against the V1.0 schematic. Reset is GPIO20 ACTIVE-HIGH.
+# Physical wiring (verified against CrowPanel V1.0 schematic):
+#   Signal      | P4 GPIO | J7 Pin | XIAO Pin | XIAO GPIO
+#   ------------|---------|--------|----------|----------
+#   MOSI        | 48      | —      | D10      | 18
+#   MISO        | 47      | —      | D9       | 20
+#   CLK         | 26      | —      | D8       | 19
+#   CS          | 29      | —      | D2       | 2
+#   Handshake   | 30      | —      | D1       | 1
+#   Data Ready  | 31      | —      | D7       | 17
+#   Power       | —       | 3V3    | 3V3      | —
+#   Ground      | —       | GND    | GND      | —
+#
+# ⚠️  DO NOT connect XIAO D4/D5 (GPIO22/23) — they are physically wired to the
+#     P4's I2C bus (GT911 touch + STC8 backlight controller).
+#
 # These CONFIG_ESP_HOSTED_* symbols are provided by the esp_hosted managed
-# component (declared in main/idf_component.yml), so they resolve fine here —
-# unlike the native-WiFi CONFIG_ESP_WIFI_* symbols that broke an earlier build.
+# component (declared in main/idf_component.yml).
 CONFIG_ESP_HOSTED_ENABLED=y
-CONFIG_ESP_HOSTED_PRIV_SDIO_OPTION=y
+# Transport: SPI only (not SDIO, not UART, not SPI-HD)
+CONFIG_ESP_HOSTED_SPI_HOST_INTERFACE=y
+# CONFIG_ESP_HOSTED_SDIO_HOST_INTERFACE is not set
+# CONFIG_ESP_HOSTED_SPI_HD_HOST_INTERFACE is not set
+# CONFIG_ESP_HOSTED_UART_HOST_INTERFACE is not set
 CONFIG_ESP_HOSTED_IDF_SLAVE_TARGET="esp32c6"
-CONFIG_ESP_HOSTED_SDIO_RESET_ACTIVE_HIGH=y
-CONFIG_ESP_HOSTED_SDIO_SLOT_1=y
-CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=y
-CONFIG_ESP_HOSTED_SDIO_CLOCK_FREQ_KHZ=40000
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CMD_SLOT_1=54
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_CLK_SLOT_1=53
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D0_SLOT_1=52
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D1_4BIT_BUS_SLOT_1=51
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D2_4BIT_BUS_SLOT_1=50
-CONFIG_ESP_HOSTED_PRIV_SDIO_PIN_D3_4BIT_BUS_SLOT_1=49
-CONFIG_ESP_HOSTED_SDIO_GPIO_RESET_SLAVE=20
+# Select co-processor target (enables C6-specific config)
+CONFIG_ESP_HOSTED_CP_TARGET_ESP32C6=y
+# No dev board preset (custom J7 wiring)
+CONFIG_ESP_HOSTED_P4_DEV_BOARD_NONE=y
+# SPI Controller (HSPI = SPI1)
+CONFIG_ESP_HOSTED_SPI_HSPI=y
+CONFIG_ESP_HOSTED_SPI_CONTROLLER=1
+# SPI Mode 3 (CPOL=1, CPHA=1) - required for non-ESP32 slaves
+CONFIG_ESP_HOSTED_SPI_PRIV_MODE_3_ESP32XX=y
+CONFIG_ESP_HOSTED_SPI_MODE=3
+# SPI Master GPIOs (P4 side, J7 header)
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_MOSI=48
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_MISO=47
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CLK=26
+CONFIG_ESP_HOSTED_SPI_HSPI_GPIO_CS=29
+CONFIG_ESP_HOSTED_SPI_GPIO_HANDSHAKE=30
+CONFIG_ESP_HOSTED_SPI_GPIO_DATA_READY=31
+# Reset: use XIAO's EN pin (no dedicated P4 GPIO needed)
+CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=-1
+CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_HIGH=y
+# Handshake/DataReady polarity
+CONFIG_ESP_HOSTED_HS_ACTIVE_HIGH=y
+CONFIG_ESP_HOSTED_DR_ACTIVE_HIGH=y
+# SPI frequency (start conservatively at 20 MHz; can increase if stable)
+CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=20
 #
-# Boot log should now print: CLK[53] CMD[54] D0[52] D1[51] D2[50] D3[49]
-# Slave_Reset[20]. If the C6 still won't enumerate, its factory slave firmware
-# (esp_hosted v2.3.0) is buggy on SDIO — drop to 1-bit bus (set
-# CONFIG_ESP_HOSTED_SDIO_4_BIT_BUS=n) and/or 20 MHz, or update the C6 firmware
-# (see crowpanel-p4-c6-sdio-ota). wifi_stack_init() already treats a failed link
-# as NON-FATAL so the welder UI keeps running either way.
+# Boot log should now print: SPI transport initialized, MOSI[48] MISO[47] CLK[26]
+# CS[29] HS[30] DR[31]. If the XIAO C6 doesn't respond:
+#  1. Verify XIAO slave firmware is flashed (see xiao-c6-slave/BUILD_INSTRUCTIONS.md)
+#  2. Check wiring: all 6 signal pins + 3V3 + GND connected to J7 header
+#  3. Verify XIAO boots (serial monitor shows "SPI slave initialized")
+#
+# wifi_stack_init() treats a failed link as NON-FATAL so the welder UI keeps
+# running either way (with WiFi disabled).
 #
 # WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
 # buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
