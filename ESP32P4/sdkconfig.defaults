@@ -148,6 +148,12 @@ CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=20
 # WiFi station+AP (provisioning) mode is enabled at runtime by wifi_bridge.cpp;
 # buffer settings use ESP-IDF defaults — tune via menuconfig if needed.
 
+# ===== Chip Revision =====
+# Allow early P4 silicon (rev v1.x). Default in IDF v6.0.1 is v3.0+ (ECO5),
+# which causes flash error: "bootloader requires chip revision [v3.1 - v3.99]".
+# Your P4 is rev v1.3, so we set minimum to v0.0 to cover all revisions.
+CONFIG_ESP32P4_REV_MIN_0=y
+
 # ===== Flash Size =====
 # CrowPanel P4 has 16 MB flash (verify via: esptool.py --port COM6 flash_id).
 # The default 2 MB setting in a fresh sdkconfig is wrong and causes partition
