@@ -985,6 +985,31 @@ extern "C" void app_main(void)
     // reset OFF GPIO12, which is LCD_G2 on the RGB panel (the old default toggled
     // a live display data line every boot).
 
+    // ---- SPI WiFi-link pin diagnostic (one-time, at boot) ----
+    // The XIAO slave reads pristine 0xFF on MOSI even at 2 MHz with a fully
+    // soldered board-to-board header. The remaining firmware-checkable cause is
+    // that one of these pins is owned by the octal PSRAM / flash MSPI controller
+    // (this P4 has 32MB PSRAM active). A pad owned by MSPI CANNOT be driven out
+    // to the header — esp-hosted's SPI init still "succeeds" via the GPIO matrix,
+    // but the external pin floats idle-HIGH -> the slave reads all-0xFF forever.
+    //
+    // gpio_dump_io_configuration prints "**RESERVED**" for any pin occupied by
+    // flash/PSRAM. If MOSI(48) or any other line below shows RESERVED, that pin
+    // must be remapped to a truly-free GPIO — reseating the header will NOT help.
+    {
+        const uint64_t spi_pins =
+            (1ULL << 26) |  // CLK
+            (1ULL << 29) |  // CS
+            (1ULL << 30) |  // Handshake
+            (1ULL << 31) |  // Data Ready
+            (1ULL << 47) |  // MISO (host input)
+            (1ULL << 48);   // MOSI (host output)  <-- prime suspect
+        ESP_LOGW(TAG, "===== SPI WiFi-link pin dump (look for **RESERVED**) =====");
+        ESP_LOGW(TAG, "Expected roles: CLK:26 CS:29 HS:30 DR:31 MISO:47 MOSI:48");
+        gpio_dump_io_configuration(stdout, spi_pins);
+        ESP_LOGW(TAG, "===== end SPI pin dump =====");
+    }
+
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();
     memset(&g_state, 0, sizeof(g_state));
