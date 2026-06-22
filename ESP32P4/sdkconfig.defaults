@@ -144,8 +144,14 @@ CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_HIGH=y
 # Handshake/DataReady polarity
 CONFIG_ESP_HOSTED_HS_ACTIVE_HIGH=y
 CONFIG_ESP_HOSTED_DR_ACTIVE_HIGH=y
-# SPI frequency (start conservatively at 20 MHz; can increase if stable)
-CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=20
+# SPI frequency: 10 MHz.
+# IMPORTANT: The XIAO C6 slave pins (GPIO 18/19/20/2) are routed through the
+# GPIO MATRIX, not the dedicated FSPI IOMUX pins. SPI slave via GPIO matrix has
+# an input-delay limit and cannot reliably sample at 20 MHz — the link starts
+# (slave logs "ESPInit") then corrupts with "rx_pkt len+offset[131070]>max[1600]"
+# (an all-0xFF / idle-high read). 10 MHz is within the GPIO-matrix slave limit.
+# If still unstable, drop further to 5 MHz.
+CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=10
 #
 # Boot log should now print: SPI transport initialized, MOSI[48] MISO[47] CLK[26]
 # CS[29] HS[30] DR[31]. If the XIAO C6 doesn't respond:
