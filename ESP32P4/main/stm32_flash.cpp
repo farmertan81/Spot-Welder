@@ -1095,7 +1095,11 @@ static bool katapult_flash_worker(const uint8_t *fw, size_t len, char *msg, size
 // ============================================================
 //  LEGACY AN3155 FLASH WORKER (kept for fallback/comparison)
 // ============================================================
+// Marked __attribute__((unused)): the active path is katapult_flash_worker().
+// This AN3155 implementation is retained for reference/fallback but not called,
+// so we explicitly silence the -Wunused-function warning.
 
+__attribute__((unused))
 static bool flash_worker(const uint8_t *fw, size_t len, char *msg, size_t msgn) {
     // 1) Park stm32_task and quiet the LCD bus (frees the UART + PSRAM bandwidth).
     welder_prep_stm32_flash();

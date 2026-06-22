@@ -9,6 +9,7 @@
 #include "esp_err.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_heap_caps.h"   // heap_caps_malloc / heap_caps_free / MALLOC_CAP_SPIRAM
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -174,7 +175,7 @@ bool sd_flash_esp32(void)
     }
 
     // Show progress UI (initial state: 0%)
-    show_firmware_progress("ESP32-P4", 0);
+    show_firmware_progress("ESP32-P4", 0, "Writing firmware...");
 
     // Read and write firmware in chunks
     size_t bytes_written = 0;
@@ -199,7 +200,7 @@ bool sd_flash_esp32(void)
         bytes_written += rd;
         int pct = (int)((bytes_written * 100) / fw_size);
         if (pct != last_pct && pct <= 100) {
-            show_firmware_progress("ESP32-P4", pct);
+            show_firmware_progress("ESP32-P4", pct, NULL);
             last_pct = pct;
         }
 
