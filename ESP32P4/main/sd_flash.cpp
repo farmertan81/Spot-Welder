@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <errno.h>
 
 static const char *TAG = "SD_FLASH";
@@ -119,6 +120,19 @@ bool sd_flash_esp32(void)
     }
 
     ESP_LOGI(TAG, "Starting ESP32-P4 flash from %s", SD_ESP32_FW_PATH);
+
+    // DEBUG: List SD card root to verify file presence
+    ESP_LOGI(TAG, "SD card root directory listing:");
+    DIR *dir = opendir(SD_MOUNT_POINT);
+    if (dir) {
+        struct dirent *entry;
+        while ((entry = readdir(dir)) != NULL) {
+            ESP_LOGI(TAG, "  %s", entry->d_name);
+        }
+        closedir(dir);
+    } else {
+        ESP_LOGE(TAG, "Failed to open SD root: %s", strerror(errno));
+    }
 
     // Check if file exists and get size
     struct stat st;
