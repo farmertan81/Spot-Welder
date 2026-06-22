@@ -113,31 +113,43 @@ bool sd_flash_is_mounted(void)
 // Shows progress UI during the flash.
 bool sd_flash_esp32(void)
 {
+    // Lazy mount: if card wasn't mounted at boot, try mounting now (handles
+    // hot-swap: card inserted after boot but before button press).
     if (!g_sd_mounted) {
-        ESP_LOGE(TAG, "SD card not mounted — cannot flash ESP32");
-        show_firmware_result_popup(false, "SD card not mounted", "ESP32-P4");
-        return false;
+        ESP_LOGW(TAG, "SD card not mounted at boot — attempting mount now...");
+        if (!sd_flash_init()) {
+            ESP_LOGE(TAG, "SD card mount failed — cannot flash ESP32");
+            show_firmware_result_popup(false, "SD card not found", "ESP32-P4");
+            return false;
+        }
+        ESP_LOGI(TAG, "SD card mounted on-demand");
     }
 
     ESP_LOGI(TAG, "Starting ESP32-P4 flash from %s", SD_ESP32_FW_PATH);
 
-    // DEBUG: List SD card root to verify file presence
-    ESP_LOGI(TAG, "SD card root directory listing:");
-    DIR *dir = opendir(SD_MOUNT_POINT);
-    if (dir) {
-        struct dirent *entry;
-        while ((entry = readdir(dir)) != NULL) {
-            ESP_LOGI(TAG, "  %s", entry->d_name);
-        }
-        closedir(dir);
-    } else {
-        ESP_LOGE(TAG, "Failed to open SD root: %s", strerror(errno));
-    }
-
     // Check if file exists and get size
     struct stat st;
     if (stat(SD_ESP32_FW_PATH, &st) != 0) {
-        ESP_LOGE(TAG, "Firmware file not found: %s", SD_ESP32_FW_PATH);
+        ESP_LOGE(TAG, "Firmware file not found: %s (%s)", SD_ESP32_FW_PATH, strerror(errno));
+        
+        // DEBUG: List what IS on the card
+        ESP_LOGI(TAG, "SD card root directory:");
+        DIR *dir = opendir(SD_MOUNT_POINT);
+        if (dir) {
+            struct dirent *entry;
+            int file_count = 0;
+            while ((entry = readdir(dir)) != NULL) {
+                ESP_LOGI(TAG, "  - %s", entry->d_name);
+                file_count++;
+            }
+            closedir(dir);
+            if (file_count == 0) {
+                ESP_LOGW(TAG, "SD card is empty");
+            }
+        } else {
+            ESP_LOGE(TAG, "Failed to list SD root: %s", strerror(errno));
+        }
+        
         show_firmware_result_popup(false, "esp32_firmware.bin not found on SD card", "ESP32-P4");
         return false;
     }
@@ -269,10 +281,15 @@ bool sd_flash_esp32(void)
 // stm32_flash_start() which spawns an async task to program the STM32.
 bool sd_flash_stm32(void)
 {
+    // Lazy mount: if card wasn't mounted at boot, try mounting now
     if (!g_sd_mounted) {
-        ESP_LOGE(TAG, "SD card not mounted — cannot flash STM32");
-        show_firmware_result_popup(false, "SD card not mounted", "STM32");
-        return false;
+        ESP_LOGW(TAG, "SD card not mounted at boot — attempting mount now...");
+        if (!sd_flash_init()) {
+            ESP_LOGE(TAG, "SD card mount failed — cannot flash STM32");
+            show_firmware_result_popup(false, "SD card not found", "STM32");
+            return false;
+        }
+        ESP_LOGI(TAG, "SD card mounted on-demand");
     }
 
     if (stm32_flash_in_progress()) {
