@@ -115,22 +115,27 @@ static bool sd_flash_force_remount(void)
 {
     ESP_LOGI(TAG, "Force remount: tearing down existing SD state...");
 
-    // If currently mounted, unmount and deinit
+    // If currently mounted, unmount.
+    //
+    // IMPORTANT: esp_vfs_fat_sdcard_unmount() ALSO deinitializes the SDMMC host
+    // controller for us, because we mounted via the esp_vfs_fat_sdmmc_mount()
+    // convenience function (it records the host so unmount auto-deinits it).
+    // Do NOT call sdmmc_host_deinit() afterwards — that double-frees the
+    // controller and causes a Guru Meditation (instruction access fault in
+    // sd_host_del_controller).
     if (g_sd_mounted) {
         esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, g_sd_card);
         g_sd_card = NULL;
         g_sd_mounted = false;
-        ESP_LOGI(TAG, "  Unmounted stale card");
+        ESP_LOGI(TAG, "  Unmounted stale card (host auto-deinitialized)");
     }
-
-    // Deinit the SDMMC host (clears controller state so it can re-probe)
-    sdmmc_host_deinit();
-    ESP_LOGI(TAG, "  SDMMC host deinit complete");
 
     // Small delay to let hardware settle (card detect/power lines)
     vTaskDelay(pdMS_TO_TICKS(100));
 
-    // Re-init from scratch
+    // Re-init from scratch: sd_flash_init() -> esp_vfs_fat_sdmmc_mount() will
+    // re-init the host AND re-probe the card (full CMD0/CMD8/ACMD41 sequence),
+    // which is exactly what's needed to detect a hot-swapped card.
     ESP_LOGI(TAG, "  Re-initializing SDMMC + FAT...");
     return sd_flash_init();
 }
