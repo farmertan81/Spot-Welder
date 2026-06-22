@@ -42,6 +42,7 @@
 #include "ui.h"
 #include "touch_gt911.h"
 #include "wifi_bridge.h"
+#include "sd_flash.h"
 
 static const char *TAG = "WELDER_UI";
 
@@ -637,8 +638,11 @@ static void cb_wifi_reconfigure(void) { wifi_bridge_reconfigure(); }
 static void cb_restart(void)          { ESP_LOGI(TAG, "Restart requested"); esp_restart(); }
 static void cb_factory_reset(void)    { ESP_LOGW(TAG, "Factory reset: wiping WiFi creds + reboot");
                                         wifi_bridge_factory_reset(); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); }
-static void cb_fw_update_esp32(void)  { ESP_LOGW(TAG, "ESP32 SD firmware update not implemented on P4 yet"); }
-static void cb_fw_update_stm32(void)  { ESP_LOGW(TAG, "STM32 SD firmware update not implemented on P4 yet"); }
+// Firmware update callbacks (triggered by UI buttons in SETUP tab)
+// Flash ESP32-P4 from /esp32_firmware.bin on SD card (OTA, then reboot)
+static void cb_fw_update_esp32(void)  { sd_flash_esp32(); }
+// Flash STM32G474 from /stm32_firmware.bin on SD card (async task, shows progress, reboots)
+static void cb_fw_update_stm32(void)  { sd_flash_stm32(); }
 
 // ============================================================
 //  LVGL PLUMBING
@@ -1091,6 +1095,14 @@ extern "C" void app_main(void)
     // Note: esp_lcd_panel_disp_on_off() is NOT supported for RGB panels
     // (returns ESP_ERR_NOT_SUPPORTED). RGB panels are always on when receiving signals.
     ESP_LOGI(TAG, "RGB LCD initialized: %dx%d", LCD_H_RES, LCD_V_RES);
+
+    // ---- SD card init (SDMMC SLOT_0, 1-bit, for firmware updates) ----
+    // WiFi now runs over SPI (external XIAO C6), so the SDMMC controller is free.
+    // Mount the SD card at boot and keep it mounted permanently. Non-fatal if
+    // the card is missing: the welder continues without SD firmware update capability.
+    if (!sd_flash_init()) {
+        ESP_LOGW(TAG, "SD card init failed — firmware update from SD disabled");
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
