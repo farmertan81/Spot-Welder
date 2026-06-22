@@ -53,23 +53,10 @@ bool sd_flash_init(void)
         return true;
     }
 
-    ESP_LOGI(TAG, "Initializing SD card (SDMMC SLOT_0, 1-bit, 10 MHz)");
+    ESP_LOGI(TAG, "Initializing SD card (SDMMC SLOT_0, 1-bit)");
     ESP_LOGI(TAG, "SD pins: CLK=43, CMD=44, D0=39 (D1/D2/D3 not wired)");
 
-    // SDMMC host config (matches proven Elecrow reference design)
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
-    host.slot = SDMMC_HOST_SLOT_0;   // SLOT_0 for SD card (SLOT_1 was old onboard C6/WiFi)
-    host.max_freq_khz = 10000;       // 10 MHz (conservative, proven stable on 1-bit)
-
-    // Slot config (1-bit mode, internal pull-ups)
-    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    slot_config.clk = GPIO_NUM_43;
-    slot_config.cmd = GPIO_NUM_44;
-    slot_config.d0  = GPIO_NUM_39;
-    slot_config.width = 1;  // 1-bit mode (only D0 wired on this board)
-    slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
-
-    // VFS FAT mount config
+    // VFS FAT mount config (shared across retries)
     esp_vfs_fat_sdmmc_mount_config_t mount_config = {
         .format_if_mount_failed = false,  // do NOT auto-format if no card
         .max_files = 5,
@@ -78,14 +65,53 @@ bool sd_flash_init(void)
         .use_one_fat = false
     };
 
-    // Mount the card
-    esp_err_t ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config,
-                                            &mount_config, &g_sd_card);
+    // Probe-frequency ladder. A 0x107 (ESP_ERR_TIMEOUT) at send_op_cond usually
+    // means the card couldn't complete init at the requested clock. Start slow
+    // (400 kHz probe is automatic), then cap the data-phase clock low and ramp.
+    // Many cheap cards / long board traces won't lock at 10 MHz on a 1-bit bus
+    // routed through the GPIO matrix.
+    const int freq_ladder_khz[] = { 20000, 10000, 4000, 1000 };
+    const int n_freqs = sizeof(freq_ladder_khz) / sizeof(freq_ladder_khz[0]);
+
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 0; attempt < n_freqs; ++attempt) {
+        int freq_khz = freq_ladder_khz[attempt];
+
+        // SDMMC host config (matches proven Elecrow reference design)
+        sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+        host.slot = SDMMC_HOST_SLOT_0;   // SLOT_0 for SD card
+        host.max_freq_khz = freq_khz;
+
+        // Slot config (1-bit mode, internal pull-ups)
+        sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+        slot_config.clk = GPIO_NUM_43;
+        slot_config.cmd = GPIO_NUM_44;
+        slot_config.d0  = GPIO_NUM_39;
+        slot_config.width = 1;  // 1-bit mode (only D0 wired on this board)
+        slot_config.flags |= SDMMC_SLOT_FLAG_INTERNAL_PULLUP;
+
+        ESP_LOGI(TAG, "SD mount attempt %d/%d at %d kHz...", attempt + 1, n_freqs, freq_khz);
+        ret = esp_vfs_fat_sdmmc_mount(SD_MOUNT_POINT, &host, &slot_config,
+                                      &mount_config, &g_sd_card);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "SD card mounted at %d kHz", freq_khz);
+            break;
+        }
+
+        ESP_LOGW(TAG, "Attempt %d failed: %s (0x%x)", attempt + 1, esp_err_to_name(ret), ret);
+        // Small settle delay before retrying at a slower clock
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+
     if (ret != ESP_OK) {
-        if (ret == ESP_FAIL) {
-            ESP_LOGE(TAG, "SD card mount FAILED (no card inserted or filesystem corrupt)");
-        } else {
-            ESP_LOGE(TAG, "SD card mount error: %s (0x%x)", esp_err_to_name(ret), ret);
+        ESP_LOGE(TAG, "SD card mount FAILED after %d attempts: %s (0x%x)",
+                 n_freqs, esp_err_to_name(ret), ret);
+        if (ret == ESP_ERR_TIMEOUT) {
+            ESP_LOGE(TAG, "0x107 timeout at send_op_cond -> card not responding.");
+            ESP_LOGE(TAG, "Check: (1) card fully inserted, (2) card is FAT32,");
+            ESP_LOGE(TAG, "       (3) pull-ups on CMD/D0, (4) try a different card.");
+        } else if (ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Filesystem mount failed (card present but not FAT32?).");
         }
         g_sd_mounted = false;
         return false;
@@ -94,7 +120,7 @@ bool sd_flash_init(void)
     // Log card info
     ESP_LOGI(TAG, "SD card mounted successfully at %s", SD_MOUNT_POINT);
     sdmmc_card_print_info(stdout, g_sd_card);
-    
+
     g_sd_mounted = true;
     return true;
 }
