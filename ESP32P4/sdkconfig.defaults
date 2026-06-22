@@ -156,14 +156,21 @@ CONFIG_ESP_HOSTED_SPI_RESET_ACTIVE_LOW=y
 # Handshake/DataReady polarity
 CONFIG_ESP_HOSTED_HS_ACTIVE_HIGH=y
 CONFIG_ESP_HOSTED_DR_ACTIVE_HIGH=y
-# SPI frequency: 10 MHz.
-# IMPORTANT: The XIAO C6 slave pins (GPIO 18/19/20/2) are routed through the
-# GPIO MATRIX, not the dedicated FSPI IOMUX pins. SPI slave via GPIO matrix has
-# an input-delay limit and cannot reliably sample at 20 MHz — the link starts
-# (slave logs "ESPInit") then corrupts with "rx_pkt len+offset[131070]>max[1600]"
-# (an all-0xFF / idle-high read). 10 MHz is within the GPIO-matrix slave limit.
-# If still unstable, drop further to 5 MHz.
-CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=10
+# SPI frequency: 2 MHz (DIAGNOSTIC — intentionally very slow).
+# The XIAO C6 slave pins (GPIO 18/19/20/2) are routed through the GPIO MATRIX,
+# not the dedicated FSPI IOMUX pins. SPI slave via GPIO matrix has a large input
+# delay; at 10-20 MHz the slave can sample MOSI entirely in its idle-HIGH window,
+# producing the pristine all-0xFF read seen as "rx_pkt len+offset[131070]".
+#
+# 2 MHz (500 ns/bit) makes GPIO-matrix delay negligible. This is a DECISIVE test:
+#   * If the link comes up at 2 MHz  -> the problem was timing; raise this value
+#     step by step (5, 8, 10 MHz) to find the reliable ceiling.
+#   * If it STILL reads all-0xFF at 2 MHz -> NOT timing. The MOSI signal itself
+#     (P4 GPIO48 -> XIAO D10/GPIO18) is not getting through: a broken/loose pin
+#     on that one line, or MOSI/MISO physically swapped (host MOSI must reach the
+#     slave's MOSI=GPIO18 INPUT, and slave MISO=GPIO20 OUTPUT must reach host
+#     MISO=GPIO47). Check/continuity-test that single wire.
+CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6=2
 #
 # Boot log should now print: SPI transport initialized, MOSI[48] MISO[47] CLK[26]
 # CS[29] HS[30] DR[31]. If the XIAO C6 doesn't respond:
