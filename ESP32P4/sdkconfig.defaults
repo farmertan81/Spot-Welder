@@ -37,6 +37,17 @@ CONFIG_LV_USE_CLIB_MALLOC=y
 # (LV_MEM_SIZE_KILOBYTES only applies to the builtin allocator, which is now
 #  disabled, so it is intentionally omitted.)
 #
+# --- PSRAM initialization (ESP32-P4 requires external PSRAM for display) ---
+# The CrowPanel P4 has 32 MB of external PSRAM (Octal-SPI mode). This is
+# ESSENTIAL for the 800x480 RGB LCD framebuffers + LVGL UI memory.
+CONFIG_SPIRAM=y
+# Octal-SPI PSRAM mode (8-bit data bus for higher bandwidth)
+CONFIG_SPIRAM_MODE_OCT=y
+# PSRAM clock speed: 200 MHz is the default for P4 (conservative, stable)
+CONFIG_SPIRAM_SPEED_200M=y
+# PSRAM size (CrowPanel has 32 MB)
+CONFIG_SPIRAM_SIZE=33554432
+#
 # --- PSRAM allocation strategy (fixes WiFi-induced glitching) ---
 # LVGL's draw buffers (moved to PSRAM in welder_main.cpp) free ~150 KB of
 # internal RAM, but LVGL objects themselves are still malloc'd and can exhaust
