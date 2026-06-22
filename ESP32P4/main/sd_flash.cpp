@@ -106,6 +106,36 @@ bool sd_flash_is_mounted(void)
 }
 
 // ============================================================
+//  FORCE REMOUNT (for hot-swap without card-detect pin)
+// ============================================================
+// Fully tears down and rebuilds the SDMMC/FAT stack. This handles removal/
+// re-insertion cycles that the lazy mount can't detect (because g_sd_mounted
+// stays true even after card removal if there's no CD pin interrupt).
+static bool sd_flash_force_remount(void)
+{
+    ESP_LOGI(TAG, "Force remount: tearing down existing SD state...");
+
+    // If currently mounted, unmount and deinit
+    if (g_sd_mounted) {
+        esp_vfs_fat_sdcard_unmount(SD_MOUNT_POINT, s_card);
+        s_card = NULL;
+        g_sd_mounted = false;
+        ESP_LOGI(TAG, "  Unmounted stale card");
+    }
+
+    // Deinit the SDMMC host (clears controller state so it can re-probe)
+    sdmmc_host_deinit();
+    ESP_LOGI(TAG, "  SDMMC host deinit complete");
+
+    // Small delay to let hardware settle (card detect/power lines)
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Re-init from scratch
+    ESP_LOGI(TAG, "  Re-initializing SDMMC + FAT...");
+    return sd_flash_init();
+}
+
+// ============================================================
 //  ESP32-P4 SELF-FLASH (OTA from SD)
 // ============================================================
 // Reads /esp32_firmware.bin from SD, writes to the inactive OTA partition
@@ -113,16 +143,14 @@ bool sd_flash_is_mounted(void)
 // Shows progress UI during the flash.
 bool sd_flash_esp32(void)
 {
-    // Lazy mount: if card wasn't mounted at boot, try mounting now (handles
-    // hot-swap: card inserted after boot but before button press).
-    if (!g_sd_mounted) {
-        ESP_LOGW(TAG, "SD card not mounted at boot — attempting mount now...");
-        if (!sd_flash_init()) {
-            ESP_LOGE(TAG, "SD card mount failed — cannot flash ESP32");
-            show_firmware_result_popup(false, "SD card not found", "ESP32-P4");
-            return false;
-        }
-        ESP_LOGI(TAG, "SD card mounted on-demand");
+    // FORCE REMOUNT every time: handles hot-swap (card removed/re-inserted after
+    // boot) without needing a hardware card-detect pin. This tears down and
+    // rebuilds the SDMMC/FAT stack from scratch so the controller re-probes.
+    ESP_LOGI(TAG, "Force remount before ESP32 flash (handles hot-swap)...");
+    if (!sd_flash_force_remount()) {
+        ESP_LOGE(TAG, "SD card mount failed — cannot flash ESP32");
+        show_firmware_result_popup(false, "SD card not found", "ESP32-P4");
+        return false;
     }
 
     ESP_LOGI(TAG, "Starting ESP32-P4 flash from %s", SD_ESP32_FW_PATH);
@@ -281,15 +309,12 @@ bool sd_flash_esp32(void)
 // stm32_flash_start() which spawns an async task to program the STM32.
 bool sd_flash_stm32(void)
 {
-    // Lazy mount: if card wasn't mounted at boot, try mounting now
-    if (!g_sd_mounted) {
-        ESP_LOGW(TAG, "SD card not mounted at boot — attempting mount now...");
-        if (!sd_flash_init()) {
-            ESP_LOGE(TAG, "SD card mount failed — cannot flash STM32");
-            show_firmware_result_popup(false, "SD card not found", "STM32");
-            return false;
-        }
-        ESP_LOGI(TAG, "SD card mounted on-demand");
+    // FORCE REMOUNT every time (same as ESP32 path above — handles hot-swap)
+    ESP_LOGI(TAG, "Force remount before STM32 flash (handles hot-swap)...");
+    if (!sd_flash_force_remount()) {
+        ESP_LOGE(TAG, "SD card mount failed — cannot flash STM32");
+        show_firmware_result_popup(false, "SD card not found", "STM32");
+        return false;
     }
 
     if (stm32_flash_in_progress()) {
