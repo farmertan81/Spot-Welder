@@ -71,12 +71,14 @@ static const char *TAG = "WELDER_UI";
 // this 5" RGB panel is far below its minimum pixel clock, so the screen goes
 // BLACK/garbage and the STM32 progress modal is invisible (that is the "screen
 // goes black during STM32 flash" symptom). The P4 has much more PSRAM bandwidth
-// than the S3, and Katapult is only 250 kbaud, so a modest reduction keeps the
-// panel displayable AND the progress bar visible while still relieving the bus.
-//   - 10 MHz: panel stays lit, progress modal visible (DEFAULT).
+// than the S3, and Katapult is only 250 kbaud (~0.05 MB/s), so we can stay very
+// close to the normal 15 MHz without starving the UART. Trial results:
+//   - 2 MHz:  panel black/garbage (old default)
+//   - 10 MHz: white/red flicker (marginal sync)
+//   - 13 MHz: clean, stable progress modal (CURRENT; only 13% slower than normal)
 //   - If STM32 flashing ever becomes unreliable on your unit, lower this back
-//     toward 2 MHz (the flash aborts safely + retries; it never bricks).
-#define LCD_FLASH_PIXEL_CLOCK_HZ  (10 * 1000 * 1000)  // 10 MHz: keep panel visible during STM32 flash
+//     toward 10 MHz (the flash aborts safely + retries; it never bricks).
+#define LCD_FLASH_PIXEL_CLOCK_HZ  (13 * 1000 * 1000)  // 13 MHz: stable panel + visible progress
 
 #define LCD_PCLK             3
 #define LCD_DE               2
