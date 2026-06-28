@@ -64,6 +64,20 @@ static const char *TAG = "WELDER_UI";
 #define LCD_V_RES           480
 #define LCD_PIXEL_CLOCK_HZ  (15 * 1000 * 1000)  // 15 MHz for extra margin on config-tab scrolling (was 16 MHz — stable main screen but minor scroll glitch)
 
+// Pixel clock used WHILE flashing the STM32 (welder_prep_stm32_flash()).
+// During an STM32 flash the P4 acts as a UART bootloader programmer; the RGB
+// scan-out DMA shares the PSRAM bus with that timing-sensitive UART, so we slow
+// the pclk to free bandwidth. The OLD ESP32-S3 board used 2 MHz — but at 2 MHz
+// this 5" RGB panel is far below its minimum pixel clock, so the screen goes
+// BLACK/garbage and the STM32 progress modal is invisible (that is the "screen
+// goes black during STM32 flash" symptom). The P4 has much more PSRAM bandwidth
+// than the S3, and Katapult is only 250 kbaud, so a modest reduction keeps the
+// panel displayable AND the progress bar visible while still relieving the bus.
+//   - 10 MHz: panel stays lit, progress modal visible (DEFAULT).
+//   - If STM32 flashing ever becomes unreliable on your unit, lower this back
+//     toward 2 MHz (the flash aborts safely + retries; it never bricks).
+#define LCD_FLASH_PIXEL_CLOCK_HZ  (10 * 1000 * 1000)  // 10 MHz: keep panel visible during STM32 flash
+
 #define LCD_PCLK             3
 #define LCD_DE               2
 #define LCD_VSYNC           41
@@ -951,10 +965,13 @@ extern "C" void welder_prep_stm32_flash(void)
     }
 
     // 2) Slow the LCD pixel clock to quiet the PSRAM bus during the flash.
+    //    We drop to LCD_FLASH_PIXEL_CLOCK_HZ (10 MHz) rather than the old 2 MHz:
+    //    that still frees bus bandwidth for the 250 kbaud bootloader UART, but
+    //    stays within the RGB panel's working range so the STM32 progress modal
+    //    REMAINS VISIBLE (2 MHz blanked the panel -> "screen goes black"). The
+    //    device reboots at the end of the flash, which restores the full pclk.
     if (g_panel_handle) {
-        // 2 MHz matches the OLD board's proven quietDisplayBus() value — slow
-        // enough that the RGB scan-out DMA stops starving the bootloader UART.
-        esp_lcd_rgb_panel_set_pclk(g_panel_handle, 2 * 1000 * 1000);  // 2 MHz
+        esp_lcd_rgb_panel_set_pclk(g_panel_handle, LCD_FLASH_PIXEL_CLOCK_HZ);
         esp_lcd_rgb_panel_restart(g_panel_handle);  // re-sync scan-out at new clk
     }
 }
