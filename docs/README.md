@@ -13,6 +13,7 @@ Reference documentation for the Spot Welder project, organized by topic.
 - **[SNUBBER_SPECIFICATION.md](hardware/SNUBBER_SPECIFICATION.md)** — RC snubber network specification (branches, calculations, layout, BOM)
 - **[BUCK_CONVERTER_PIN_ANALYSIS.md](hardware/BUCK_CONVERTER_PIN_ANALYSIS.md)** — Buck converter pin analysis
 - **[FIRMWARE_MEASUREMENT_ANALYSIS.md](hardware/FIRMWARE_MEASUREMENT_ANALYSIS.md)** — Firmware measurement/sensing analysis
+- **[ESP32C6_WIFI_DAUGHTERBOARD.md](hardware/ESP32C6_WIFI_DAUGHTERBOARD.md)** — External XIAO ESP32-C6 WiFi daughterboard (SPI/J7); why the SD card ↔ onboard-C6 SDIO conflict forced it, and the wiring/config
 
 ## 📁 firmware/ — Firmware development history & notes
 
@@ -23,14 +24,18 @@ Reference documentation for the Spot Welder project, organized by topic.
 - **[STATUS_TAB_UI_IMPROVEMENTS.md](firmware/STATUS_TAB_UI_IMPROVEMENTS.md)** — Status tab UI improvements
 - **[CHANGELOG_P4_UI_STABLE.md](firmware/CHANGELOG_P4_UI_STABLE.md)** — ESP32-P4 UI stable changelog
 
-## 📁 features/ — Feature design documents
-
-- **[WIRELESS_STM32_FLASH_EXPLAINED.md](features/WIRELESS_STM32_FLASH_EXPLAINED.md)** — Wireless STM32 flashing explained (also `.pdf`, `.docx`)
-- **[SD_AND_STM32_FLASHING_FEASIBILITY.md](features/SD_AND_STM32_FLASHING_FEASIBILITY.md)** — SD card + STM32 flashing feasibility (also `.pdf`, `.docx`)
+> The **ESP32-P4 WiFi over SPI** integration checklist (wiring, flashing, boot-log
+> verification, troubleshooting) lives with the firmware at
+> **[../ESP32P4/SPI_WIFI_INTEGRATION_CHECKLIST.md](../ESP32P4/SPI_WIFI_INTEGRATION_CHECKLIST.md)**.
 
 ## 📁 issues/ — Known issues & troubleshooting
 
 - **[KNOWN_ISSUES.md](issues/KNOWN_ISSUES.md)** — Known issues and workarounds (also `.pdf`, `.docx`)
+
+## 📁 archive/ — Superseded documents (historical)
+
+- **[WIRELESS_STM32_FLASH_EXPLAINED.md](archive/WIRELESS_STM32_FLASH_EXPLAINED.md)** — Wireless STM32 flashing (superseded by Katapult; also `.pdf`, `.docx`)
+- **[SD_AND_STM32_FLASHING_FEASIBILITY.md](archive/SD_AND_STM32_FLASHING_FEASIBILITY.md)** — SD-card + STM32 flashing feasibility study (superseded by Katapult; also `.pdf`, `.docx`)
 
 ## Related locations
 

@@ -36,6 +36,11 @@ monitoring and control.
   tabs), drives the local control flow, and **bridges** the STM32 UART link to
   a TCP/WiFi connection for the optional web tier.
 - Hosts the over-the-air and SD-card firmware-update flows for **both** chips.
+- **WiFi** is provided by an external **Seeed XIAO ESP32-C6** daughterboard on
+  the P4's SPI (J7) header. The board's *onboard* C6 uses SDIO, which shares the
+  P4's SDMMC controller with the microSD card — so the external C6-over-SPI
+  workaround frees the SD card to run alongside WiFi. See
+  [docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md](docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md).
 
 ### Tier 3 — Raspberry Pi / Flask (optional remote dashboard)
 - Connects to the ESP32 over TCP (port 8888) for a remote web dashboard:
@@ -103,6 +108,7 @@ All three paths work reliably in production and include read-back verification.
 |---|---|---|
 | Controller MCU | **STM32G474CEU6** | 512 KB Flash; Katapult bootloader @ `0x08000000`, app @ `0x08002000` |
 | Display / bridge | **Elecrow CrowPanel ESP32-P4** | ESP32-P4, 5" 800×480 RGB, capacitive touch, 16 MB PSRAM, SD card |
+| WiFi radio | **Seeed XIAO ESP32-C6** (external) | On the P4 SPI/J7 header (esp-hosted). Frees SDMMC for the SD card — see [docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md](docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md) |
 | STM32↔ESP32 link | 2 wires | ESP32-P4 GPIO 27/28 (UART3-IN) ↔ STM32 PA9/PA10 (USART1) @ 576k baud |
 | STM32 programmer (optional) | ST-LINK V2/V3 | Optional; only needed for initial Katapult install or deep debugging |
 | Remote tier (optional) | Raspberry Pi / PC | Runs the Flask dashboard, connects over WiFi/TCP |
@@ -136,7 +142,7 @@ idf.py set-target esp32p4
 idf.py build           # build
 idf.py -p PORT flash   # flash over USB
 ```
-- Build output under `ESP32P4/build/`.
+- Build output: `ESP32P4/build/esp32_firmware.bin` (project name `esp32_firmware`).
 - The ESP32-P4 can also self-update from the SD card: copy the image to the
   card as `/esp32_firmware.bin` and trigger the update from the Setup tab.
 

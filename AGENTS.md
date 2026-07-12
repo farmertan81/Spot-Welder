@@ -71,6 +71,11 @@ python app.py                        # serves dashboard on :8080, TCP bridge cli
 - **UART link is 576000 8N1** through BSS138 level shifters on the UART3-IN header (GPIO 27/28 on P4,
   PA9/PA10 on STM32). Do NOT raise the baud rate — higher rates corrupt through the RC-limited shifters.
   Bootloader mode uses 115200 8E1.
+- **WiFi is an external XIAO ESP32-C6 on SPI (J7 header)**, not the board's onboard C6. The onboard C6 uses
+  SDIO, which collides with the SD card's SDMMC controller; the external C6-over-SPI workaround frees the SD
+  card. Pins: MOSI 48 / MISO 47 / CLK 26 / CS 29 / HS 30 / DR 31 / reset 32 (active-low), SPI mode 3.
+  Do NOT raise `CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6` above 10 MHz (GPIO-matrix slave sampling limit). The C6
+  transport lives in `ESP32P4/sdkconfig.defaults`; full writeup in `docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md`.
 - **The charge MOSFET (`CHARGER_EN`) is owned by the STM32** and MUST be OFF during a weld pulse — the
   joule integrator assumes discharge-only current. Never move this control to the P4.
 - **Reserved:** do not bind host ports 1000/2200 in any tooling.
