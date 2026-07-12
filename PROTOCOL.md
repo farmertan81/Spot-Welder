@@ -245,6 +245,42 @@ Format: `CELLS,C1=V1,C2=V2,C3=V3`
 
 ---
 
+## 🔧 Protocol Cleanup Roadmap (3S → future 4S)
+
+**Current reality (July 2026):** 3-cell pack. `STATUS2` emits `cell1`, `cell2`, `cell3` only.
+
+**Future expansion:** 4-cell pack in development. `cell4` aliases/parsing in Flask (`app.py:1406-1415`) are **intentional forward-compatibility scaffolding** and must remain untouched — they will activate when the new 4S hardware emits `cell4` in `STATUS2`.
+
+### Known redundant fields (safe to consolidate in a future coordinated cleanup):
+
+1. **`STATUS.joule_target` ← duplicate of `joule_target_j`**  
+   - **Where:** STM32 emitter (`main.c:679-680`) + Flask parser (`app.py:843`)  
+   - **Issue:** Both fields emitted in joule control mode, both parsed by Flask — identical values  
+   - **Recommendation:** Keep `joule_target_j` (explicit units), drop `joule_target`  
+   - **Scope:** 3-file change (STM32 emitter, ESP32-P4 relay if it parses STATUS, Flask parser)
+
+2. **`WELD_DONE.energy_j` ← duplicate of `energy_weld_j`**  
+   - **Where:** STM32 emitter (`main.c:3189-3190`) + Flask parser (`app.py:2067-2070`)  
+   - **Issue:** Both fields emitted in `WELD_DONE`, both parsed by Flask — identical values  
+   - **Stale comment:** The in-code comment at `main.c:3157` claiming `energy_j` is the "cap-bank ΔV source-of-truth" is outdated; `energy_cap_j` now holds that value  
+   - **Recommendation:** Keep `energy_weld_j` (explicit meaning), drop `energy_j`  
+   - **Scope:** 2-file change (STM32 emitter, Flask parser)
+
+### Legacy packet paths (current ESP32-P4 vs old ESP32-S3):
+
+- **`CELLS` packet:** Only produced by legacy `ESP32_8048S043C` firmware on Flask `CELLS` command  
+  - Current ESP32-P4 does **not** emit it; STM32 ignores the command  
+  - Flask still requests it on connect if `REQUEST_CELLS_ON_CONNECT=True` (`app.py:1037`)  
+  - **Status:** Deprecated; superseded by `DISPLAY` + continuous `STATUS2` telemetry
+
+- **`DISPLAY` packet:** Produced by **both** legacy ESP32-S3 and current ESP32-P4  
+  - Flask accepts from either source  
+  - **Status:** Active; dual-source emission is intentional for backward compatibility
+
+**Timing:** These cleanups are **non-urgent** — all redundant fields work correctly today due to Flask's tolerant parsing. Coordinate the changes when the 4S hardware/firmware work begins or during a dedicated protocol cleanup pass.
+
+---
+
 ## Breaking Change Policy
 
 Any modification to:
