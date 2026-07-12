@@ -42,6 +42,7 @@
 #include "ui.h"
 #include "touch_gt911.h"
 #include "wifi_bridge.h"
+#include "sd_flash.h"
 
 static const char *TAG = "WELDER_UI";
 
@@ -62,6 +63,22 @@ static const char *TAG = "WELDER_UI";
 #define LCD_H_RES           800
 #define LCD_V_RES           480
 #define LCD_PIXEL_CLOCK_HZ  (15 * 1000 * 1000)  // 15 MHz for extra margin on config-tab scrolling (was 16 MHz — stable main screen but minor scroll glitch)
+
+// Pixel clock used WHILE flashing the STM32 (welder_prep_stm32_flash()).
+// During an STM32 flash the P4 acts as a UART bootloader programmer; the RGB
+// scan-out DMA shares the PSRAM bus with that timing-sensitive UART, so we slow
+// the pclk to free bandwidth. The OLD ESP32-S3 board used 2 MHz — but at 2 MHz
+// this 5" RGB panel is far below its minimum pixel clock, so the screen goes
+// BLACK/garbage and the STM32 progress modal is invisible (that is the "screen
+// goes black during STM32 flash" symptom). The P4 has much more PSRAM bandwidth
+// than the S3, and Katapult is only 250 kbaud (~0.05 MB/s), so we can stay very
+// close to the normal 15 MHz without starving the UART. Trial results:
+//   - 2 MHz:  panel black/garbage (old default)
+//   - 10 MHz: white/red flicker (marginal sync)
+//   - 13 MHz: clean, stable progress modal (CURRENT; only 13% slower than normal)
+//   - If STM32 flashing ever becomes unreliable on your unit, lower this back
+//     toward 10 MHz (the flash aborts safely + retries; it never bricks).
+#define LCD_FLASH_PIXEL_CLOCK_HZ  (13 * 1000 * 1000)  // 13 MHz: stable panel + visible progress
 
 #define LCD_PCLK             3
 #define LCD_DE               2
@@ -637,8 +654,11 @@ static void cb_wifi_reconfigure(void) { wifi_bridge_reconfigure(); }
 static void cb_restart(void)          { ESP_LOGI(TAG, "Restart requested"); esp_restart(); }
 static void cb_factory_reset(void)    { ESP_LOGW(TAG, "Factory reset: wiping WiFi creds + reboot");
                                         wifi_bridge_factory_reset(); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); }
-static void cb_fw_update_esp32(void)  { ESP_LOGW(TAG, "ESP32 SD firmware update not implemented on P4 yet"); }
-static void cb_fw_update_stm32(void)  { ESP_LOGW(TAG, "STM32 SD firmware update not implemented on P4 yet"); }
+// Firmware update callbacks (triggered by UI buttons in SETUP tab)
+// Flash ESP32-P4 from /esp32_firmware.bin on SD card (OTA, then reboot)
+static void cb_fw_update_esp32(void)  { sd_flash_esp32(); }
+// Flash STM32G474 from /stm32_firmware.bin on SD card (async task, shows progress, reboots)
+static void cb_fw_update_stm32(void)  { sd_flash_stm32(); }
 
 // ============================================================
 //  LVGL PLUMBING
@@ -947,10 +967,13 @@ extern "C" void welder_prep_stm32_flash(void)
     }
 
     // 2) Slow the LCD pixel clock to quiet the PSRAM bus during the flash.
+    //    We drop to LCD_FLASH_PIXEL_CLOCK_HZ (10 MHz) rather than the old 2 MHz:
+    //    that still frees bus bandwidth for the 250 kbaud bootloader UART, but
+    //    stays within the RGB panel's working range so the STM32 progress modal
+    //    REMAINS VISIBLE (2 MHz blanked the panel -> "screen goes black"). The
+    //    device reboots at the end of the flash, which restores the full pclk.
     if (g_panel_handle) {
-        // 2 MHz matches the OLD board's proven quietDisplayBus() value — slow
-        // enough that the RGB scan-out DMA stops starving the bootloader UART.
-        esp_lcd_rgb_panel_set_pclk(g_panel_handle, 2 * 1000 * 1000);  // 2 MHz
+        esp_lcd_rgb_panel_set_pclk(g_panel_handle, LCD_FLASH_PIXEL_CLOCK_HZ);
         esp_lcd_rgb_panel_restart(g_panel_handle);  // re-sync scan-out at new clk
     }
 }
@@ -962,89 +985,53 @@ extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "===== ESP32-P4 Welder Display (UI port) =====");
 
-    // BOOT0 LOW first so the STM32 stays in application mode.
-    // INPUT_OUTPUT (not plain OUTPUT) so the input buffer stays enabled and
-    // gpio_get_level() reads the ACTUAL pad voltage — this lets stm32_flash.cpp
-    // verify BOOT0 truly drives HIGH before a flash (an output-only pin always
-    // reads back 0 because its input register is disconnected).
-    gpio_config_t boot0 = {};
-    boot0.pin_bit_mask = (1ULL << STM32_BOOT0_PIN);
-    boot0.mode = GPIO_MODE_INPUT_OUTPUT;
-    boot0.pull_down_en = GPIO_PULLDOWN_ENABLE;
-    gpio_config(&boot0);
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
-    // CRITICAL: WeAct G474 has R2 10k pull-DOWN on PB8. Set GPIO31 to MAXIMUM
-    // drive strength (~20mA) to guarantee it overcomes the pulldown + any wire
-    // resistance and holds PB8 reliably HIGH during the reset pulse.
-    gpio_set_drive_capability((gpio_num_t)STM32_BOOT0_PIN, GPIO_DRIVE_CAP_3);
-    // Dump GPIO31's IO-mux state: if it prints "**RESERVED**" the pin is owned
-    // by the flash/PSRAM controller and CANNOT be used for BOOT0 (pick another).
-    ESP_LOGI(TAG, "GPIO%d (BOOT0) set LOW; readback=%d, dumping IO config:",
-             STM32_BOOT0_PIN, gpio_get_level((gpio_num_t)STM32_BOOT0_PIN));
-    gpio_dump_io_configuration(stdout, (1ULL << STM32_BOOT0_PIN));
+    // ---- GPIO31 / GPIO32 are now owned by the esp-hosted WiFi link ----
+    // These two pins were formerly the STM32 ROM-bootloader straps (GPIO31=BOOT0,
+    // GPIO32=NRST). The STM32 is no longer flashed/reset from the P4 over these
+    // straps, so both pins are repurposed for the external XIAO ESP32-C6 SPI link:
+    //
+    //   GPIO31 -> esp-hosted SPI "Data Ready"  (input, IRQ; XIAO D7/GPIO17)
+    //   GPIO32 -> esp-hosted SPI "Reset Slave" (output pulse; XIAO RST/EN)
+    //
+    // CRITICAL: esp-hosted configures GPIO31 as its Data-Ready INTERRUPT during
+    // transport init (which runs BEFORE app_main). The old code here used to
+    // reconfigure GPIO31 as a push-pull OUTPUT for a BOOT0 self-test ~26 ms later,
+    // which CLOBBERED esp-hosted's interrupt on the DR line and broke the SPI
+    // handshake (slave logged "rx_pkt len+offset[131070]", host timed out with
+    // "Failed to get ESP_Hosted slave transport up"). That self-test is removed.
+    // Do NOT drive GPIO31 or GPIO32 from here — esp-hosted owns them now.
+    //
+    // The esp-hosted reset GPIO is set via menuconfig / sdkconfig:
+    //   CONFIG_ESP_HOSTED_SPI_GPIO_RESET_SLAVE=32   (was defaulting to 12=LCD_G2!)
+    // Routing reset to GPIO32 (a) gives the host a REAL reset line to the XIAO so
+    // host+slave start their transaction state machines in sync, and (b) moves
+    // reset OFF GPIO12, which is LCD_G2 on the RGB panel (the old default toggled
+    // a live display data line every boot).
 
-    // ---- BOOT0 self-test (safe: no STM32 reset happens here) ----
-    // Drive GPIO31 HIGH briefly and read the actual pad voltage back. This is a
-    // standalone wiring diagnostic that does NOT need a flash/WiFi cycle:
-    //   readback=1 -> the ESP pin drives HIGH fine. If a flash still fails with
-    //                 the app restarting, the WIRE to the STM32 BOOT0 pad is
-    //                 open/wrong, or the STM32 option bytes ignore BOOT0.
-    //   readback=0 -> something EXTERNAL is clamping GPIO31 low (a hard short to
-    //                 GND, or a very strong pulldown on the STM32 side). A normal
-    //                 push-pull output beats the on-chip ~45k pulldown, so a 0
-    //                 here means a real external load.
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 1);
-    vTaskDelay(pdMS_TO_TICKS(20));
-    int b0_hi = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
-    gpio_set_level((gpio_num_t)STM32_BOOT0_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(5));
-    int b0_lo = gpio_get_level((gpio_num_t)STM32_BOOT0_PIN);
-    ESP_LOGW(TAG, "BOOT0 self-test: driven HIGH readback=%d, driven LOW "
-                  "readback=%d  (want 1 then 0)", b0_hi, b0_lo);
-    if (b0_hi != 1)
-        ESP_LOGE(TAG, "BOOT0 cannot reach HIGH — external short/strong pulldown "
-                      "on GPIO%d, the strap will never enter the ROM bootloader",
-                 STM32_BOOT0_PIN);
-
-    // Release BOOT0 to Hi-Z now that the self-test is done. The board's 10k
-    // pulldown holds PB8 LOW (app mode) on its own, and releasing the line means
-    // the ESP is NOT fighting an attached ST-Link/SWD debugger on the shared
-    // strap. The flasher re-claims the pin only for the brief hardware pulse.
-    gpio_set_direction((gpio_num_t)STM32_BOOT0_PIN, GPIO_MODE_INPUT);
-
-    // ---- NRST (hardware reset) init ----
-    // NRST is active-LOW. The STM32 has an internal weak pull-up (~40k), but we
-    // drive it HIGH explicitly from the ESP to guarantee a clean idle state. We
-    // use INPUT_OUTPUT mode like BOOT0 so stm32_flash.cpp can read back the pin
-    // to verify it drives both levels correctly.
-    gpio_config_t nrst = {};
-    nrst.pin_bit_mask = (1ULL << STM32_NRST_PIN);
-    nrst.mode = GPIO_MODE_INPUT_OUTPUT;
-    nrst.pull_up_en = GPIO_PULLUP_ENABLE;  // match the STM32 internal pull-up
-    gpio_config(&nrst);
-    // Max drive strength so the push-pull HIGH charges the WeAct board's NRST
-    // reset capacitor (~100nF) FAST and overpowers the STM32's internal reset
-    // pulldown. The previous flash log showed NRST reading back 0 right after
-    // release; boosting drive + a proper settle below tells us whether that was
-    // just the RC cap charging (recovers to 1) or a real short/clamp (stays 0).
-    gpio_set_drive_capability((gpio_num_t)STM32_NRST_PIN, GPIO_DRIVE_CAP_3);
-    gpio_set_level((gpio_num_t)STM32_NRST_PIN, 1);  // idle HIGH (not in reset)
-    // Settle, then sample twice so we can see if the line holds high on its own.
-    vTaskDelay(pdMS_TO_TICKS(5));
-    int nrst_rb1 = gpio_get_level((gpio_num_t)STM32_NRST_PIN);
-    ESP_LOGI(TAG, "GPIO%d (NRST) set HIGH (drive=CAP_3); readback=%d (want 1)",
-             STM32_NRST_PIN, nrst_rb1);
-    if (nrst_rb1 != 1)
-        ESP_LOGE(TAG, "NRST cannot reach HIGH even at idle -> hard short to GND or "
-                      "wrong pin. The STM32 will be stuck in reset.");
-
-    // Release NRST to Hi-Z now that the self-test is done. The STM32's internal
-    // ~40k pull-up holds NRST HIGH (not in reset) on its own. CRITICAL: this hands
-    // the reset line back to any attached ST-Link/SWD debugger. While the ESP held
-    // NRST as a strong push-pull HIGH, the ST-Link could not connect
-    // ("DEV_TARGET_HELD_UNDER_RESET") and SWD programming could be corrupted. The
-    // flasher re-claims NRST only for its brief reset pulses.
-    gpio_set_direction((gpio_num_t)STM32_NRST_PIN, GPIO_MODE_INPUT);
+    // ---- SPI WiFi-link pin diagnostic (one-time, at boot) ----
+    // The XIAO slave reads pristine 0xFF on MOSI even at 2 MHz with a fully
+    // soldered board-to-board header. The remaining firmware-checkable cause is
+    // that one of these pins is owned by the octal PSRAM / flash MSPI controller
+    // (this P4 has 32MB PSRAM active). A pad owned by MSPI CANNOT be driven out
+    // to the header — esp-hosted's SPI init still "succeeds" via the GPIO matrix,
+    // but the external pin floats idle-HIGH -> the slave reads all-0xFF forever.
+    //
+    // gpio_dump_io_configuration prints "**RESERVED**" for any pin occupied by
+    // flash/PSRAM. If MOSI(48) or any other line below shows RESERVED, that pin
+    // must be remapped to a truly-free GPIO — reseating the header will NOT help.
+    {
+        const uint64_t spi_pins =
+            (1ULL << 26) |  // CLK
+            (1ULL << 29) |  // CS
+            (1ULL << 30) |  // Handshake
+            (1ULL << 31) |  // Data Ready
+            (1ULL << 47) |  // MISO (host input)
+            (1ULL << 48);   // MOSI (host output)  <-- prime suspect
+        ESP_LOGW(TAG, "===== SPI WiFi-link pin dump (look for **RESERVED**) =====");
+        ESP_LOGW(TAG, "Expected roles: CLK:26 CS:29 HS:30 DR:31 MISO:47 MOSI:48");
+        gpio_dump_io_configuration(stdout, spi_pins);
+        ESP_LOGW(TAG, "===== end SPI pin dump =====");
+    }
 
     // Shared welder state defaults.
     g_state_mtx = xSemaphoreCreateMutex();
@@ -1127,6 +1114,14 @@ extern "C" void app_main(void)
     // Note: esp_lcd_panel_disp_on_off() is NOT supported for RGB panels
     // (returns ESP_ERR_NOT_SUPPORTED). RGB panels are always on when receiving signals.
     ESP_LOGI(TAG, "RGB LCD initialized: %dx%d", LCD_H_RES, LCD_V_RES);
+
+    // ---- SD card init (SDMMC SLOT_0, 1-bit, for firmware updates) ----
+    // WiFi now runs over SPI (external XIAO C6), so the SDMMC controller is free.
+    // Mount the SD card at boot and keep it mounted permanently. Non-fatal if
+    // the card is missing: the welder continues without SD firmware update capability.
+    if (!sd_flash_init()) {
+        ESP_LOGW(TAG, "SD card init failed — firmware update from SD disabled");
+    }
 
     vTaskDelay(pdMS_TO_TICKS(100));
     backlight_set(100);
