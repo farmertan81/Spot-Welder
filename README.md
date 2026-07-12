@@ -76,7 +76,7 @@ a `BOOT0` control line, there is no fully reliable wire-free way to force the
 ROM bootloader.
 
 ➡️ **Full details, analysis, and the future fix are in
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md).**
+[KNOWN_ISSUES.md](docs/issues/KNOWN_ISSUES.md).**
 
 ### Workaround — flashing the STM32 with an ST-LINK
 
@@ -96,7 +96,7 @@ ROM bootloader.
 > An **experimental option-byte** SD-flash path exists in the firmware (the
 > STM32 reprograms its boot option bytes to force the ROM bootloader, then
 > restores them on the next boot). It is **unverified on hardware** — keep an
-> ST-LINK handy as the guaranteed recovery path. See KNOWN_ISSUES.md.
+> ST-LINK handy as the guaranteed recovery path. See docs/issues/KNOWN_ISSUES.md.
 
 ---
 
@@ -144,7 +144,7 @@ pio run -t upload      # flash over USB
 ### Putting firmware on the SD card
 - `/esp32_firmware.bin` — ESP32 update image (SD update **works**).
 - `/stm32_firmware.bin` — STM32 update image (SD update **unreliable**; use
-  ST-LINK — see [KNOWN_ISSUES.md](KNOWN_ISSUES.md)).
+  ST-LINK — see [KNOWN_ISSUES.md](docs/issues/KNOWN_ISSUES.md)).
 
 ---
 
@@ -155,18 +155,22 @@ pio run -t upload      # flash over USB
 | `STM32G474CE/` | STM32 controller firmware (PlatformIO) |
 | `ESP32_8048S043C/` | ESP32-S3 display / bridge firmware (PlatformIO) |
 | `Spotwelder Full/` | Earlier combined ESP32 project (reference) |
-| `docs/` | Pin assignments, measurement analysis, design docs |
+| `docs/` | All documentation — see [docs/README.md](docs/README.md) (hardware, firmware, features, issues) |
+| `PROTOCOL.md` | Serial/TCP telemetry protocol reference |
+| `AGENTS.md` | Build commands + workspace map for contributors/agents |
 | `Datasheets/` | Component datasheets |
-| `_old_firmware/` | Archived known-good firmware binaries |
-| `KNOWN_ISSUES.md` | **STM32 SD-flash limitation — read this** |
+| `archive/old_firmware/` | Archived known-good firmware binaries |
+| `docs/issues/KNOWN_ISSUES.md` | **STM32 SD-flash limitation — read this** |
 
 ---
 
 ## Further Reading
 
-- **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** — STM32 SD-flash limitation in full.
-- `ESP32_ARCHITECTURE_ANALYSIS.md` — deep dive on the ESP32 firmware.
-- `docs/PIN_ASSIGNMENTS.md` — authoritative STM32 pin map.
-- `docs/FIRMWARE_MEASUREMENT_ANALYSIS.md` — measurement / ADC architecture.
-- `SD_AND_STM32_FLASHING_FEASIBILITY.md` — original feasibility study for the
+- **[KNOWN_ISSUES.md](docs/issues/KNOWN_ISSUES.md)** — STM32 SD-flash limitation in full.
+- `docs/firmware/ESP32_ARCHITECTURE_ANALYSIS.md` — deep dive on the ESP32 firmware.
+- `docs/hardware/PIN_ASSIGNMENTS.md` — authoritative STM32 pin map.
+- `docs/hardware/FIRMWARE_MEASUREMENT_ANALYSIS.md` — measurement / ADC architecture.
+- `docs/features/SD_AND_STM32_FLASHING_FEASIBILITY.md` — original feasibility study for the
   SD-flash feature.
+- **[PROTOCOL.md](PROTOCOL.md)** — serial/TCP telemetry protocol reference.
+- **[AGENTS.md](AGENTS.md)** — build commands and workspace map.
