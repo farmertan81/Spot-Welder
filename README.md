@@ -58,45 +58,42 @@ monitoring and control.
   reporting, mDNS (`spotwelder.local`), and ArduinoOTA.
 - **ESP32 self-update** — the ESP32 reflashes its **own** firmware from the SD
   card (`/esp32_firmware.bin`) reliably.
-- **STM32 update via ST-LINK** — flashing the STM32 with an ST-LINK programmer
-  works every time and is the supported path (see below).
+- **STM32 wireless/SD update via Katapult bootloader** — STM32 firmware can be
+  updated wirelessly (WiFi), from SD card, or via USB-to-serial, with full
+  CRC validation. No ST-LINK required for routine updates.
 
 ---
 
-## ⚠️ Known Limitation: STM32 SD-Card Flashing Requires ST-LINK
+## ✅ Wireless & SD Firmware Updates (ESP32-P4 + STM32)
 
-Updating the **STM32** firmware from the SD card (driving the chip into its ROM
-bootloader purely in software, over the existing UART link) is **not reliable**
-on this hardware. **To update the STM32 firmware, use an ST-LINK programmer.**
+Both the **ESP32-P4** and the **STM32G474** support **self-contained firmware updates**
+with no programmer or PC required:
 
-**Root cause (short version):** the Sunton ESP32-8048S043C board exposes **no
-free GPIO** that can be wired to the STM32 `BOOT0` pin, and the STM32G4 ROM
-bootloader does not come up USART-responsive after a software-only jump. Without
-a `BOOT0` control line, there is no fully reliable wire-free way to force the
-ROM bootloader.
+### ESP32-P4 Update
+- Drop `/esp32_firmware.bin` on the SD card and tap "Update ESP32" on the touchscreen,
+  OR upload via the web interface at `http://<esp-ip>/update`
+- Uses dual OTA partitions for safe rollback
 
-➡️ **Full details, analysis, and the future fix are in
-[KNOWN_ISSUES.md](docs/issues/KNOWN_ISSUES.md).**
+### STM32 Update (via Katapult Bootloader)
 
-### Workaround — flashing the STM32 with an ST-LINK
+The STM32 uses a **persistent 8 KiB Katapult bootloader** at flash address `0x08000000`.
+Katapult handles firmware updates with CRC validation over UART, with no BOOT0/NRST
+pins required.
 
-1. Connect an **ST-LINK V2/V3** to the STM32 SWD header (SWDIO, SWCLK, GND, and
-   3V3 reference).
-2. Build the STM32 firmware (see below) — the binary is produced at
-   `STM32G474CE/.pio/build/g474ceu6_stlink/firmware.bin`.
-3. Flash with PlatformIO:
-   ```bash
-   cd STM32G474CE
-   pio run -e g474ceu6_stlink -t upload
-   ```
-   …or with STM32CubeProgrammer (load `firmware.bin` at address `0x08000000`).
-4. The **ESP32** still updates from SD normally — only the STM32 needs the
-   ST-LINK.
+**Three update methods:**
+1. **Wireless (WiFi)** — upload `.bin` to `http://<esp-ip>/stm32` or run
+   `python3 tools/stm32_flash_wifi.py`
+2. **SD card** — copy firmware to SD, tap "Update STM32" on touchscreen
+3. **USB-to-serial (PC)** — `python3 tools/katapult_flash_usb.py /dev/ttyUSB0 firmware.bin`
 
-> An **experimental option-byte** SD-flash path exists in the firmware (the
-> STM32 reprograms its boot option bytes to force the ROM bootloader, then
-> restores them on the next boot). It is **unverified on hardware** — keep an
-> ST-LINK handy as the guaranteed recovery path. See docs/issues/KNOWN_ISSUES.md.
+All three paths work reliably in production and include read-back verification.
+
+**ST-LINK is optional** — only needed for:
+- Initial Katapult installation (one-time)
+- Deep debugging with breakpoints
+- Emergency recovery (rare)
+
+➡️ **Full setup guide:** [docs/firmware/KATAPULT_BOOTLOADER_SETUP.md](docs/firmware/KATAPULT_BOOTLOADER_SETUP.md)
 
 ---
 
@@ -104,16 +101,15 @@ ROM bootloader.
 
 | Component | Part | Notes |
 |---|---|---|
-| Controller MCU | **STM32G474CEU6** | 512 KB Flash, single bank; ROM bootloader at `0x1FFF0000` |
-| Display / bridge | **Sunton ESP32-8048S043C** | ESP32-S3, 4.3" 800×480 RGB, GT911 touch, PSRAM, microSD |
-| STM32↔ESP32 link | 2 wires | ESP32 GPIO18 → STM32 PA10 (RX); STM32 PA9 → ESP32 GPIO17 (RX) |
-| **STM32 programmer** | **ST-LINK V2/V3** | **Required** to flash the STM32 firmware (see limitation above) |
-| Remote tier (optional) | Raspberry Pi | Runs the Flask dashboard, connects over WiFi/TCP |
+| Controller MCU | **STM32G474CEU6** | 512 KB Flash; Katapult bootloader @ `0x08000000`, app @ `0x08002000` |
+| Display / bridge | **Elecrow CrowPanel ESP32-P4** | ESP32-P4, 5" 800×480 RGB, capacitive touch, 16 MB PSRAM, SD card |
+| STM32↔ESP32 link | 2 wires | ESP32-P4 GPIO 27/28 (UART3-IN) ↔ STM32 PA9/PA10 (USART1) @ 576k baud |
+| STM32 programmer (optional) | ST-LINK V2/V3 | Optional; only needed for initial Katapult install or deep debugging |
+| Remote tier (optional) | Raspberry Pi / PC | Runs the Flask dashboard, connects over WiFi/TCP |
 | Power stage | Supercap bank + INA226 sensors | 4S pack monitoring, weld/balance/charger control |
 
-> **No BOOT0 / NRST control wires** exist between the ESP32 and STM32 — every
-> exposed ESP32 header pin is already consumed by the RGB LCD, GT911 touch I²C,
-> the STM32 UART, the microSD SPI bus, or the USB debug UART.
+> **Legacy hardware:** The original build used a Sunton ESP32-8048S043C (ESP32-S3)
+> with GPIO 17/18 @ 2 Mbaud. Current production uses ESP32-P4 with GPIO 27/28 @ 576k baud.
 
 ---
 
