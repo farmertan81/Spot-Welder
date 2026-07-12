@@ -12,7 +12,6 @@ communicate over a shared serial/TCP telemetry protocol.
 | `ESP32P4/`            | ESP32-P4 (CrowPanel Advance 5") | **ESP-IDF** (CMake) | UI + WiFi bridge + STM32/OTA flasher. Talks to STM32 over UART3-IN @ 576000. Enriches STATUS, relays WAVEFORM_* raw. |
 | `STM32G474CE/`        | STM32G474CE | **PlatformIO** (`env:g474ceu6_stlink`) | Real-time weld controller: FET drive, ADC/shunt, INA226, charger, joule integrator. **Sole producer of STATUS, WELD_DONE, WAVEFORM_* packets.** |
 | `ESP32_8048S043C/`    | ESP32-8048S043C (old board) | **PlatformIO / Arduino** | Legacy display firmware. Produces DISPLAY and CELLS packets. Keep buildable; not the primary target. |
-| `Spotwelder Full/`    | *(build artifacts only)* | *(no source)* | **Not an active firmware target.** Contains only `.pio/`, `build.log`, `sdkconfig.defaults`. |
 | *(separate repo)* `Spot-Welder-Server/` | Python 3 / Flask | `pip` | Dashboard + TCP client to the P4 bridge (:8888). Re-parses telemetry. |
 
 > The Flask server lives in a **separate repository** (`Spot-Welder-Server`). For any change
@@ -59,7 +58,6 @@ pio device monitor -b 576000         # serial monitor at app baud
 cd ESP32_8048S043C
 pio run                              # keep it compiling; secondary priority
 ```
-> Note: `Spotwelder Full/` contains only build artifacts and is not a build target.
 
 ### Flask server (separate repo)
 ```bash

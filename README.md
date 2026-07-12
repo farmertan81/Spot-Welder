@@ -1,7 +1,7 @@
 # Spot-Welder
 
 A capacitor-bank battery spot welder built around a 3-tier architecture: an
-**STM32G474CE** real-time controller, an **ESP32-S3** touchscreen display /
+**STM32G474CE** real-time controller, an **ESP32-P4** touchscreen display /
 bridge, and an optional **Raspberry Pi / Flask** web dashboard for remote
 monitoring and control.
 
@@ -11,11 +11,11 @@ monitoring and control.
 
 ```
    ┌──────────────────────┐        ┌──────────────────────┐        ┌──────────────────────┐
-   │   TIER 1: STM32G474   │  UART  │   TIER 2: ESP32-S3    │  WiFi  │  TIER 3: Raspberry Pi │
+   │   TIER 1: STM32G474   │  UART  │   TIER 2: ESP32-P4    │  WiFi  │  TIER 3: Raspberry Pi │
    │   (real-time control) │◄──────►│  (display + bridge)   │◄──────►│   / Flask web server  │
-   │                       │ 2 Mbd  │                       │  TCP   │      (optional)       │
+   │                       │ 576k   │                       │  TCP   │      (optional)       │
    └──────────────────────┘        └──────────────────────┘        └──────────────────────┘
-        weld timing,                  4.3" 800×480 touch UI,            remote dashboard,
+        weld timing,                  5" 800×480 touch UI,             remote dashboard,
         ADC/INA226 sensing,           local control, SD card,           logging, graphing
         PWM, safety, Flash            UART↔TCP forwarding
 ```
@@ -25,13 +25,13 @@ monitoring and control.
   DWT cycle counter), PWM output, ADC + INA226 current/voltage sensing,
   lead-resistance calibration, watchdog, and persistent settings in Flash.
 - Communicates with the ESP32 over **USART1 (PA9 = TX, PA10 = RX)** at
-  **2 000 000 baud, 8N1**.
+  **576 000 baud, 8N1** (the ESP32-P4 side is GPIO 27/28 on the UART3-IN header).
 - The STM32 is the single source of truth — the ESP32 never overrides its
   safety decisions.
 
-### Tier 2 — ESP32-S3 (display + bridge)
-- Board: **Sunton ESP32-8048S043C** (4.3" 800×480 IPS RGB panel, GT911
-  capacitive touch, PSRAM, microSD).
+### Tier 2 — ESP32-P4 (display + bridge)
+- Board: **Elecrow CrowPanel Advance ESP32-P4** (5" 800×480 RGB panel, GT911
+  capacitive touch, 16 MB PSRAM, microSD).
 - Runs the LVGL touchscreen UI (Status / Pulse / Telemetry / Config / Logs
   tabs), drives the local control flow, and **bridges** the STM32 UART link to
   a TCP/WiFi connection for the optional web tier.
@@ -49,7 +49,7 @@ monitoring and control.
 - **Welding & control** — pulse sequencing, power/preheat control, pedal and
   contact triggering, and all safety gating run rock-solid on the STM32.
 - **Sensing & telemetry** — INA226 pack/cell monitoring, ADC current/voltage
-  capture, and waveform capture stream cleanly to the UI at 2 Mbaud.
+  capture, and waveform capture stream cleanly to the UI at 576k baud.
 - **Lead-resistance calibration** — full UI → STM32 → Flash flow with
   pedal/contact trigger logic mirroring a real weld.
 - **Touchscreen UI** — responsive LVGL 5-tab interface with anti-shudder
@@ -115,32 +115,45 @@ All three paths work reliably in production and include read-back verification.
 
 ## Build Instructions
 
-Both firmwares use **PlatformIO**.
+The STM32 firmware uses **PlatformIO**; the current ESP32-P4 firmware uses
+**ESP-IDF**.
 
 ### STM32 firmware
 ```bash
 cd STM32G474CE
 pio run -e g474ceu6_stlink            # build
-pio run -e g474ceu6_stlink -t upload  # flash via ST-LINK (required)
+pio run -e g474ceu6_stlink -t upload  # flash via ST-LINK (initial Katapult install only)
 ```
 - Output binary: `STM32G474CE/.pio/build/g474ceu6_stlink/firmware.bin`
 - Requires the ARM GCC toolchain (PlatformIO installs it automatically).
+- Routine updates do **not** need ST-LINK — use the Katapult wireless/SD/USB
+  flow (see below).
 
-### ESP32 firmware
+### ESP32-P4 firmware (current)
+```bash
+cd ESP32P4
+idf.py set-target esp32p4
+idf.py build           # build
+idf.py -p PORT flash   # flash over USB
+```
+- Build output under `ESP32P4/build/`.
+- The ESP32-P4 can also self-update from the SD card: copy the image to the
+  card as `/esp32_firmware.bin` and trigger the update from the Setup tab.
+
+### Legacy ESP32-S3 firmware (Sunton board — reference only)
 ```bash
 cd ESP32_8048S043C
-pio run                # build
+pio run                # build (PlatformIO / Arduino)
 pio run -t upload      # flash over USB
 ```
-- Combined image and `firmware.bin` are produced under
-  `ESP32_8048S043C/.pio/build/esp32-8048S043C/`.
-- The ESP32 can also self-update from the SD card: copy `firmware.bin` to the
-  card as `/esp32_firmware.bin` and trigger the update from the Setup tab.
+- Kept buildable for the old **Sunton ESP32-8048S043C** board; **not** the
+  primary target.
 
 ### Putting firmware on the SD card
 - `/esp32_firmware.bin` — ESP32 update image (SD update **works**).
-- `/stm32_firmware.bin` — STM32 update image (SD update **unreliable**; use
-  ST-LINK — see [KNOWN_ISSUES.md](docs/issues/KNOWN_ISSUES.md)).
+- `/stm32_firmware.bin` — STM32 update image (SD update **works** via the
+  Katapult bootloader — see
+  [KATAPULT_BOOTLOADER_SETUP.md](docs/firmware/KATAPULT_BOOTLOADER_SETUP.md)).
 
 ---
 
@@ -149,8 +162,8 @@ pio run -t upload      # flash over USB
 | Path | Contents |
 |---|---|
 | `STM32G474CE/` | STM32 controller firmware (PlatformIO) |
-| `ESP32_8048S043C/` | ESP32-S3 display / bridge firmware (PlatformIO) |
-| `Spotwelder Full/` | Earlier combined ESP32 project (reference) |
+| `ESP32P4/` | **Current** ESP32-P4 display / bridge firmware (ESP-IDF) |
+| `ESP32_8048S043C/` | Legacy ESP32-S3 (Sunton) display / bridge firmware (PlatformIO) |
 | `docs/` | All documentation — see [docs/README.md](docs/README.md) (hardware, firmware, features, issues) |
 | `PROTOCOL.md` | Serial/TCP telemetry protocol reference |
 | `AGENTS.md` | Build commands + workspace map for contributors/agents |
