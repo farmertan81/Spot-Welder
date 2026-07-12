@@ -78,8 +78,9 @@ static char              s_scan_options[2048] = {0};  // cached <option> list
 
 static wifi_bridge_cmd_cb_t s_cmd_cb = NULL;
 
-// TCP bridge: current client socket (guarded). -1 if none.
-static int               s_client_sock    = -1;
+// TCP bridge: multi-client support (up to MAX_BRIDGE_CLIENTS simultaneous connections)
+#define MAX_BRIDGE_CLIENTS  5
+static int               s_clients[MAX_BRIDGE_CLIENTS];  // client sockets; -1 = unused slot
 static SemaphoreHandle_t s_client_mtx     = NULL;
 
 static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000ULL); }
@@ -164,11 +165,16 @@ void wifi_bridge_broadcast(const char *line)
 {
     if (!line || !line[0] || !s_client_mtx) return;
     xSemaphoreTake(s_client_mtx, portMAX_DELAY);
-    int sock = s_client_sock;
-    if (sock >= 0) {
-        // Append newline so the Flask side can split on lines.
-        send(sock, line, strlen(line), 0);
-        send(sock, "\n", 1, 0);
+    // Broadcast to ALL connected clients (Flask, MobaXterm, etc.)
+    for (int i = 0; i < MAX_BRIDGE_CLIENTS; i++) {
+        int sock = s_clients[i];
+        if (sock >= 0) {
+            // Append newline so the Flask side can split on lines.
+            // send() is non-blocking with MSG_DONTWAIT — if a client is slow/dead,
+            // we don't stall the broadcast for the others.
+            send(sock, line, strlen(line), MSG_DONTWAIT);
+            send(sock, "\n", 1, MSG_DONTWAIT);
+        }
     }
     xSemaphoreGive(s_client_mtx);
 }
@@ -208,12 +214,63 @@ bool wifi_bridge_get_info(bool *out_connected, bool *out_ap_mode,
     return connected;
 }
 
-static void tcp_bridge_task(void *arg)
+// Per-client RX handler: receives commands from one TCP client, forwards to STM32.
+// Runs as a separate task so multiple clients can send commands concurrently.
+typedef struct {
+    int sock;
+    int slot;
+} client_rx_ctx_t;
+
+static void client_rx_task(void *arg)
 {
+    client_rx_ctx_t *ctx = (client_rx_ctx_t *)arg;
+    int sock = ctx->sock;
+    int slot = ctx->slot;
+    free(ctx);
+
     char rx[1024];
     char linebuf[1024];
     size_t linelen = 0;
 
+    ESP_LOGI(TAG, "Client RX task started for slot %d (sock %d)", slot, sock);
+
+    while (1) {
+        int len = recv(sock, rx, sizeof(rx), 0);
+        if (len <= 0) {
+            if (len < 0) ESP_LOGE(TAG, "Client slot %d: recv errno %d", slot, errno);
+            else         ESP_LOGI(TAG, "Client slot %d disconnected", slot);
+            break;
+        }
+        // Split received data into newline-delimited commands.
+        for (int i = 0; i < len; i++) {
+            char c = rx[i];
+            if (c == '\n' || c == '\r') {
+                if (linelen > 0) {
+                    linebuf[linelen] = '\0';
+                    if (s_cmd_cb) s_cmd_cb(linebuf);  // forward to STM32
+                    linelen = 0;
+                }
+            } else if (linelen < sizeof(linebuf) - 1) {
+                linebuf[linelen++] = c;
+            }
+        }
+    }
+
+    // Client disconnected: remove from the client array.
+    xSemaphoreTake(s_client_mtx, portMAX_DELAY);
+    if (s_clients[slot] == sock) {
+        s_clients[slot] = -1;
+    }
+    xSemaphoreGive(s_client_mtx);
+
+    shutdown(sock, 0);
+    close(sock);
+    ESP_LOGI(TAG, "Client slot %d closed", slot);
+    vTaskDelete(NULL);
+}
+
+static void tcp_bridge_task(void *arg)
+{
     struct sockaddr_in dest = {};
     dest.sin_addr.s_addr = htonl(INADDR_ANY);
     dest.sin_family      = AF_INET;
@@ -233,13 +290,14 @@ static void tcp_bridge_task(void *arg)
         vTaskDelete(NULL);
         return;
     }
-    if (listen(listen_sock, 1) != 0) {
+    if (listen(listen_sock, MAX_BRIDGE_CLIENTS) != 0) {
         ESP_LOGE(TAG, "bridge: listen() failed: errno %d", errno);
         close(listen_sock);
         vTaskDelete(NULL);
         return;
     }
-    ESP_LOGI(TAG, "TCP bridge listening on port %d", TCP_BRIDGE_PORT);
+    ESP_LOGI(TAG, "TCP bridge listening on port %d (multi-client, max %d)", 
+             TCP_BRIDGE_PORT, MAX_BRIDGE_CLIENTS);
 
     while (1) {
         struct sockaddr_storage src;
@@ -255,49 +313,62 @@ static void tcp_bridge_task(void *arg)
         if (src.ss_family == AF_INET) {
             inet_ntoa_r(((struct sockaddr_in *)&src)->sin_addr, addr_str, sizeof(addr_str) - 1);
         }
-        ESP_LOGI(TAG, "Flask client connected from %s", addr_str);
 
-        // TCP keepalive so a dead client is detected.
+        // TCP keepalive so dead clients are detected and cleaned up.
         int ka = 1, idle = 5, intvl = 5, cnt = 3;
         setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &ka, sizeof(ka));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
         setsockopt(sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
 
-        // Only one client at a time: replace any previous.
+        // Find a free slot for this client.
+        int slot = -1;
         xSemaphoreTake(s_client_mtx, portMAX_DELAY);
-        if (s_client_sock >= 0) { close(s_client_sock); }
-        s_client_sock = sock;
-        xSemaphoreGive(s_client_mtx);
-        linelen = 0;
-
-        // Receive loop: split into newline-delimited commands -> cmd_cb.
-        while (1) {
-            int len = recv(sock, rx, sizeof(rx), 0);
-            if (len <= 0) {
-                if (len < 0) ESP_LOGE(TAG, "bridge: recv errno %d", errno);
-                else         ESP_LOGI(TAG, "Flask client disconnected");
+        for (int i = 0; i < MAX_BRIDGE_CLIENTS; i++) {
+            if (s_clients[i] < 0) {
+                slot = i;
+                s_clients[i] = sock;
                 break;
             }
-            for (int i = 0; i < len; i++) {
-                char c = rx[i];
-                if (c == '\n' || c == '\r') {
-                    if (linelen > 0) {
-                        linebuf[linelen] = '\0';
-                        if (s_cmd_cb) s_cmd_cb(linebuf);
-                        linelen = 0;
-                    }
-                } else if (linelen < sizeof(linebuf) - 1) {
-                    linebuf[linelen++] = c;
-                }
-            }
+        }
+        xSemaphoreGive(s_client_mtx);
+
+        if (slot < 0) {
+            ESP_LOGW(TAG, "Client from %s rejected: all %d slots full", 
+                     addr_str, MAX_BRIDGE_CLIENTS);
+            shutdown(sock, 0);
+            close(sock);
+            continue;
         }
 
-        xSemaphoreTake(s_client_mtx, portMAX_DELAY);
-        if (s_client_sock == sock) s_client_sock = -1;
-        xSemaphoreGive(s_client_mtx);
-        shutdown(sock, 0);
-        close(sock);
+        ESP_LOGI(TAG, "Client connected from %s (slot %d)", addr_str, slot);
+
+        // Spawn a lightweight RX task for this client.
+        client_rx_ctx_t *ctx = (client_rx_ctx_t *)malloc(sizeof(client_rx_ctx_t));
+        if (!ctx) {
+            ESP_LOGE(TAG, "Failed to allocate client context");
+            xSemaphoreTake(s_client_mtx, portMAX_DELAY);
+            s_clients[slot] = -1;
+            xSemaphoreGive(s_client_mtx);
+            shutdown(sock, 0);
+            close(sock);
+            continue;
+        }
+        ctx->sock = sock;
+        ctx->slot = slot;
+
+        char task_name[24];
+        snprintf(task_name, sizeof(task_name), "bridge_rx_%d", slot);
+        BaseType_t ret = xTaskCreate(client_rx_task, task_name, 3072, ctx, 5, NULL);
+        if (ret != pdPASS) {
+            ESP_LOGE(TAG, "Failed to spawn RX task for slot %d", slot);
+            free(ctx);
+            xSemaphoreTake(s_client_mtx, portMAX_DELAY);
+            s_clients[slot] = -1;
+            xSemaphoreGive(s_client_mtx);
+            shutdown(sock, 0);
+            close(sock);
+        }
     }
 }
 
@@ -815,9 +886,14 @@ static void start_ap_portal(void)
     // Free port 80 if the LAN OTA server was running (we're leaving STA mode).
     stop_lan_httpd();
 
-    // Drop any bridge client.
+    // Drop all bridge clients.
     xSemaphoreTake(s_client_mtx, portMAX_DELAY);
-    if (s_client_sock >= 0) { close(s_client_sock); s_client_sock = -1; }
+    for (int i = 0; i < MAX_BRIDGE_CLIENTS; i++) {
+        if (s_clients[i] >= 0) {
+            close(s_clients[i]);
+            s_clients[i] = -1;
+        }
+    }
     xSemaphoreGive(s_client_mtx);
 
     // APSTA so we can scan for networks while the AP is up.
@@ -1056,6 +1132,11 @@ void wifi_bridge_start(wifi_bridge_cmd_cb_t cmd_cb)
 
     s_client_mtx  = xSemaphoreCreateMutex();
     s_wifi_events = xEventGroupCreate();
+
+    // Initialize all client slots to -1 (unused).
+    for (int i = 0; i < MAX_BRIDGE_CLIENTS; i++) {
+        s_clients[i] = -1;
+    }
 
     // NOTE: we deliberately do NOT bring up NVS / WiFi here. app_main() runs on
     // the main task, whose stack is not in internal DRAM on this board, and any

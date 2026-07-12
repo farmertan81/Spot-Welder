@@ -28,7 +28,12 @@ import urllib.error
 DEFAULT_HOSTS = ["spotwelder.local", "192.168.1.77"]  # tried in order
 USERNAME      = "admin"
 PASSWORD      = "spotwelder2024"
-FIRMWARE_REL  = os.path.join("build", "hello_world.bin")  # project name = hello_world
+# Project was renamed hello_world -> esp32_firmware (CMakeLists.txt), so the
+# build now outputs build/esp32_firmware.bin. We look for that FIRST. The old
+# hello_world.bin may still be lying around in build/ from before the rename
+# and is STALE — never flash it.
+FIRMWARE_REL  = os.path.join("build", "esp32_firmware.bin")  # project name = esp32_firmware
+STALE_NAMES   = ["hello_world.bin"]  # legacy names that must NOT be flashed
 TIMEOUT_S     = 120
 # -------------------------------------------------------------------------
 
@@ -39,11 +44,29 @@ def project_root():
 
 
 def find_firmware():
+    build_dir = os.path.join(project_root(), "build")
     fw = os.path.join(project_root(), FIRMWARE_REL)
+
+    # Warn loudly if a stale legacy binary is still present — that's the classic
+    # "OTA flashed old firmware" trap after the project rename.
+    for stale in STALE_NAMES:
+        stale_path = os.path.join(build_dir, stale)
+        if os.path.isfile(stale_path):
+            print("WARNING: stale legacy binary present (ignored): %s" % stale_path)
+            print("         Delete it to avoid confusion: it is NOT flashed.")
+
     if not os.path.isfile(fw):
         print("ERROR: firmware not found:\n  %s" % fw)
         print("Build first (ESP-IDF 'Build' button or `idf.py build`).")
+        print("Expected the build to output 'esp32_firmware.bin' "
+              "(project name in CMakeLists.txt).")
         sys.exit(1)
+
+    # Show the timestamp so the user can confirm it is a fresh build.
+    import time
+    mtime = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(os.path.getmtime(fw)))
+    print("Firmware: %s" % fw)
+    print("  built:  %s   size: %d bytes" % (mtime, os.path.getsize(fw)))
     return fw
 
 

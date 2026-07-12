@@ -1,3 +1,15 @@
+# ⚠️ ARCHIVED — SUPERSEDED BY KATAPULT BOOTLOADER
+
+> **This document is kept for historical reference only.**
+>
+> The ROM-bootloader / AN3155 / BOOT0+NRST approach described here was **replaced**
+> by the **Katapult bootloader** (commit `29be8a0`, 2026-06-21).
+>
+> **For current STM32 wireless/SD flashing:** see
+> `docs/firmware/KATAPULT_BOOTLOADER_SETUP.md`
+
+---
+
 # Wireless STM32 Flashing — How It Works, and Why It Took Two Days
 
 This document explains how the spot welder flashes its **STM32G474** weld

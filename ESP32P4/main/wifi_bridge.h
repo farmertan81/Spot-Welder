@@ -11,9 +11,11 @@
 //     device answers at "spotwelder.local".
 //   - "Reconfigure WiFi" (Setup tab) re-enters the AP portal.
 //
-// On the ESP32-P4 the radio itself lives on the onboard ESP32-C6 and is reached
-// over SDIO via esp_hosted / esp_wifi_remote, but the esp_wifi API used here is
-// identical to a native-WiFi target.
+// On the ESP32-P4 the radio lives on an EXTERNAL Seeed XIAO ESP32-C6 (on the
+// SPI / J7 header) and is reached over SPI via esp_hosted / esp_wifi_remote —
+// the onboard C6 (SDIO) is unused because its bus collides with the SD card's
+// SDMMC controller (see docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md). The
+// esp_wifi API used here is identical to a native-WiFi target.
 
 #pragma once
 #include <stdbool.h>

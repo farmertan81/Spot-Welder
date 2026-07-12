@@ -86,7 +86,7 @@ STM32_Programmer_CLI -c port=SWD -d .pio/build/g474ceu6_stlink/firmware.bin 0x08
 > PlatformIO's bin is offset‑relative, so specify 0x08002000 with CubeProgrammer).
 
 ### Step 3 — Power‑cycle and confirm
-On the STM32 serial @ **1,000,000 baud 8N1** you should see:
+On the STM32 serial @ **576000 baud 8N1** (ESP32-P4 GPIO 27/28, UART3-IN header) you should see:
 ```
 BOOT,FW=KATAPULT-APP-v6-RELOCATED-0x08002000
 ```
@@ -125,7 +125,7 @@ Katapult can be entered via three different methods, each suited for different s
 **Hardware needed:** Just the 2-wire UART connection (PA9/PA10) already in place.
 
 How it works:
-1. ESP32 sends `BOOTLOADER\n` command to the running STM32 app @ 1Mbaud 8N1
+1. ESP32 sends `BOOTLOADER\n` command to the running STM32 app @ 576k baud 8N1
 2. STM32 app calls `requestKatapultReset()`:
    - Reads Katapult's magic RAM address from its vector table at `*(uint32_t*)0x08000000`
    - Writes the 64-bit signature `0x5984E3FA6CA1589B` (REQUEST_CANBOOT)
@@ -188,7 +188,7 @@ STM32 flash works end-to-end from the ESP32 with **no BOOT0/NRST pins** and
 **no AN3155 parity complexity**.
 
 **How it works:**
-1. ESP sends `BOOTLOADER` command to the running STM32 app @ 1Mbaud 8N1
+1. ESP sends `BOOTLOADER` command to the running STM32 app @ 576k baud 8N1 (GPIO 27/28)
 2. STM32 app calls `requestKatapultReset()` → writes Katapult's magic signature to RAM → warm reset
 3. Katapult runs, sees the signature, stays in its USART1 update loop @ **250000 8N1**
 4. ESP switches UART to 250k 8N1 and speaks Katapult's framed protocol:
