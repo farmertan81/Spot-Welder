@@ -1,5 +1,12 @@
 # ESP32 Display Firmware — Comprehensive Architecture Analysis
 
+> ⚠️ **LEGACY REFERENCE — describes the OLD ESP32-S3 board.** This document
+> analyzes the legacy **Sunton ESP32-8048S043C (ESP32-S3)** firmware (GPIO 17/18
+> @ 2,000,000 baud). Current production has migrated to the **ESP32-P4** board
+> (GPIO 27/28 @ 576,000 baud) — see the main [README](../../README.md) and
+> [CHANGELOG_P4_UI_STABLE.md](CHANGELOG_P4_UI_STABLE.md). Kept for historical
+> reference on the old board's internals.
+
 > **Project:** Spot Welder Full  
 > **Branch:** Dev  
 > **Firmware Target:** ESP32-S3 (ESP32-8048S043C — 800×480 TFT + GT911 capacitive touch)  

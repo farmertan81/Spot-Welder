@@ -12,7 +12,6 @@ communicate over a shared serial/TCP telemetry protocol.
 | `ESP32P4/`            | ESP32-P4 (CrowPanel Advance 5") | **ESP-IDF** (CMake) | UI + WiFi bridge + STM32/OTA flasher. Talks to STM32 over UART3-IN @ 576000. Enriches STATUS, relays WAVEFORM_* raw. |
 | `STM32G474CE/`        | STM32G474CE | **PlatformIO** (`env:g474ceu6_stlink`) | Real-time weld controller: FET drive, ADC/shunt, INA226, charger, joule integrator. **Sole producer of STATUS, WELD_DONE, WAVEFORM_* packets.** |
 | `ESP32_8048S043C/`    | ESP32-8048S043C (old board) | **PlatformIO / Arduino** | Legacy display firmware. Produces DISPLAY and CELLS packets. Keep buildable; not the primary target. |
-| `Spotwelder Full/`    | *(build artifacts only)* | *(no source)* | **Not an active firmware target.** Contains only `.pio/`, `build.log`, `sdkconfig.defaults`. |
 | *(separate repo)* `Spot-Welder-Server/` | Python 3 / Flask | `pip` | Dashboard + TCP client to the P4 bridge (:8888). Re-parses telemetry. |
 
 > The Flask server lives in a **separate repository** (`Spot-Welder-Server`). For any change
@@ -59,7 +58,6 @@ pio device monitor -b 576000         # serial monitor at app baud
 cd ESP32_8048S043C
 pio run                              # keep it compiling; secondary priority
 ```
-> Note: `Spotwelder Full/` contains only build artifacts and is not a build target.
 
 ### Flask server (separate repo)
 ```bash
@@ -73,6 +71,11 @@ python app.py                        # serves dashboard on :8080, TCP bridge cli
 - **UART link is 576000 8N1** through BSS138 level shifters on the UART3-IN header (GPIO 27/28 on P4,
   PA9/PA10 on STM32). Do NOT raise the baud rate — higher rates corrupt through the RC-limited shifters.
   Bootloader mode uses 115200 8E1.
+- **WiFi is an external XIAO ESP32-C6 on SPI (J7 header)**, not the board's onboard C6. The onboard C6 uses
+  SDIO, which collides with the SD card's SDMMC controller; the external C6-over-SPI workaround frees the SD
+  card. Pins: MOSI 48 / MISO 47 / CLK 26 / CS 29 / HS 30 / DR 31 / reset 32 (active-low), SPI mode 3.
+  Do NOT raise `CONFIG_ESP_HOSTED_SPI_FREQ_ESP32C6` above 10 MHz (GPIO-matrix slave sampling limit). The C6
+  transport lives in `ESP32P4/sdkconfig.defaults`; full writeup in `docs/hardware/ESP32C6_WIFI_DAUGHTERBOARD.md`.
 - **The charge MOSFET (`CHARGER_EN`) is owned by the STM32** and MUST be OFF during a weld pulse — the
   joule integrator assumes discharge-only current. Never move this control to the P4.
 - **Reserved:** do not bind host ports 1000/2200 in any tooling.

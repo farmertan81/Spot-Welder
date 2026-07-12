@@ -1,3 +1,17 @@
+# ⚠️ ARCHIVED — SUPERSEDED BY KATAPULT BOOTLOADER
+
+> **This document is kept for historical reference only.**
+>
+> This was a feasibility study written before implementation. STM32 wireless/SD
+> flashing has since been **implemented via the Katapult bootloader** (commit
+> `29be8a0`, 2026-06-21), which uses a different approach than the ROM bootloader
+> path analyzed here.
+>
+> **For current STM32 wireless/SD flashing:** see
+> `docs/firmware/KATAPULT_BOOTLOADER_SETUP.md`
+
+---
+
 # Feasibility Report: SD-Card Flashing & STM32 Remote Programming
 
 **Goal:** Make the spot welder self-contained for firmware updates (no PC):
