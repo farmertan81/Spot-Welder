@@ -42,4 +42,8 @@ Reference documentation for the Spot Welder project, organized by topic.
 - **`../Datasheets/`** — Component datasheets; STM32 reference manuals under `../Datasheets/STM/`
 - **`../tools/`** — Katapult/flashing utility scripts
 - **`../archive/`** — Retired artifacts (e.g. `old_firmware/` backup binary)
-- **`../STM32G474CE/GPIO_BALANCER_ANALYSIS.md`** — GPIO analysis kept alongside STM32 source
+
+> The balancer GPIO analysis previously kept at `../STM32G474CE/GPIO_BALANCER_ANALYSIS.md`
+> has been consolidated into **[hardware/BALANCER_SPECIFICATION.md](hardware/BALANCER_SPECIFICATION.md)**
+> (see the *PB3 / PB4 — JTAG/SWD Debug Conflict* section) and the master pin map in
+> **[hardware/PIN_ASSIGNMENTS.md](hardware/PIN_ASSIGNMENTS.md)**.

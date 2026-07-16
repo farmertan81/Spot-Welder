@@ -1,5 +1,7 @@
 # STM32G474CE Pin Assignments (Final)
 
+> **Status: Current Hardware — reflects schematic rev as of 2026**
+
 > **Project:** Spot Welder (Final Schematic Freeze)
 >
 > **Controller board:** WeAct Studio STM32G474CE breakout (removable header format)
@@ -98,4 +100,4 @@ The following pins remain available for future features (CAN, USB, secondary UAR
 
 ---
 
-**DOCUMENT STATUS:** This is the authority. Inconsistent data in legacy analysis files (e.g., STM32G474CE/GPIO_BALANCER_ANALYSIS.md) should be ignored or archived.
+**DOCUMENT STATUS:** This is the authority for the logical pin allocation. The balancer GPIO detail (formerly in the standalone `STM32G474CE/GPIO_BALANCER_ANALYSIS.md`, now removed) has been consolidated into [BALANCER_SPECIFICATION.md](BALANCER_SPECIFICATION.md).
