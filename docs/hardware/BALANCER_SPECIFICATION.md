@@ -1,5 +1,7 @@
 # 4-Cell Li-ion Balancer Specification
 
+> **Status: Current Hardware — reflects schematic rev as of 2026**
+
 > **Project:** Capacitive Discharge Spot Welder  
 > **MCU:** STM32G474CE  
 > **Author:** JQ-DHJ  
@@ -89,6 +91,14 @@ PB6  →  TLP291 Ch.4  →  Q4 (IRLML6244)  →  Cell 4  (most positive cell)
 > **PB3 Note:** PB3 defaults to JTDO/SWO after reset. Firmware must explicitly
 > reconfigure it as GPIO_Output. This is safe because the project uses only SWD
 > (SWCLK/SWDIO on PA13/PA14) — JTAG/SWO is not required.
+
+### PB3 / PB4 — JTAG/SWD Debug Conflict
+
+PB3 (JTDO/TRACESWO) and PB4 (NJTRST) are shared with the JTAG debug interface.
+If the balancer board needs these GPIOs for other functions, the JTAG port must be
+disabled in firmware (JTAG-DP Disabled, SW-DP Enabled) before use, while SW-DP
+(SWCLK/SWDIO on PA13/PA14) remains enabled. During bring-up and debugging, leave
+these pins reserved for the debug interface.
 
 ---
 
